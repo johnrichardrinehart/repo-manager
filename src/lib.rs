@@ -1144,7 +1144,7 @@ fn clone_repo(config: &Config, db: &Store, url: &str) -> Result<()> {
 
 fn ghq_get_command(root: &Path, url: &str) -> Command {
     let mut command = Command::new("ghq");
-    command.arg("--root").arg(root).arg("get").arg(url);
+    command.env("GHQ_ROOT", root).arg("get").arg(url);
     command
 }
 
@@ -1737,20 +1737,25 @@ mod tests {
     }
 
     #[test]
-    fn ghq_root_is_a_global_option_before_get() {
+    fn ghq_root_is_configured_with_environment() {
         let command = ghq_get_command(Path::new("/tmp/clones"), "https://github.com/owner/repo");
         let args = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        assert_eq!(
-            args,
-            vec![
-                "--root",
-                "/tmp/clones",
-                "get",
-                "https://github.com/owner/repo"
-            ]
+        let envs = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(args, vec!["get", "https://github.com/owner/repo"]);
+        assert!(
+            envs.iter()
+                .any(|(key, value)| key == "GHQ_ROOT" && value.as_deref() == Some("/tmp/clones"))
         );
     }
 
