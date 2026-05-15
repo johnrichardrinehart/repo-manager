@@ -1,7 +1,12 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream, UdpSocket};
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -65,6 +70,32 @@ pub struct Cli {
     )]
     worktree_root: Option<PathBuf>,
 
+    #[arg(
+        long,
+        env = "REPO_MANAGER_RPC_URL",
+        value_name = "URL",
+        help = "RPC endpoint for clone lifecycle events (default: unix:///run/repo-manager.socket)",
+        long_help = "RPC endpoint for clone lifecycle events. Supported schemes are unix://, tcp://, and udp://. Defaults to unix:///run/repo-manager.socket."
+    )]
+    rpc_url: Option<String>,
+
+    #[arg(
+        long,
+        env = "REPO_MANAGER_DETECT_RELATED",
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        help = "Ask the daemon to look for shared Git history after successful clones"
+    )]
+    detect_related: Option<bool>,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Print command results as machine-readable JSON"
+    )]
+    json: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -89,6 +120,11 @@ enum SetupCommands {
         long_about = "Persist common repo-manager settings to a config file.\n\nValues written by setup are loaded on future runs from the selected file. Environment variables and top-level CLI options still override persisted config at runtime."
     )]
     Setup(SetupArgs),
+    #[command(
+        about = "Run the repo-manager RPC daemon",
+        long_about = "Run the repo-manager RPC daemon.\n\nThe daemon receives clone lifecycle events from clients. When related-history detection is configured, it compares successful clones with other managed repositories and records pending relationship decisions."
+    )]
+    Daemon(DaemonArgs),
 }
 
 #[derive(Debug, Subcommand, HelpGroup)]
@@ -139,6 +175,11 @@ enum OrganizationalAnalysisCommands {
         long_about = "Show historical locator paths and old-path symlinks for a repository after moves.\n\nThese aliases are filesystem paths created by `repo move` or `repo reconcile`; they are not shell aliases and not Git remotes."
     )]
     Aliases(AliasesCommand),
+    #[command(
+        about = "Review repositories with shared Git history",
+        long_about = "List and resolve daemon-detected shared-history candidates.\n\nThese are suggestions only: shared Git objects can mean mirrors, forks, moved repositories, vendor trees, or unrelated repositories with common ancestry."
+    )]
+    Related(RelatedCommand),
 }
 
 #[derive(Debug, Args)]
@@ -173,6 +214,28 @@ struct SetupArgs {
         help = "Persist the root directory for development worktrees"
     )]
     worktree_root: Option<PathBuf>,
+
+    #[arg(long, value_name = "URL", help = "Persist the daemon RPC endpoint")]
+    rpc_url: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        help = "Persist daemon-side related-history detection after successful clones"
+    )]
+    detect_related: Option<bool>,
+}
+
+#[derive(Debug, Args)]
+struct DaemonArgs {
+    #[arg(
+        long,
+        value_name = "URL",
+        help = "RPC endpoint to listen on (default: configured RPC endpoint)"
+    )]
+    listen: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -310,6 +373,35 @@ struct AliasesCommand {
     command: AliasesSubcommand,
 }
 
+#[derive(Debug, Subcommand)]
+enum RelatedSubcommand {
+    #[command(about = "List unresolved shared-history suggestions")]
+    List,
+    #[command(
+        about = "Resolve a shared-history suggestion",
+        long_about = "Resolve a shared-history suggestion with an explicit relationship.\n\nKinds: mirror, fork, canonical, moved, successor, unrelated."
+    )]
+    Resolve(RelatedResolveArgs),
+}
+
+#[derive(Debug, Args)]
+struct RelatedCommand {
+    #[command(subcommand)]
+    command: RelatedSubcommand,
+}
+
+#[derive(Debug, Args)]
+struct RelatedResolveArgs {
+    #[arg(value_name = "ID", help = "Suggestion ID from `repo related list`")]
+    id: i64,
+
+    #[arg(
+        value_name = "KIND",
+        help = "Relationship kind: mirror, fork, canonical, moved, successor, or unrelated"
+    )]
+    kind: String,
+}
+
 #[derive(Debug, Args)]
 struct RepoRef {
     #[arg(
@@ -326,6 +418,13 @@ struct Config {
     cache_root: PathBuf,
     clone_root: PathBuf,
     worktree_root: PathBuf,
+    rpc_url: String,
+    detect_related: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Output {
+    json: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -334,6 +433,8 @@ struct FileConfig {
     cache_root: Option<PathBuf>,
     clone_root: Option<PathBuf>,
     worktree_root: Option<PathBuf>,
+    rpc_url: Option<String>,
+    detect_related: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -358,7 +459,82 @@ struct ReconcileSkip {
     reason: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum RpcEvent {
+    CloneStarted(CloneStartedEvent),
+    CloneFinished(CloneFinishedEvent),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CloneStartedEvent {
+    url: String,
+    locator: Locator,
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CloneFinishedEvent {
+    url: String,
+    locator: Locator,
+    path: PathBuf,
+    success: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CloneResult {
+    action: &'static str,
+    locator: Locator,
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ForkResult {
+    action: &'static str,
+    fork_locator: Locator,
+    canonical_locator: Locator,
+    fork_path: PathBuf,
+    canonical_path: PathBuf,
+    fork_remote: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SetupResult {
+    action: &'static str,
+    config_path: PathBuf,
+    config: FileConfig,
+    note: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SuccessorResult {
+    action: &'static str,
+    old_ref: String,
+    new_locator: Locator,
+    new_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RelatedSuggestion {
+    id: i64,
+    repo_id: i64,
+    repo_locator: Locator,
+    repo_path: PathBuf,
+    related_repo_id: i64,
+    related_locator: Locator,
+    related_path: PathBuf,
+    shared_refs: Vec<String>,
+    resolution: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RelatedResolution {
+    action: &'static str,
+    id: i64,
+    resolution: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Locator {
     pub authority: String,
     pub remote_path: String,
@@ -469,40 +645,42 @@ fn styled(style: anstyle::Style, text: &str) -> String {
 pub fn run() -> Result<()> {
     let cli = parse_cli();
     let config = Config::from_cli(&cli)?;
+    let output = Output { json: cli.json };
 
     match cli.command {
         Commands::Setup(command) => match command {
-            SetupCommands::Setup(args) => setup_config(&config, args),
+            SetupCommands::Setup(args) => setup_config(&config, &output, args),
+            SetupCommands::Daemon(args) => run_daemon(&config, args),
         },
         Commands::RepositoryOperations(command) => match command {
             RepositoryOperationCommands::Clone(args) => {
                 let db = Store::open(&config.state)?;
-                clone_repo(&config, &db, &args.url)
+                clone_repo(&config, &db, &output, &args.url)
             }
             RepositoryOperationCommands::Fork(args) => {
                 let db = Store::open(&config.state)?;
-                fork_repo(&config, &db, &args.fork_url, &args.canonical)
+                fork_repo(&config, &db, &output, &args.fork_url, &args.canonical)
             }
             RepositoryOperationCommands::Worktree(command) => match command.command {
                 WorktreeSubcommand::Add(args) => {
                     let db = Store::open(&config.state)?;
-                    add_worktree(&config, &db, args)
+                    add_worktree(&config, &db, &output, args)
                 }
             },
         },
         Commands::OrganizationalChanges(command) => match command {
             OrganizationalChangeCommands::Move(args) => {
                 let db = Store::open(&config.state)?;
-                move_repo(&config, &db, &args.repo_ref, &args.new_url)
+                move_repo(&config, &db, &output, &args.repo_ref, &args.new_url)
             }
             OrganizationalChangeCommands::Reconcile => {
                 let db = Store::open(&config.state)?;
-                reconcile(&config, &db)
+                reconcile(&config, &db, &output)
             }
             OrganizationalChangeCommands::Successor(command) => match command.command {
                 SuccessorSubcommand::Set(args) => {
                     let db = Store::open(&config.state)?;
-                    successor_set(&config, &db, &args.old_ref, &args.new_url)
+                    successor_set(&config, &db, &output, &args.old_ref, &args.new_url)
                 }
             },
         },
@@ -510,9 +688,19 @@ pub fn run() -> Result<()> {
             OrganizationalAnalysisCommands::Aliases(command) => match command.command {
                 AliasesSubcommand::List(args) => {
                     let db = Store::open(&config.state)?;
-                    aliases_list(&db, &args.repo_ref)
+                    warn_pending_related(&db)?;
+                    aliases_list(&db, &output, &args.repo_ref)
                 }
             },
+            OrganizationalAnalysisCommands::Related(command) => {
+                let db = Store::open(&config.state)?;
+                match command.command {
+                    RelatedSubcommand::List => related_list(&db, &output),
+                    RelatedSubcommand::Resolve(args) => {
+                        related_resolve(&db, &output, args.id, &args.kind)
+                    }
+                }
+            }
         },
     }
 }
@@ -548,12 +736,23 @@ impl Config {
             .clone()
             .or(file_config.worktree_root)
             .unwrap_or(default_worktree_root()?);
+        let rpc_url = cli
+            .rpc_url
+            .clone()
+            .or(file_config.rpc_url)
+            .unwrap_or_else(default_rpc_url);
+        let detect_related = cli
+            .detect_related
+            .or(file_config.detect_related)
+            .unwrap_or(false);
         Ok(Self {
             config_path,
             state,
             cache_root,
             clone_root,
             worktree_root,
+            rpc_url,
+            detect_related,
         })
     }
 }
@@ -579,7 +778,7 @@ impl FileConfig {
     }
 }
 
-fn setup_config(config: &Config, args: SetupArgs) -> Result<()> {
+fn setup_config(config: &Config, output: &Output, args: SetupArgs) -> Result<()> {
     let config_path = args.file.unwrap_or_else(|| config.config_path.clone());
     let file_config = FileConfig {
         state: Some(args.state.unwrap_or_else(|| config.state.clone())),
@@ -589,14 +788,17 @@ fn setup_config(config: &Config, args: SetupArgs) -> Result<()> {
             args.worktree_root
                 .unwrap_or_else(|| config.worktree_root.clone()),
         ),
+        rpc_url: Some(args.rpc_url.unwrap_or_else(|| config.rpc_url.clone())),
+        detect_related: Some(args.detect_related.unwrap_or(config.detect_related)),
     };
     file_config.save(&config_path)?;
-    print_json(&serde_json::json!({
-        "action": "setup",
-        "config_path": &config_path,
-        "config": &file_config,
-        "note": "Environment variables and top-level CLI options override these persisted values at runtime."
-    }))
+    let result = SetupResult {
+        action: "setup",
+        config_path,
+        config: file_config,
+        note: "Environment variables and top-level CLI options override these persisted values at runtime.",
+    };
+    output_setup(output, &result)
 }
 
 fn home_dir() -> Result<PathBuf> {
@@ -630,6 +832,10 @@ fn default_clone_root() -> Result<PathBuf> {
 
 fn default_worktree_root() -> Result<PathBuf> {
     Ok(home_dir()?.join("code/worktrees"))
+}
+
+fn default_rpc_url() -> String {
+    "unix:///run/repo-manager.socket".to_string()
 }
 
 impl Locator {
@@ -823,13 +1029,13 @@ struct Store {
     conn: Connection,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RepoRecord {
     id: i64,
     current: Locator,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ManagedRepoRecord {
     id: i64,
     current: Locator,
@@ -904,6 +1110,17 @@ impl Store {
               kind TEXT NOT NULL,
               payload_json TEXT NOT NULL,
               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS related_history (
+              id INTEGER PRIMARY KEY,
+              repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+              related_repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+              shared_refs_json TEXT NOT NULL,
+              resolution TEXT,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              resolved_at TEXT,
+              UNIQUE(repo_id, related_repo_id)
             );
             ",
         )?;
@@ -1118,28 +1335,162 @@ impl Store {
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
+
+    fn record_related_history(
+        &self,
+        repo_id: i64,
+        related_repo_id: i64,
+        shared_refs: &[String],
+    ) -> Result<()> {
+        self.conn.execute(
+            "
+            INSERT INTO related_history (repo_id, related_repo_id, shared_refs_json)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(repo_id, related_repo_id) DO UPDATE SET
+              shared_refs_json = excluded.shared_refs_json
+            ",
+            params![
+                repo_id,
+                related_repo_id,
+                serde_json::to_string(shared_refs)?
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn pending_related_count(&self) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM related_history WHERE resolution IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    fn related_suggestions(&self, unresolved_only: bool) -> Result<Vec<RelatedSuggestion>> {
+        let filter = if unresolved_only {
+            "WHERE related_history.resolution IS NULL"
+        } else {
+            ""
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "
+            SELECT
+              related_history.id,
+              repo.id,
+              repo.current_authority,
+              repo.current_remote_path,
+              repo.current_path,
+              related.id,
+              related.current_authority,
+              related.current_remote_path,
+              related.current_path,
+              related_history.shared_refs_json,
+              related_history.resolution
+            FROM related_history
+            JOIN repos repo ON repo.id = related_history.repo_id
+            JOIN repos related ON related.id = related_history.related_repo_id
+            {filter}
+            ORDER BY related_history.id
+            "
+        ))?;
+        let rows = stmt.query_map([], |row| {
+            let shared_refs_json: String = row.get(9)?;
+            let shared_refs = serde_json::from_str(&shared_refs_json).unwrap_or_default();
+            Ok(RelatedSuggestion {
+                id: row.get(0)?,
+                repo_id: row.get(1)?,
+                repo_locator: Locator {
+                    authority: row.get(2)?,
+                    remote_path: row.get(3)?,
+                },
+                repo_path: PathBuf::from(row.get::<_, String>(4)?),
+                related_repo_id: row.get(5)?,
+                related_locator: Locator {
+                    authority: row.get(6)?,
+                    remote_path: row.get(7)?,
+                },
+                related_path: PathBuf::from(row.get::<_, String>(8)?),
+                shared_refs,
+                resolution: row.get(10)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    fn resolve_related(&self, id: i64, resolution: &str) -> Result<()> {
+        let changed = self.conn.execute(
+            "
+            UPDATE related_history
+            SET resolution = ?2, resolved_at = CURRENT_TIMESTAMP
+            WHERE id = ?1
+            ",
+            params![id, resolution],
+        )?;
+        if changed == 0 {
+            bail!("unknown related-history suggestion: {id}");
+        }
+        Ok(())
+    }
 }
 
-fn clone_repo(config: &Config, db: &Store, url: &str) -> Result<()> {
+fn clone_repo(config: &Config, db: &Store, output: &Output, url: &str) -> Result<()> {
+    warn_pending_related(db)?;
     let locator = Locator::parse(url)?;
     let path = locator_path(&config.clone_root, &locator);
     fs::create_dir_all(path.parent().context("clone path has no parent")?)?;
-    if which::which("ghq").is_ok() {
+    let _ = send_rpc_event(
+        &config.rpc_url,
+        &RpcEvent::CloneStarted(CloneStartedEvent {
+            url: url.to_string(),
+            locator: locator.clone(),
+            path: path.clone(),
+        }),
+    );
+    let clone_result = if which::which("ghq").is_ok() {
         let status = ghq_get_command(&config.clone_root, url)
             .status()
             .context("running ghq get")?;
         if !status.success() {
-            run_git(["clone", url, &path.display().to_string()])?;
+            run_git(["clone", url, &path.display().to_string()])
+        } else {
+            Ok(())
         }
     } else {
-        run_git(["clone", url, &path.display().to_string()])?;
+        run_git(["clone", url, &path.display().to_string()])
+    };
+    if let Err(error) = clone_result {
+        let _ = send_rpc_event(
+            &config.rpc_url,
+            &RpcEvent::CloneFinished(CloneFinishedEvent {
+                url: url.to_string(),
+                locator,
+                path,
+                success: false,
+            }),
+        );
+        return Err(error);
     }
     db.upsert_repo(&locator, &path, None)?;
-    print_json(&serde_json::json!({
-        "action": "clone",
-        "locator": locator,
-        "path": path,
-    }))
+    let _ = send_rpc_event(
+        &config.rpc_url,
+        &RpcEvent::CloneFinished(CloneFinishedEvent {
+            url: url.to_string(),
+            locator: locator.clone(),
+            path: path.clone(),
+            success: true,
+        }),
+    );
+    output_clone(
+        output,
+        &CloneResult {
+            action: "clone",
+            locator,
+            path,
+        },
+    )
 }
 
 fn ghq_get_command(root: &Path, url: &str) -> Command {
@@ -1148,7 +1499,14 @@ fn ghq_get_command(root: &Path, url: &str) -> Command {
     command
 }
 
-fn fork_repo(config: &Config, db: &Store, fork_url: &str, canonical_url: &str) -> Result<()> {
+fn fork_repo(
+    config: &Config,
+    db: &Store,
+    output: &Output,
+    fork_url: &str,
+    canonical_url: &str,
+) -> Result<()> {
+    warn_pending_related(db)?;
     let fork_locator = Locator::parse(fork_url)?;
     let canonical_locator = Locator::parse(canonical_url)?;
     let fork_path = locator_path(&config.clone_root, &fork_locator);
@@ -1180,17 +1538,21 @@ fn fork_repo(config: &Config, db: &Store, fork_url: &str, canonical_url: &str) -
     let canonical_id = db.upsert_repo(&canonical_locator, &canonical_path, None)?;
     let fork_id = db.upsert_repo(&fork_locator, &fork_path, Some(&canonical_locator.key()))?;
     db.record_fork(fork_id, canonical_id)?;
-    print_json(&serde_json::json!({
-        "action": "fork",
-        "fork_locator": fork_locator,
-        "canonical_locator": canonical_locator,
-        "fork_path": fork_path,
-        "canonical_path": canonical_path,
-        "fork_remote": fork_remote,
-    }))
+    output_fork(
+        output,
+        &ForkResult {
+            action: "fork",
+            fork_locator,
+            canonical_locator,
+            fork_path,
+            canonical_path,
+            fork_remote,
+        },
+    )
 }
 
-fn add_worktree(config: &Config, db: &Store, args: WorktreeAddArgs) -> Result<()> {
+fn add_worktree(config: &Config, db: &Store, output: &Output, args: WorktreeAddArgs) -> Result<()> {
+    warn_pending_related(db)?;
     let locator = Locator::parse(&args.canonical_url)?;
     let plan = plan_worktree_add(
         &config.clone_root,
@@ -1219,10 +1581,17 @@ fn add_worktree(config: &Config, db: &Store, args: WorktreeAddArgs) -> Result<()
         run_git_in(&plan.worktree_path, ["reset", "--hard", start])?;
     }
     db.upsert_repo(&plan.canonical_locator, &plan.canonical_path, None)?;
-    print_json(&plan)
+    output_worktree(output, &plan)
 }
 
-fn move_repo(config: &Config, db: &Store, repo_ref: &str, new_url: &str) -> Result<()> {
+fn move_repo(
+    config: &Config,
+    db: &Store,
+    output: &Output,
+    repo_ref: &str,
+    new_url: &str,
+) -> Result<()> {
+    warn_pending_related(db)?;
     let new_locator = Locator::parse(new_url)?;
     let (repo_id, old_locator, historical) = match db.find_repo(repo_ref)? {
         Some(record) => {
@@ -1240,12 +1609,13 @@ fn move_repo(config: &Config, db: &Store, repo_ref: &str, new_url: &str) -> Resu
     apply_filesystem_move(&plan)?;
     ensure_remote(&plan.new_path, "origin", new_url)?;
     db.apply_move_metadata(repo_id, &plan)?;
-    print_json(&plan)
+    output_move(output, &plan)
 }
 
-fn reconcile(config: &Config, db: &Store) -> Result<()> {
+fn reconcile(config: &Config, db: &Store, output: &Output) -> Result<()> {
+    warn_pending_related(db)?;
     let report = reconcile_repos(config, db)?;
-    print_json(&report)
+    output_reconcile(output, &report)
 }
 
 fn reconcile_repos(config: &Config, db: &Store) -> Result<ReconcileReport> {
@@ -1337,19 +1707,313 @@ fn reconcile_repos(config: &Config, db: &Store) -> Result<ReconcileReport> {
     })
 }
 
-fn successor_set(config: &Config, db: &Store, old_ref: &str, new_url: &str) -> Result<()> {
+fn successor_set(
+    config: &Config,
+    db: &Store,
+    output: &Output,
+    old_ref: &str,
+    new_url: &str,
+) -> Result<()> {
+    warn_pending_related(db)?;
     let new_locator = Locator::parse(new_url)?;
     db.record_successor(old_ref, &new_locator)?;
-    print_json(&serde_json::json!({
-        "action": "successor-set",
-        "old_ref": old_ref,
-        "new_locator": new_locator,
-        "new_path": locator_path(&config.clone_root, &new_locator),
-    }))
+    output_successor(
+        output,
+        &SuccessorResult {
+            action: "successor-set",
+            old_ref: old_ref.to_string(),
+            new_path: locator_path(&config.clone_root, &new_locator),
+            new_locator,
+        },
+    )
 }
 
-fn aliases_list(db: &Store, repo_ref: &str) -> Result<()> {
-    print_json(&db.aliases(repo_ref)?)
+fn aliases_list(db: &Store, output: &Output, repo_ref: &str) -> Result<()> {
+    output_aliases(output, &db.aliases(repo_ref)?)
+}
+
+fn related_list(db: &Store, output: &Output) -> Result<()> {
+    output_related(output, &db.related_suggestions(true)?)
+}
+
+fn related_resolve(db: &Store, output: &Output, id: i64, kind: &str) -> Result<()> {
+    validate_relationship_kind(kind)?;
+    db.resolve_related(id, kind)?;
+    output_related_resolution(
+        output,
+        &RelatedResolution {
+            action: "related-resolve",
+            id,
+            resolution: kind.to_string(),
+        },
+    )
+}
+
+fn validate_relationship_kind(kind: &str) -> Result<()> {
+    match kind {
+        "mirror" | "fork" | "canonical" | "moved" | "successor" | "unrelated" => Ok(()),
+        _ => bail!(
+            "invalid relationship kind: {kind}; expected mirror, fork, canonical, moved, successor, or unrelated"
+        ),
+    }
+}
+
+fn warn_pending_related(db: &Store) -> Result<()> {
+    let count = db.pending_related_count()?;
+    if count > 0 {
+        eprintln!(
+            "repo-manager: {count} unresolved shared-history suggestion(s); run `repo related list`"
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+enum RpcEndpoint {
+    Unix(PathBuf),
+    Tcp(String),
+    Udp(String),
+}
+
+fn parse_rpc_endpoint(input: &str) -> Result<RpcEndpoint> {
+    let url = Url::parse(input).with_context(|| format!("invalid RPC endpoint URL: {input}"))?;
+    match url.scheme() {
+        "unix" => {
+            let path = PathBuf::from(url.path());
+            if path.as_os_str().is_empty() {
+                bail!("unix RPC endpoint requires a socket path");
+            }
+            Ok(RpcEndpoint::Unix(path))
+        }
+        "tcp" => Ok(RpcEndpoint::Tcp(socket_addr_from_url(&url)?)),
+        "udp" => Ok(RpcEndpoint::Udp(socket_addr_from_url(&url)?)),
+        scheme => bail!("unsupported RPC endpoint scheme: {scheme}; expected unix, tcp, or udp"),
+    }
+}
+
+fn socket_addr_from_url(url: &Url) -> Result<String> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("RPC endpoint requires a host"))?;
+    let port = url
+        .port()
+        .ok_or_else(|| anyhow!("RPC endpoint requires a port"))?;
+    Ok(format!("{host}:{port}"))
+}
+
+fn send_rpc_event(endpoint: &str, event: &RpcEvent) -> Result<()> {
+    let message = format!("{}\n", serde_json::to_string(event)?);
+    match parse_rpc_endpoint(endpoint)? {
+        RpcEndpoint::Unix(path) => {
+            #[cfg(unix)]
+            {
+                let mut stream = UnixStream::connect(path)?;
+                stream.write_all(message.as_bytes())?;
+                Ok(())
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = path;
+                bail!("unix RPC endpoints are not supported on this platform")
+            }
+        }
+        RpcEndpoint::Tcp(addr) => {
+            let mut stream = TcpStream::connect(addr)?;
+            stream.write_all(message.as_bytes())?;
+            Ok(())
+        }
+        RpcEndpoint::Udp(addr) => {
+            let socket = UdpSocket::bind("0.0.0.0:0")?;
+            socket.send_to(message.as_bytes(), addr)?;
+            Ok(())
+        }
+    }
+}
+
+fn run_daemon(config: &Config, args: DaemonArgs) -> Result<()> {
+    let endpoint = parse_rpc_endpoint(args.listen.as_deref().unwrap_or(&config.rpc_url))?;
+    match endpoint {
+        RpcEndpoint::Unix(path) => run_unix_daemon(config, &path),
+        RpcEndpoint::Tcp(addr) => run_tcp_daemon(config, &addr),
+        RpcEndpoint::Udp(addr) => run_udp_daemon(config, &addr),
+    }
+}
+
+#[cfg(unix)]
+fn run_unix_daemon(config: &Config, path: &Path) -> Result<()> {
+    if path.exists() {
+        fs::remove_file(path)
+            .with_context(|| format!("removing stale RPC socket {}", path.display()))?;
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating RPC socket directory {}", parent.display()))?;
+    }
+    let listener =
+        UnixListener::bind(path).with_context(|| format!("listening on {}", path.display()))?;
+    println!("repo-manager daemon listening on unix://{}", path.display());
+    for stream in listener.incoming() {
+        let stream = stream.context("accepting unix RPC connection")?;
+        let config = config.clone();
+        thread::spawn(move || {
+            if let Err(error) = handle_rpc_reader(&config, BufReader::new(stream)) {
+                eprintln!("repo-manager daemon: {error:#}");
+            }
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn run_unix_daemon(_config: &Config, _path: &Path) -> Result<()> {
+    bail!("unix RPC endpoints are not supported on this platform")
+}
+
+fn run_tcp_daemon(config: &Config, addr: &str) -> Result<()> {
+    let listener = TcpListener::bind(addr).with_context(|| format!("listening on tcp://{addr}"))?;
+    println!("repo-manager daemon listening on tcp://{addr}");
+    for stream in listener.incoming() {
+        let stream = stream.context("accepting TCP RPC connection")?;
+        let config = config.clone();
+        thread::spawn(move || {
+            if let Err(error) = handle_rpc_reader(&config, BufReader::new(stream)) {
+                eprintln!("repo-manager daemon: {error:#}");
+            }
+        });
+    }
+    Ok(())
+}
+
+fn run_udp_daemon(config: &Config, addr: &str) -> Result<()> {
+    let socket = UdpSocket::bind(addr).with_context(|| format!("listening on udp://{addr}"))?;
+    println!("repo-manager daemon listening on udp://{addr}");
+    let mut buffer = [0_u8; 65_535];
+    loop {
+        let (len, _peer) = socket.recv_from(&mut buffer)?;
+        let message = String::from_utf8_lossy(&buffer[..len]);
+        let event: RpcEvent = serde_json::from_str(message.trim())
+            .with_context(|| format!("parsing RPC event: {message}"))?;
+        handle_rpc_event(config, event)?;
+    }
+}
+
+fn handle_rpc_reader<R: BufRead>(config: &Config, mut reader: R) -> Result<()> {
+    let mut line = String::new();
+    while reader.read_line(&mut line)? != 0 {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            let event: RpcEvent =
+                serde_json::from_str(trimmed).context("parsing RPC event JSON")?;
+            handle_rpc_event(config, event)?;
+        }
+        line.clear();
+    }
+    Ok(())
+}
+
+fn handle_rpc_event(config: &Config, event: RpcEvent) -> Result<()> {
+    match event {
+        RpcEvent::CloneStarted(_) => Ok(()),
+        RpcEvent::CloneFinished(event) => {
+            if event.success && config.detect_related {
+                let store = Store::open(&config.state)?;
+                let count = detect_related_history(&store, &event.locator)?;
+                if count > 0 {
+                    notify_related_history(count, &event.locator);
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn detect_related_history(store: &Store, locator: &Locator) -> Result<usize> {
+    let Some(repo) = store.find_repo(locator.key().as_str())? else {
+        return Ok(0);
+    };
+    let repos = store.current_repos()?;
+    let Some(current) = repos
+        .iter()
+        .find(|candidate| candidate.id == repo.id)
+        .cloned()
+    else {
+        return Ok(0);
+    };
+    let current_refs = git_ref_tips(&current.path)?;
+    if current_refs.is_empty() {
+        return Ok(0);
+    }
+
+    let mut detected = 0;
+    for other in repos {
+        if other.id == current.id || !other.path.exists() {
+            continue;
+        }
+        let other_refs = git_ref_tips(&other.path)?;
+        let shared = shared_ref_descriptions(&current_refs, &other_refs);
+        if !shared.is_empty() {
+            store.record_related_history(current.id, other.id, &shared)?;
+            detected += 1;
+        }
+    }
+    Ok(detected)
+}
+
+fn git_ref_tips(path: &Path) -> Result<Vec<(String, String)>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args([
+            "for-each-ref",
+            "--format=%(objectname)%09%(refname:short)",
+            "refs/heads",
+            "refs/remotes",
+            "refs/tags",
+        ])
+        .output()
+        .with_context(|| format!("reading Git refs in {}", path.display()))?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    let stdout = String::from_utf8(output.stdout).context("Git refs contain invalid UTF-8")?;
+    Ok(stdout
+        .lines()
+        .filter_map(|line| {
+            let (object, name) = line.split_once('\t')?;
+            Some((object.to_string(), name.to_string()))
+        })
+        .collect())
+}
+
+fn shared_ref_descriptions(
+    current_refs: &[(String, String)],
+    other_refs: &[(String, String)],
+) -> Vec<String> {
+    let other_objects = other_refs
+        .iter()
+        .map(|(object, _name)| object)
+        .collect::<HashSet<_>>();
+    current_refs
+        .iter()
+        .filter(|(object, _name)| other_objects.contains(object))
+        .take(20)
+        .map(|(object, name)| format!("{} {}", short_hash(object), name))
+        .collect()
+}
+
+fn short_hash(hash: &str) -> &str {
+    hash.get(..12).unwrap_or(hash)
+}
+
+fn notify_related_history(count: usize, locator: &Locator) {
+    let body = format!(
+        "{} shares Git history with {count} managed repo(s). Run `repo related list`.",
+        locator.key()
+    );
+    let _ = Command::new("notify-send")
+        .arg("repo-manager")
+        .arg(&body)
+        .status();
 }
 
 fn apply_filesystem_move(plan: &MovePlan) -> Result<()> {
@@ -1587,6 +2251,156 @@ fn git_remote_url(cwd: &Path, name: &str) -> Result<Option<String>> {
         .trim()
         .to_string();
     Ok((!url.is_empty()).then_some(url))
+}
+
+fn output_setup(output: &Output, result: &SetupResult) -> Result<()> {
+    if output.json {
+        return print_json(result);
+    }
+    println!("saved config: {}", result.config_path.display());
+    println!("{}", result.note);
+    Ok(())
+}
+
+fn output_clone(output: &Output, result: &CloneResult) -> Result<()> {
+    if output.json {
+        return print_json(result);
+    }
+    println!(
+        "cloned {} -> {}",
+        result.locator.key(),
+        result.path.display()
+    );
+    Ok(())
+}
+
+fn output_fork(output: &Output, result: &ForkResult) -> Result<()> {
+    if output.json {
+        return print_json(result);
+    }
+    println!(
+        "created fork worktree {} -> {}",
+        result.fork_locator.key(),
+        result.fork_path.display()
+    );
+    println!(
+        "registered fork remote `{}` on {}",
+        result.fork_remote,
+        result.canonical_path.display()
+    );
+    Ok(())
+}
+
+fn output_worktree(output: &Output, plan: &WorktreePlan) -> Result<()> {
+    if output.json {
+        return print_json(plan);
+    }
+    println!(
+        "created worktree {} -> {}",
+        plan.canonical_locator.key(),
+        plan.worktree_path.display()
+    );
+    Ok(())
+}
+
+fn output_move(output: &Output, plan: &MovePlan) -> Result<()> {
+    if output.json {
+        return print_json(plan);
+    }
+    println!(
+        "moved {} -> {}",
+        plan.old_locator.key(),
+        plan.new_locator.key()
+    );
+    println!("current path: {}", plan.new_path.display());
+    for alias in &plan.aliases {
+        println!(
+            "alias: {} -> {}",
+            alias.alias_path.display(),
+            alias.target_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn output_reconcile(output: &Output, report: &ReconcileReport) -> Result<()> {
+    if output.json {
+        return print_json(report);
+    }
+    println!("applied {} move(s)", report.planned_moves.len());
+    if !report.skipped.is_empty() {
+        println!("skipped {} repo(s)", report.skipped.len());
+    }
+    Ok(())
+}
+
+fn output_successor(output: &Output, result: &SuccessorResult) -> Result<()> {
+    if output.json {
+        return print_json(result);
+    }
+    println!(
+        "recorded successor: {} -> {}",
+        result.old_ref,
+        result.new_locator.key()
+    );
+    Ok(())
+}
+
+fn output_aliases(output: &Output, aliases: &[AliasPlan]) -> Result<()> {
+    if output.json {
+        return print_json(&aliases);
+    }
+    if aliases.is_empty() {
+        println!("no aliases");
+        return Ok(());
+    }
+    for alias in aliases {
+        println!(
+            "{} -> {}",
+            alias.alias_path.display(),
+            alias.target_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn output_related(output: &Output, suggestions: &[RelatedSuggestion]) -> Result<()> {
+    if output.json {
+        return print_json(&suggestions);
+    }
+    if suggestions.is_empty() {
+        println!("no unresolved shared-history suggestions");
+        return Ok(());
+    }
+    for suggestion in suggestions {
+        let refs = if suggestion.shared_refs.is_empty() {
+            "shared refs: unknown".to_string()
+        } else {
+            format!("shared refs: {}", suggestion.shared_refs.join(", "))
+        };
+        println!(
+            "#{} {} <-> {} ({refs})",
+            suggestion.id,
+            suggestion.repo_locator.key(),
+            suggestion.related_locator.key()
+        );
+        println!(
+            "  resolve with: repo related resolve {} <kind>",
+            suggestion.id
+        );
+    }
+    Ok(())
+}
+
+fn output_related_resolution(output: &Output, resolution: &RelatedResolution) -> Result<()> {
+    if output.json {
+        return print_json(resolution);
+    }
+    println!(
+        "resolved shared-history suggestion #{} as {}",
+        resolution.id, resolution.resolution
+    );
+    Ok(())
 }
 
 fn print_json<T: Serialize>(value: &T) -> Result<()> {
@@ -1832,6 +2646,8 @@ mod tests {
             cache_root: dir.path().join("cache"),
             clone_root,
             worktree_root,
+            rpc_url: default_rpc_url(),
+            detect_related: false,
         };
 
         let report = reconcile_repos(&config, &store).unwrap();
@@ -1891,6 +2707,8 @@ mod tests {
             cache_root,
             clone_root,
             worktree_root: dir.path().join("worktrees"),
+            rpc_url: default_rpc_url(),
+            detect_related: false,
         };
 
         let report = reconcile_repos(&config, &store).unwrap();
@@ -1923,6 +2741,8 @@ mod tests {
             cache_root: Some(dir.path().join("cache/from-file")),
             clone_root: Some(dir.path().join("clones/from-file")),
             worktree_root: Some(dir.path().join("worktrees/from-file")),
+            rpc_url: Some("tcp://127.0.0.1:47321".to_string()),
+            detect_related: Some(true),
         }
         .save(&config_path)
         .unwrap();
@@ -1933,12 +2753,17 @@ mod tests {
             cache_root: Some(dir.path().join("cache/from-cli")),
             clone_root: None,
             worktree_root: None,
+            rpc_url: Some("udp://127.0.0.1:47322".to_string()),
+            detect_related: Some(false),
+            json: false,
             command: Commands::Setup(SetupCommands::Setup(SetupArgs {
                 file: None,
                 state: None,
                 cache_root: None,
                 clone_root: None,
                 worktree_root: None,
+                rpc_url: None,
+                detect_related: None,
             })),
         };
         let config = Config::from_cli(&cli).unwrap();
@@ -1948,6 +2773,8 @@ mod tests {
         assert_eq!(config.cache_root, dir.path().join("cache/from-cli"));
         assert_eq!(config.clone_root, dir.path().join("clones/from-file"));
         assert_eq!(config.worktree_root, dir.path().join("worktrees/from-file"));
+        assert_eq!(config.rpc_url, "udp://127.0.0.1:47322");
+        assert!(!config.detect_related);
     }
 
     #[test]
@@ -1959,17 +2786,22 @@ mod tests {
             cache_root: dir.path().join("cache"),
             clone_root: dir.path().join("clones"),
             worktree_root: dir.path().join("worktrees"),
+            rpc_url: default_rpc_url(),
+            detect_related: false,
         };
         let explicit_file = dir.path().join("custom/repo-config.json");
 
         setup_config(
             &config,
+            &Output { json: true },
             SetupArgs {
                 file: Some(explicit_file.clone()),
                 state: None,
                 cache_root: None,
                 clone_root: Some(dir.path().join("custom-clones")),
                 worktree_root: None,
+                rpc_url: Some("tcp://127.0.0.1:47321".to_string()),
+                detect_related: Some(true),
             },
         )
         .unwrap();
@@ -1980,6 +2812,37 @@ mod tests {
         assert_eq!(saved.cache_root, Some(config.cache_root));
         assert_eq!(saved.clone_root, Some(dir.path().join("custom-clones")));
         assert_eq!(saved.worktree_root, Some(config.worktree_root));
+        assert_eq!(saved.rpc_url, Some("tcp://127.0.0.1:47321".to_string()));
+        assert_eq!(saved.detect_related, Some(true));
+    }
+
+    #[test]
+    fn related_history_suggestions_are_persisted_until_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("repos.sqlite")).unwrap();
+        let first_locator = Locator::parse("github.com/example/first").unwrap();
+        let second_locator = Locator::parse("github.com/example/second").unwrap();
+        let first_path = dir.path().join("clones/github.com/example/first");
+        let second_path = dir.path().join("clones/github.com/example/second");
+        let first_id = store
+            .upsert_repo(&first_locator, &first_path, None)
+            .unwrap();
+        let second_id = store
+            .upsert_repo(&second_locator, &second_path, None)
+            .unwrap();
+
+        store
+            .record_related_history(first_id, second_id, &["abcdef123456 main".to_string()])
+            .unwrap();
+
+        let suggestions = store.related_suggestions(true).unwrap();
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(store.pending_related_count().unwrap(), 1);
+
+        store.resolve_related(suggestions[0].id, "mirror").unwrap();
+
+        assert_eq!(store.pending_related_count().unwrap(), 0);
+        assert!(store.related_suggestions(true).unwrap().is_empty());
     }
 
     #[test]
