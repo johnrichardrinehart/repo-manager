@@ -9,6 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -105,6 +106,23 @@ pub struct Cli {
 
     #[arg(
         long,
+        env = "REPO_MANAGER_RELATED_SCAN_ROOT",
+        value_name = "DIR",
+        help = "Root scanned by the daemon for shared-history review (default: ~/code)",
+        long_help = "Root scanned by the daemon after a client reports a completed clone. Defaults to ~/code."
+    )]
+    related_scan_root: Option<PathBuf>,
+
+    #[arg(
+        long,
+        env = "REPO_MANAGER_CLONE_START_TTL_MINUTES",
+        value_name = "MINUTES",
+        help = "Daemon TTL for in-progress clone events (default: 60)"
+    )]
+    clone_start_ttl_minutes: Option<u64>,
+
+    #[arg(
+        long,
         env = "REPO_MANAGER_RPC_RATE_LIMIT_PER_SECOND",
         value_name = "N",
         help = "Daemon RPC receive rate limit per client (default: 1; 0 disables)"
@@ -144,7 +162,7 @@ enum SetupCommands {
     Setup(SetupArgs),
     #[command(
         about = "Run the repo-manager RPC daemon",
-        long_about = "Run the repo-manager RPC daemon.\n\nThe daemon receives clone lifecycle events from clients. When related-history detection is configured, it compares successful clones with other managed repositories and records pending relationship decisions."
+        long_about = "Run the repo-manager RPC daemon.\n\nThe daemon receives clone lifecycle events from clients. When related-history detection is configured, a matching clone-start and successful clone-finished pair makes the daemon scan the configured related scan root for other Git repositories, compare commit history, and record pending relationship decisions."
     )]
     Daemon(DaemonArgs),
 }
@@ -255,6 +273,20 @@ struct SetupArgs {
         help = "Persist daemon-side related-history detection after successful clones"
     )]
     detect_related: Option<bool>,
+
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Persist the daemon shared-history scan root (default: ~/code)"
+    )]
+    related_scan_root: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "MINUTES",
+        help = "Persist daemon TTL for in-progress clone events (default: 60)"
+    )]
+    clone_start_ttl_minutes: Option<u64>,
 
     #[arg(
         long,
@@ -457,6 +489,8 @@ struct Config {
     rpc_url: String,
     client_id: String,
     detect_related: bool,
+    related_scan_root: PathBuf,
+    clone_start_ttl_minutes: u64,
     rpc_rate_limit_per_second: u32,
 }
 
@@ -474,6 +508,8 @@ struct FileConfig {
     rpc_url: Option<String>,
     client_id: Option<String>,
     detect_related: Option<bool>,
+    related_scan_root: Option<PathBuf>,
+    clone_start_ttl_minutes: Option<u64>,
     rpc_rate_limit_per_second: Option<u32>,
 }
 
@@ -500,10 +536,14 @@ struct ReconcileSkip {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "event", rename_all = "snake_case")]
+#[serde(tag = "event")]
 enum RpcEvent {
-    CloneStarted(CloneStartedEvent),
-    CloneFinished(CloneFinishedEvent),
+    #[serde(rename = "clone_started")]
+    Started(CloneStartedEvent),
+    #[serde(rename = "clone_finished")]
+    Finished(CloneFinishedEvent),
+    #[serde(rename = "clone_cancelled")]
+    Cancelled(CloneCancelledEvent),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -523,11 +563,29 @@ struct CloneFinishedEvent {
     success: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CloneCancelledEvent {
+    client_id: String,
+    url: String,
+    locator: Locator,
+    path: PathBuf,
+    reason: String,
+}
+
 impl RpcEvent {
     fn client_id(&self) -> &str {
         match self {
-            Self::CloneStarted(event) => &event.client_id,
-            Self::CloneFinished(event) => &event.client_id,
+            Self::Started(event) => &event.client_id,
+            Self::Finished(event) => &event.client_id,
+            Self::Cancelled(event) => &event.client_id,
+        }
+    }
+
+    fn event_name(&self) -> &'static str {
+        match self {
+            Self::Started(_) => "clone_started",
+            Self::Finished(_) => "clone_finished",
+            Self::Cancelled(_) => "clone_cancelled",
         }
     }
 }
@@ -808,6 +866,15 @@ impl Config {
             .detect_related
             .or(file_config.detect_related)
             .unwrap_or(false);
+        let related_scan_root = cli
+            .related_scan_root
+            .clone()
+            .or(file_config.related_scan_root)
+            .unwrap_or(default_related_scan_root()?);
+        let clone_start_ttl_minutes = cli
+            .clone_start_ttl_minutes
+            .or(file_config.clone_start_ttl_minutes)
+            .unwrap_or(60);
         let rpc_rate_limit_per_second = cli
             .rpc_rate_limit_per_second
             .or(file_config.rpc_rate_limit_per_second)
@@ -821,6 +888,8 @@ impl Config {
             rpc_url,
             client_id,
             detect_related,
+            related_scan_root,
+            clone_start_ttl_minutes,
             rpc_rate_limit_per_second,
         })
     }
@@ -853,6 +922,12 @@ impl FileConfig {
         self.rpc_url = other.rpc_url.or_else(|| self.rpc_url.take());
         self.client_id = other.client_id.or_else(|| self.client_id.take());
         self.detect_related = other.detect_related.or(self.detect_related);
+        self.related_scan_root = other
+            .related_scan_root
+            .or_else(|| self.related_scan_root.take());
+        self.clone_start_ttl_minutes = other
+            .clone_start_ttl_minutes
+            .or(self.clone_start_ttl_minutes);
         self.rpc_rate_limit_per_second = other
             .rpc_rate_limit_per_second
             .or(self.rpc_rate_limit_per_second);
@@ -882,6 +957,14 @@ fn setup_config(config: &Config, output: &Output, args: SetupArgs) -> Result<()>
         rpc_url: Some(args.rpc_url.unwrap_or_else(|| config.rpc_url.clone())),
         client_id: Some(args.client_id.unwrap_or_else(|| config.client_id.clone())),
         detect_related: Some(args.detect_related.unwrap_or(config.detect_related)),
+        related_scan_root: Some(
+            args.related_scan_root
+                .unwrap_or_else(|| config.related_scan_root.clone()),
+        ),
+        clone_start_ttl_minutes: Some(
+            args.clone_start_ttl_minutes
+                .unwrap_or(config.clone_start_ttl_minutes),
+        ),
         rpc_rate_limit_per_second: Some(
             args.rpc_rate_limit_per_second
                 .unwrap_or(config.rpc_rate_limit_per_second),
@@ -937,6 +1020,10 @@ fn default_clone_root() -> Result<PathBuf> {
 
 fn default_worktree_root() -> Result<PathBuf> {
     Ok(home_dir()?.join("code/worktrees"))
+}
+
+fn default_related_scan_root() -> Result<PathBuf> {
+    Ok(home_dir()?.join("code"))
 }
 
 fn default_rpc_url() -> String {
@@ -1507,6 +1594,14 @@ impl Store {
         related_repo_id: i64,
         shared_refs: &[String],
     ) -> Result<()> {
+        if repo_id == related_repo_id {
+            return Ok(());
+        }
+        let (repo_id, related_repo_id) = if repo_id < related_repo_id {
+            (repo_id, related_repo_id)
+        } else {
+            (related_repo_id, repo_id)
+        };
         self.conn.execute(
             "
             INSERT INTO related_history (repo_id, related_repo_id, shared_refs_json)
@@ -1608,29 +1703,42 @@ fn clone_repo(config: &Config, db: &Store, output: &Output, url: &str) -> Result
     fs::create_dir_all(path.parent().context("clone path has no parent")?)?;
     send_rpc_event_best_effort(
         &config.rpc_url,
-        &RpcEvent::CloneStarted(CloneStartedEvent {
+        &RpcEvent::Started(CloneStartedEvent {
             client_id: config.client_id.clone(),
             url: url.to_string(),
             locator: locator.clone(),
             path: path.clone(),
         }),
     );
+    let lifecycle = CloneLifecycle {
+        rpc_url: config.rpc_url.clone(),
+        client_id: config.client_id.clone(),
+        url: url.to_string(),
+        locator: locator.clone(),
+        path: path.clone(),
+    };
     let clone_result = if which::which("ghq").is_ok() {
-        let status = ghq_get_command(&config.clone_root, url)
-            .status()
-            .context("running ghq get")?;
-        if !status.success() {
-            run_git(["clone", url, &path.display().to_string()])
-        } else {
-            Ok(())
+        match run_clone_command_with_cancellation(
+            ghq_get_command(&config.clone_root, url),
+            "ghq get",
+            &lifecycle,
+        )? {
+            CloneCommandOutcome::Success => Ok(()),
+            CloneCommandOutcome::Failed => run_clone_command_with_cancellation(
+                git_clone_command(url, &path),
+                "git clone",
+                &lifecycle,
+            )
+            .and_then(CloneCommandOutcome::into_result),
         }
     } else {
-        run_git(["clone", url, &path.display().to_string()])
+        run_clone_command_with_cancellation(git_clone_command(url, &path), "git clone", &lifecycle)
+            .and_then(CloneCommandOutcome::into_result)
     };
     if let Err(error) = clone_result {
         send_rpc_event_best_effort(
             &config.rpc_url,
-            &RpcEvent::CloneFinished(CloneFinishedEvent {
+            &RpcEvent::Finished(CloneFinishedEvent {
                 client_id: config.client_id.clone(),
                 url: url.to_string(),
                 locator,
@@ -1643,7 +1751,7 @@ fn clone_repo(config: &Config, db: &Store, output: &Output, url: &str) -> Result
     db.upsert_repo(&locator, &path, None)?;
     send_rpc_event_best_effort(
         &config.rpc_url,
-        &RpcEvent::CloneFinished(CloneFinishedEvent {
+        &RpcEvent::Finished(CloneFinishedEvent {
             client_id: config.client_id.clone(),
             url: url.to_string(),
             locator: locator.clone(),
@@ -1665,6 +1773,103 @@ fn ghq_get_command(root: &Path, url: &str) -> Command {
     let mut command = Command::new("ghq");
     command.env("GHQ_ROOT", root).arg("get").arg(url);
     command
+}
+
+fn git_clone_command(url: &str, path: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.arg("clone").arg(url).arg(path);
+    command
+}
+
+#[derive(Debug)]
+struct CloneLifecycle {
+    rpc_url: String,
+    client_id: String,
+    url: String,
+    locator: Locator,
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloneCommandOutcome {
+    Success,
+    Failed,
+}
+
+impl CloneCommandOutcome {
+    fn into_result(self) -> Result<()> {
+        match self {
+            Self::Success => Ok(()),
+            Self::Failed => bail!("clone command failed"),
+        }
+    }
+}
+
+fn run_clone_command_with_cancellation(
+    mut command: Command,
+    label: &str,
+    lifecycle: &CloneLifecycle,
+) -> Result<CloneCommandOutcome> {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let signal_ids = register_clone_cancel_signals(Arc::clone(&cancelled))?;
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("starting {label}"))?;
+    let outcome = loop {
+        if cancelled.load(Ordering::Relaxed) {
+            send_clone_cancelled(lifecycle, "client received termination signal");
+            let _ = child.kill();
+            let _ = child.wait();
+            break Err(anyhow!("{label} cancelled by signal"));
+        }
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("waiting for {label}"))?
+        {
+            break Ok(if status.success() {
+                CloneCommandOutcome::Success
+            } else {
+                CloneCommandOutcome::Failed
+            });
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+    unregister_clone_cancel_signals(signal_ids);
+    outcome
+}
+
+fn register_clone_cancel_signals(cancelled: Arc<AtomicBool>) -> Result<Vec<signal_hook::SigId>> {
+    let signals = [
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGHUP,
+    ];
+    signals
+        .into_iter()
+        .map(|signal| {
+            signal_hook::flag::register(signal, Arc::clone(&cancelled))
+                .with_context(|| format!("registering signal handler for {signal}"))
+        })
+        .collect()
+}
+
+fn unregister_clone_cancel_signals(signal_ids: Vec<signal_hook::SigId>) {
+    for signal_id in signal_ids {
+        signal_hook::low_level::unregister(signal_id);
+    }
+}
+
+fn send_clone_cancelled(lifecycle: &CloneLifecycle, reason: &str) {
+    send_rpc_event_best_effort(
+        &lifecycle.rpc_url,
+        &RpcEvent::Cancelled(CloneCancelledEvent {
+            client_id: lifecycle.client_id.clone(),
+            url: lifecycle.url.clone(),
+            locator: lifecycle.locator.clone(),
+            path: lifecycle.path.clone(),
+            reason: reason.to_string(),
+        }),
+    );
 }
 
 fn fork_repo(
@@ -1974,6 +2179,29 @@ impl RateLimiter {
     }
 }
 
+#[derive(Debug)]
+struct DaemonState {
+    rate_limiter: Mutex<RateLimiter>,
+    clone_starts: Mutex<HashMap<String, InProgressClone>>,
+    clone_start_ttl: Duration,
+}
+
+impl DaemonState {
+    fn new(rate_limit_per_second: u32, clone_start_ttl_minutes: u64) -> Self {
+        Self {
+            rate_limiter: Mutex::new(RateLimiter::new(rate_limit_per_second)),
+            clone_starts: Mutex::new(HashMap::new()),
+            clone_start_ttl: Duration::from_secs(clone_start_ttl_minutes.saturating_mul(60)),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct InProgressClone {
+    event: CloneStartedEvent,
+    started_at: Instant,
+}
+
 fn parse_rpc_endpoint(input: &str) -> Result<RpcEndpoint> {
     let url = Url::parse(input).with_context(|| format!("invalid RPC endpoint URL: {input}"))?;
     match url.scheme() {
@@ -2038,22 +2266,62 @@ fn send_rpc_event_best_effort(endpoint: &str, event: &RpcEvent) {
 
 fn run_daemon(config: &Config, args: DaemonArgs) -> Result<()> {
     let endpoint = parse_rpc_endpoint(args.listen.as_deref().unwrap_or(&config.rpc_url))?;
-    let rate_limiter = Arc::new(Mutex::new(RateLimiter::new(
+    let daemon_state = Arc::new(DaemonState::new(
         config.rpc_rate_limit_per_second,
-    )));
+        config.clone_start_ttl_minutes,
+    ));
+    spawn_clone_ttl_cleanup(Arc::clone(&daemon_state));
     match endpoint {
-        RpcEndpoint::Unix(path) => run_unix_daemon(config, &path, rate_limiter),
-        RpcEndpoint::Tcp(addr) => run_tcp_daemon(config, &addr, rate_limiter),
-        RpcEndpoint::Udp(addr) => run_udp_daemon(config, &addr, rate_limiter),
+        RpcEndpoint::Unix(path) => run_unix_daemon(config, &path, daemon_state),
+        RpcEndpoint::Tcp(addr) => run_tcp_daemon(config, &addr, daemon_state),
+        RpcEndpoint::Udp(addr) => run_udp_daemon(config, &addr, daemon_state),
     }
 }
 
+fn spawn_clone_ttl_cleanup(daemon_state: Arc<DaemonState>) {
+    thread::spawn(move || {
+        let sleep_for = daemon_state
+            .clone_start_ttl
+            .min(Duration::from_secs(60))
+            .max(Duration::from_secs(1));
+        loop {
+            thread::sleep(sleep_for);
+            if let Err(error) = prune_expired_clone_starts(&daemon_state) {
+                warn!("could not prune expired clone-start events: {error:#}");
+            }
+        }
+    });
+}
+
+fn prune_expired_clone_starts(daemon_state: &DaemonState) -> Result<usize> {
+    let ttl = daemon_state.clone_start_ttl;
+    let now = Instant::now();
+    let mut clone_starts = daemon_state
+        .clone_starts
+        .lock()
+        .map_err(|_| anyhow!("daemon clone-start lock poisoned"))?;
+    let before = clone_starts.len();
+    clone_starts.retain(|_key, clone| {
+        let keep = now.duration_since(clone.started_at) < ttl;
+        if !keep {
+            debug!(
+                "clone-start event expired for client {}: {} -> {}",
+                clone.event.client_id,
+                clone.event.locator.key(),
+                clone.event.path.display()
+            );
+        }
+        keep
+    });
+    let pruned = before - clone_starts.len();
+    if pruned > 0 {
+        debug!("pruned {pruned} expired clone-start event(s)");
+    }
+    Ok(pruned)
+}
+
 #[cfg(unix)]
-fn run_unix_daemon(
-    config: &Config,
-    path: &Path,
-    rate_limiter: Arc<Mutex<RateLimiter>>,
-) -> Result<()> {
+fn run_unix_daemon(config: &Config, path: &Path, daemon_state: Arc<DaemonState>) -> Result<()> {
     if path.exists() {
         fs::remove_file(path)
             .with_context(|| format!("removing stale RPC socket {}", path.display()))?;
@@ -2071,10 +2339,10 @@ fn run_unix_daemon(
         let stream = stream.context("accepting unix RPC connection")?;
         let peer = unix_peer_description(&stream, path);
         let config = config.clone();
-        let rate_limiter = Arc::clone(&rate_limiter);
+        let daemon_state = Arc::clone(&daemon_state);
         thread::spawn(move || {
             if let Err(error) =
-                handle_rpc_reader(&config, BufReader::new(stream), peer, rate_limiter)
+                handle_rpc_reader(&config, BufReader::new(stream), peer, daemon_state)
             {
                 eprintln!("repo-manager daemon: {error:#}");
             }
@@ -2084,19 +2352,11 @@ fn run_unix_daemon(
 }
 
 #[cfg(not(unix))]
-fn run_unix_daemon(
-    _config: &Config,
-    _path: &Path,
-    _rate_limiter: Arc<Mutex<RateLimiter>>,
-) -> Result<()> {
+fn run_unix_daemon(_config: &Config, _path: &Path, _daemon_state: Arc<DaemonState>) -> Result<()> {
     bail!("unix RPC endpoints are not supported on this platform")
 }
 
-fn run_tcp_daemon(
-    config: &Config,
-    addr: &str,
-    rate_limiter: Arc<Mutex<RateLimiter>>,
-) -> Result<()> {
+fn run_tcp_daemon(config: &Config, addr: &str, daemon_state: Arc<DaemonState>) -> Result<()> {
     let listener = TcpListener::bind(addr).with_context(|| format!("listening on tcp://{addr}"))?;
     println!("repo-manager daemon listening on tcp://{addr}");
     for stream in listener.incoming() {
@@ -2106,10 +2366,10 @@ fn run_tcp_daemon(
             .map(|addr| format!("tcp://{addr}"))
             .unwrap_or_else(|_| "tcp://unknown-peer".to_string());
         let config = config.clone();
-        let rate_limiter = Arc::clone(&rate_limiter);
+        let daemon_state = Arc::clone(&daemon_state);
         thread::spawn(move || {
             if let Err(error) =
-                handle_rpc_reader(&config, BufReader::new(stream), peer, rate_limiter)
+                handle_rpc_reader(&config, BufReader::new(stream), peer, daemon_state)
             {
                 eprintln!("repo-manager daemon: {error:#}");
             }
@@ -2118,11 +2378,7 @@ fn run_tcp_daemon(
     Ok(())
 }
 
-fn run_udp_daemon(
-    config: &Config,
-    addr: &str,
-    rate_limiter: Arc<Mutex<RateLimiter>>,
-) -> Result<()> {
+fn run_udp_daemon(config: &Config, addr: &str, daemon_state: Arc<DaemonState>) -> Result<()> {
     let socket = UdpSocket::bind(addr).with_context(|| format!("listening on udp://{addr}"))?;
     println!("repo-manager daemon listening on udp://{addr}");
     let mut buffer = [0_u8; 65_535];
@@ -2132,10 +2388,10 @@ fn run_udp_daemon(
         debug!("received RPC message from udp://{peer}: {}", message.trim());
         let event: RpcEvent = serde_json::from_str(message.trim())
             .with_context(|| format!("parsing RPC event: {message}"))?;
-        if !allow_rpc_event(&rate_limiter, &event, &format!("udp://{peer}"))? {
+        if !allow_rpc_event(&daemon_state, &event, &format!("udp://{peer}"))? {
             continue;
         }
-        handle_rpc_event(config, event)?;
+        handle_rpc_event(config, &daemon_state, event)?;
     }
 }
 
@@ -2143,7 +2399,7 @@ fn handle_rpc_reader<R: BufRead>(
     config: &Config,
     mut reader: R,
     peer: String,
-    rate_limiter: Arc<Mutex<RateLimiter>>,
+    daemon_state: Arc<DaemonState>,
 ) -> Result<()> {
     let mut line = String::new();
     while reader.read_line(&mut line)? != 0 {
@@ -2152,26 +2408,24 @@ fn handle_rpc_reader<R: BufRead>(
             debug!("received RPC message from {peer}: {trimmed}");
             let event: RpcEvent =
                 serde_json::from_str(trimmed).context("parsing RPC event JSON")?;
-            if !allow_rpc_event(&rate_limiter, &event, &peer)? {
+            if !allow_rpc_event(&daemon_state, &event, &peer)? {
                 line.clear();
                 continue;
             }
-            handle_rpc_event(config, event)?;
+            handle_rpc_event(config, &daemon_state, event)?;
         }
         line.clear();
     }
     Ok(())
 }
 
-fn allow_rpc_event(
-    rate_limiter: &Arc<Mutex<RateLimiter>>,
-    event: &RpcEvent,
-    peer: &str,
-) -> Result<bool> {
-    let mut limiter = rate_limiter
+fn allow_rpc_event(daemon_state: &DaemonState, event: &RpcEvent, peer: &str) -> Result<bool> {
+    let mut limiter = daemon_state
+        .rate_limiter
         .lock()
         .map_err(|_| anyhow!("RPC rate limiter lock poisoned"))?;
-    let allowed = limiter.allow(event.client_id());
+    let key = format!("{}:{}", event.client_id(), event.event_name());
+    let allowed = limiter.allow(&key);
     if !allowed {
         warn!(
             "rate limited RPC message from client {} ({peer})",
@@ -2191,18 +2445,30 @@ fn unix_peer_description(stream: &UnixStream, socket_path: &Path) -> String {
     format!("unix://{} peer={addr}", socket_path.display())
 }
 
-fn handle_rpc_event(config: &Config, event: RpcEvent) -> Result<()> {
+fn handle_rpc_event(config: &Config, daemon_state: &DaemonState, event: RpcEvent) -> Result<()> {
+    prune_expired_clone_starts(daemon_state)?;
     match event {
-        RpcEvent::CloneStarted(event) => {
+        RpcEvent::Started(event) => {
             debug!(
                 "clone started from client {}: {} -> {}",
                 event.client_id,
                 event.locator.key(),
                 event.path.display()
             );
+            daemon_state
+                .clone_starts
+                .lock()
+                .map_err(|_| anyhow!("daemon clone-start lock poisoned"))?
+                .insert(
+                    clone_event_key(&event.client_id, &event.locator, &event.path),
+                    InProgressClone {
+                        event,
+                        started_at: Instant::now(),
+                    },
+                );
             Ok(())
         }
-        RpcEvent::CloneFinished(event) => {
+        RpcEvent::Finished(event) => {
             debug!(
                 "clone finished from client {}: {} -> {} success={}",
                 event.client_id,
@@ -2210,96 +2476,198 @@ fn handle_rpc_event(config: &Config, event: RpcEvent) -> Result<()> {
                 event.path.display(),
                 event.success
             );
-            if event.success && config.detect_related {
+            let started = daemon_state
+                .clone_starts
+                .lock()
+                .map_err(|_| anyhow!("daemon clone-start lock poisoned"))?
+                .remove(&clone_event_key(
+                    &event.client_id,
+                    &event.locator,
+                    &event.path,
+                ));
+            if event.success && config.detect_related && started.is_some() {
                 let store = Store::open(&config.state)?;
-                let count = detect_related_history(&store, &event.locator)?;
+                let count = detect_related_history_under_code(
+                    &store,
+                    &event.locator,
+                    &event.path,
+                    &config.related_scan_root,
+                )?;
                 if count > 0 {
                     notify_related_history(count, &event.locator);
                 }
+            } else if event.success && config.detect_related {
+                debug!(
+                    "skipping related-history review for {} because no matching clone-start event was observed",
+                    event.locator.key()
+                );
             }
+            Ok(())
+        }
+        RpcEvent::Cancelled(event) => {
+            debug!(
+                "clone cancelled from client {}: {} -> {} reason={}",
+                event.client_id,
+                event.locator.key(),
+                event.path.display(),
+                event.reason
+            );
+            daemon_state
+                .clone_starts
+                .lock()
+                .map_err(|_| anyhow!("daemon clone-start lock poisoned"))?
+                .remove(&clone_event_key(
+                    &event.client_id,
+                    &event.locator,
+                    &event.path,
+                ));
             Ok(())
         }
     }
 }
 
-fn detect_related_history(store: &Store, locator: &Locator) -> Result<usize> {
-    let Some(repo) = store.find_repo(locator.key().as_str())? else {
-        return Ok(0);
-    };
-    let repos = store.current_repos()?;
-    let Some(current) = repos
-        .iter()
-        .find(|candidate| candidate.id == repo.id)
-        .cloned()
-    else {
-        return Ok(0);
-    };
-    let current_refs = git_ref_tips(&current.path)?;
-    if current_refs.is_empty() {
+fn clone_event_key(client_id: &str, locator: &Locator, path: &Path) -> String {
+    format!("{}\n{}\n{}", client_id, locator.key(), path.display())
+}
+
+fn detect_related_history_under_code(
+    store: &Store,
+    locator: &Locator,
+    path: &Path,
+    scan_root: &Path,
+) -> Result<usize> {
+    let current_id = store.upsert_repo(locator, path, None)?;
+    let current_commits = git_commit_objects(path)?;
+    if current_commits.is_empty() {
         return Ok(0);
     }
-
+    let current_objects = current_commits.into_iter().collect::<HashSet<_>>();
+    let current_path = comparable_path(path);
     let mut detected = 0;
-    for other in repos {
-        if other.id == current.id || !other.path.exists() {
+
+    for other_path in discover_git_repositories(scan_root)? {
+        if comparable_path(&other_path) == current_path {
             continue;
         }
-        let other_refs = git_ref_tips(&other.path)?;
-        let shared = shared_ref_descriptions(&current_refs, &other_refs);
-        if !shared.is_empty() {
-            store.record_related_history(current.id, other.id, &shared)?;
-            detected += 1;
+        let shared = shared_commit_descriptions(&current_objects, &other_path)?;
+        if shared.is_empty() {
+            continue;
         }
+        let Some(other_locator) = repo_locator_from_origin(&other_path)? else {
+            debug!(
+                "skipping shared-history candidate without parseable origin: {}",
+                other_path.display()
+            );
+            continue;
+        };
+        let other_id = store.upsert_repo(&other_locator, &other_path, None)?;
+        store.record_related_history(current_id, other_id, &shared)?;
+        detected += 1;
     }
+
     Ok(detected)
 }
 
-fn git_ref_tips(path: &Path) -> Result<Vec<(String, String)>> {
+fn discover_git_repositories(root: &Path) -> Result<Vec<PathBuf>> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut repos = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        if path.join(".git").exists() {
+            repos.push(path);
+            continue;
+        }
+        let entries = match fs::read_dir(&path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                debug!(
+                    "skipping unreadable scan directory {}: {error}",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() || file_type.is_symlink() {
+                continue;
+            }
+            let name = entry.file_name();
+            if should_prune_scan_dir(&name) {
+                continue;
+            }
+            stack.push(entry.path());
+        }
+    }
+    repos.sort();
+    Ok(repos)
+}
+
+fn should_prune_scan_dir(name: &std::ffi::OsStr) -> bool {
+    matches!(
+        name.to_str(),
+        Some(".git" | ".direnv" | ".jj" | "target" | "node_modules")
+    )
+}
+
+fn repo_locator_from_origin(path: &Path) -> Result<Option<Locator>> {
+    let Some(origin) = git_origin_url(path)? else {
+        return Ok(None);
+    };
+    match Locator::parse(&origin) {
+        Ok(locator) => Ok(Some(locator)),
+        Err(error) => {
+            debug!(
+                "origin for {} is not a locator-compatible Git URL: {error:#}",
+                path.display()
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn comparable_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn git_commit_objects(path: &Path) -> Result<Vec<String>> {
     let output = Command::new("git")
         .arg("-C")
         .arg(path)
-        .args([
-            "for-each-ref",
-            "--format=%(objectname)%09%(refname:short)",
-            "refs/heads",
-            "refs/remotes",
-            "refs/tags",
-        ])
+        .args(["rev-list", "--all"])
         .output()
-        .with_context(|| format!("reading Git refs in {}", path.display()))?;
+        .with_context(|| format!("reading Git commit graph in {}", path.display()))?;
     if !output.status.success() {
         return Ok(Vec::new());
     }
-    let stdout = String::from_utf8(output.stdout).context("Git refs contain invalid UTF-8")?;
-    Ok(stdout
-        .lines()
-        .filter_map(|line| {
-            let (object, name) = line.split_once('\t')?;
-            Some((object.to_string(), name.to_string()))
-        })
-        .collect())
+    let stdout = String::from_utf8(output.stdout).context("Git commits contain invalid UTF-8")?;
+    Ok(stdout.lines().map(str::to_string).collect())
 }
 
-fn shared_ref_descriptions(
-    current_refs: &[(String, String)],
-    other_refs: &[(String, String)],
-) -> Vec<String> {
-    let other_objects = other_refs
-        .iter()
-        .map(|(object, _name)| object)
-        .collect::<HashSet<_>>();
-    current_refs
-        .iter()
-        .filter(|(object, _name)| other_objects.contains(object))
+fn shared_commit_descriptions(
+    current_objects: &HashSet<String>,
+    other_path: &Path,
+) -> Result<Vec<String>> {
+    Ok(git_commit_objects(other_path)?
+        .into_iter()
+        .filter(|object| current_objects.contains(object))
         .take(20)
-        .map(|(object, name)| format!("{} {}", short_hash(object), name))
-        .collect()
+        .map(|object| format!("shared commit {}", short_hash(&object)))
+        .collect())
 }
 
 fn short_hash(hash: &str) -> &str {
     hash.get(..12).unwrap_or(hash)
 }
 
+#[cfg(not(test))]
 fn notify_related_history(count: usize, locator: &Locator) {
     let body = format!(
         "{} shares Git history with {count} managed repo(s). Run `repo related list`.",
@@ -2310,6 +2678,9 @@ fn notify_related_history(count: usize, locator: &Locator) {
         .arg(&body)
         .status();
 }
+
+#[cfg(test)]
+fn notify_related_history(_count: usize, _locator: &Locator) {}
 
 fn apply_filesystem_move(plan: &MovePlan) -> Result<()> {
     if plan.old_path != plan.new_path {
@@ -2421,17 +2792,6 @@ fn split_authority_port(authority: &str) -> (&str, Option<u16>) {
         return (host, Some(port));
     }
     (authority, None)
-}
-
-fn run_git<const N: usize>(args: [&str; N]) -> Result<()> {
-    let status = Command::new("git")
-        .args(args)
-        .status()
-        .context("running git")?;
-    if !status.success() {
-        bail!("git command failed with status {status}");
-    }
-    Ok(())
 }
 
 fn run_git_in<I, S>(cwd: &Path, args: I) -> Result<()>
@@ -2669,9 +3029,9 @@ fn output_related(output: &Output, suggestions: &[RelatedSuggestion]) -> Result<
     }
     for suggestion in suggestions {
         let refs = if suggestion.shared_refs.is_empty() {
-            "shared refs: unknown".to_string()
+            "evidence: unknown".to_string()
         } else {
-            format!("shared refs: {}", suggestion.shared_refs.join(", "))
+            format!("evidence: {}", suggestion.shared_refs.join(", "))
         };
         println!(
             "#{} {} <-> {} ({refs})",
@@ -2944,6 +3304,8 @@ mod tests {
             rpc_url: default_rpc_url(),
             client_id: generate_client_id().unwrap(),
             detect_related: false,
+            related_scan_root: dir.path().join("code"),
+            clone_start_ttl_minutes: 60,
             rpc_rate_limit_per_second: 1,
         };
 
@@ -3007,6 +3369,8 @@ mod tests {
             rpc_url: default_rpc_url(),
             client_id: generate_client_id().unwrap(),
             detect_related: false,
+            related_scan_root: dir.path().join("code"),
+            clone_start_ttl_minutes: 60,
             rpc_rate_limit_per_second: 1,
         };
 
@@ -3043,6 +3407,8 @@ mod tests {
             rpc_url: Some("tcp://127.0.0.1:47321".to_string()),
             client_id: Some("00000000-0000-4000-8000-000000000001".to_string()),
             detect_related: Some(true),
+            related_scan_root: Some(dir.path().join("code/from-file")),
+            clone_start_ttl_minutes: Some(45),
             rpc_rate_limit_per_second: Some(7),
         }
         .save(&config_path)
@@ -3057,6 +3423,8 @@ mod tests {
             rpc_url: Some("udp://127.0.0.1:47322".to_string()),
             client_id: Some("00000000-0000-4000-8000-000000000002".to_string()),
             detect_related: Some(false),
+            related_scan_root: Some(dir.path().join("code/from-cli")),
+            clone_start_ttl_minutes: Some(30),
             rpc_rate_limit_per_second: Some(3),
             json: false,
             command: Commands::Setup(SetupCommands::Setup(SetupArgs {
@@ -3068,6 +3436,8 @@ mod tests {
                 rpc_url: None,
                 client_id: None,
                 detect_related: None,
+                related_scan_root: None,
+                clone_start_ttl_minutes: None,
                 rpc_rate_limit_per_second: None,
             })),
         };
@@ -3081,6 +3451,8 @@ mod tests {
         assert_eq!(config.rpc_url, "udp://127.0.0.1:47322");
         assert_eq!(config.client_id, "00000000-0000-4000-8000-000000000002");
         assert!(!config.detect_related);
+        assert_eq!(config.related_scan_root, dir.path().join("code/from-cli"));
+        assert_eq!(config.clone_start_ttl_minutes, 30);
         assert_eq!(config.rpc_rate_limit_per_second, 3);
     }
 
@@ -3096,6 +3468,8 @@ mod tests {
             rpc_url: default_rpc_url(),
             client_id: "00000000-0000-4000-8000-000000000003".to_string(),
             detect_related: false,
+            related_scan_root: dir.path().join("code"),
+            clone_start_ttl_minutes: 60,
             rpc_rate_limit_per_second: 1,
         };
         let explicit_file = dir.path().join("custom/repo-config.json");
@@ -3112,6 +3486,8 @@ mod tests {
                 rpc_url: Some("tcp://127.0.0.1:47321".to_string()),
                 client_id: Some("00000000-0000-4000-8000-000000000004".to_string()),
                 detect_related: Some(true),
+                related_scan_root: Some(dir.path().join("custom-code")),
+                clone_start_ttl_minutes: Some(15),
                 rpc_rate_limit_per_second: Some(5),
             },
         )
@@ -3129,6 +3505,11 @@ mod tests {
             Some("00000000-0000-4000-8000-000000000004".to_string())
         );
         assert_eq!(saved.detect_related, Some(true));
+        assert_eq!(
+            saved.related_scan_root,
+            Some(dir.path().join("custom-code"))
+        );
+        assert_eq!(saved.clone_start_ttl_minutes, Some(15));
         assert_eq!(saved.rpc_rate_limit_per_second, Some(5));
     }
 
@@ -3143,6 +3524,8 @@ mod tests {
             rpc_url: Some("unix:///run/base.sock".to_string()),
             client_id: None,
             detect_related: Some(false),
+            related_scan_root: Some(dir.path().join("code/base")),
+            clone_start_ttl_minutes: Some(60),
             rpc_rate_limit_per_second: Some(1),
         };
 
@@ -3154,6 +3537,8 @@ mod tests {
             rpc_url: None,
             client_id: Some("00000000-0000-4000-8000-000000000005".to_string()),
             detect_related: Some(true),
+            related_scan_root: Some(dir.path().join("code/user")),
+            clone_start_ttl_minutes: Some(10),
             rpc_rate_limit_per_second: Some(9),
         });
 
@@ -3161,6 +3546,8 @@ mod tests {
         assert_eq!(base.cache_root, Some(dir.path().join("cache/user")));
         assert_eq!(base.clone_root, Some(dir.path().join("clones/user")));
         assert_eq!(base.rpc_url, Some("unix:///run/base.sock".to_string()));
+        assert_eq!(base.related_scan_root, Some(dir.path().join("code/user")));
+        assert_eq!(base.clone_start_ttl_minutes, Some(10));
         assert_eq!(
             base.client_id,
             Some("00000000-0000-4000-8000-000000000005".to_string())
@@ -3184,6 +3571,198 @@ mod tests {
 
         assert!(limiter.allow("client-a"));
         assert!(limiter.allow("client-a"));
+    }
+
+    #[test]
+    fn daemon_cancellation_removes_matching_clone_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let daemon_state = DaemonState::new(0, 60);
+        let locator = Locator::parse("example.com/current").unwrap();
+        let path = dir.path().join("code/clones/example.com/current");
+
+        handle_rpc_event(
+            &config,
+            &daemon_state,
+            RpcEvent::Started(CloneStartedEvent {
+                client_id: config.client_id.clone(),
+                url: "https://example.com/current.git".to_string(),
+                locator: locator.clone(),
+                path: path.clone(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(daemon_state.clone_starts.lock().unwrap().len(), 1);
+
+        handle_rpc_event(
+            &config,
+            &daemon_state,
+            RpcEvent::Cancelled(CloneCancelledEvent {
+                client_id: config.client_id.clone(),
+                url: "https://example.com/current.git".to_string(),
+                locator,
+                path,
+                reason: "test cancellation".to_string(),
+            }),
+        )
+        .unwrap();
+        assert!(daemon_state.clone_starts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn daemon_ttl_prunes_stale_clone_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let daemon_state = DaemonState::new(0, 0);
+        let locator = Locator::parse("example.com/current").unwrap();
+        let path = dir.path().join("code/clones/example.com/current");
+
+        handle_rpc_event(
+            &config,
+            &daemon_state,
+            RpcEvent::Started(CloneStartedEvent {
+                client_id: config.client_id.clone(),
+                url: "https://example.com/current.git".to_string(),
+                locator,
+                path,
+            }),
+        )
+        .unwrap();
+
+        let pruned = prune_expired_clone_starts(&daemon_state).unwrap();
+        assert_eq!(pruned, 1);
+        assert!(daemon_state.clone_starts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn daemon_reviews_code_root_after_matching_clone_start_and_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let code_root = dir.path().join("code");
+        let seed = dir.path().join("seed");
+        let current_path = code_root.join("clones/example.com/current");
+        let other_path = code_root.join("repos/example.com/other");
+        fs::create_dir_all(&seed).unwrap();
+        run_git_in(&seed, ["init"]).unwrap();
+        fs::write(seed.join("README.md"), "shared history\n").unwrap();
+        run_git_in(&seed, ["add", "."]).unwrap();
+        run_git_in(
+            &seed,
+            [
+                "-c",
+                "user.name=repo-manager",
+                "-c",
+                "user.email=repo-manager@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        )
+        .unwrap();
+        clone_local_repo(&seed, &current_path);
+        clone_local_repo(&seed, &other_path);
+        run_git_in(
+            &current_path,
+            [
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.com/current.git",
+            ],
+        )
+        .unwrap();
+        run_git_in(
+            &other_path,
+            [
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.com/other.git",
+            ],
+        )
+        .unwrap();
+
+        let state_path = dir.path().join("repos.sqlite");
+        let config = Config {
+            config_path: dir.path().join("config.json"),
+            state: state_path.clone(),
+            cache_root: dir.path().join("cache"),
+            clone_root: dir.path().join("clones"),
+            worktree_root: dir.path().join("worktrees"),
+            rpc_url: default_rpc_url(),
+            client_id: "00000000-0000-4000-8000-000000000006".to_string(),
+            detect_related: true,
+            related_scan_root: code_root,
+            clone_start_ttl_minutes: 60,
+            rpc_rate_limit_per_second: 0,
+        };
+        let daemon_state = DaemonState::new(0, 60);
+        let locator = Locator::parse("example.com/current").unwrap();
+        let start = CloneStartedEvent {
+            client_id: config.client_id.clone(),
+            url: "https://example.com/current.git".to_string(),
+            locator: locator.clone(),
+            path: current_path.clone(),
+        };
+        handle_rpc_event(&config, &daemon_state, RpcEvent::Started(start)).unwrap();
+        handle_rpc_event(
+            &config,
+            &daemon_state,
+            RpcEvent::Finished(CloneFinishedEvent {
+                client_id: config.client_id.clone(),
+                url: "https://example.com/current.git".to_string(),
+                locator,
+                path: current_path,
+                success: true,
+            }),
+        )
+        .unwrap();
+
+        let store = Store::open(&state_path).unwrap();
+        let suggestions = store.related_suggestions(true).unwrap();
+        assert_eq!(suggestions.len(), 1);
+        assert!(
+            suggestions[0].repo_locator.key() == "example.com/current"
+                || suggestions[0].related_locator.key() == "example.com/current"
+        );
+        assert!(
+            suggestions[0].repo_locator.key() == "example.com/other"
+                || suggestions[0].related_locator.key() == "example.com/other"
+        );
+        assert!(
+            suggestions[0]
+                .shared_refs
+                .iter()
+                .any(|evidence| evidence.starts_with("shared commit "))
+        );
+    }
+
+    fn clone_local_repo(seed: &Path, destination: &Path) {
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        assert!(
+            Command::new("git")
+                .arg("clone")
+                .arg(seed)
+                .arg(destination)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    fn test_config(root: &Path) -> Config {
+        Config {
+            config_path: root.join("config.json"),
+            state: root.join("repos.sqlite"),
+            cache_root: root.join("cache"),
+            clone_root: root.join("clones"),
+            worktree_root: root.join("worktrees"),
+            rpc_url: default_rpc_url(),
+            client_id: "00000000-0000-4000-8000-000000000099".to_string(),
+            detect_related: true,
+            related_scan_root: root.join("code"),
+            clone_start_ttl_minutes: 60,
+            rpc_rate_limit_per_second: 0,
+        }
     }
 
     #[test]
