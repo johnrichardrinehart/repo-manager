@@ -17,6 +17,9 @@ anyhow = "1"
 anstyle = "1"
 clap = { version = "4", features = ["derive", "env"] }
 directories = "6"
+env_logger = "0.11"
+getrandom = "0.4"
+log = "0.4"
 repo-help-derive = { path = "crates/repo-help-derive" }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
