@@ -1125,11 +1125,7 @@ fn clone_repo(config: &Config, db: &Store, url: &str) -> Result<()> {
     let path = locator_path(&config.clone_root, &locator);
     fs::create_dir_all(path.parent().context("clone path has no parent")?)?;
     if which::which("ghq").is_ok() {
-        let status = Command::new("ghq")
-            .arg("get")
-            .arg("--root")
-            .arg(&config.clone_root)
-            .arg(url)
+        let status = ghq_get_command(&config.clone_root, url)
             .status()
             .context("running ghq get")?;
         if !status.success() {
@@ -1144,6 +1140,12 @@ fn clone_repo(config: &Config, db: &Store, url: &str) -> Result<()> {
         "locator": locator,
         "path": path,
     }))
+}
+
+fn ghq_get_command(root: &Path, url: &str) -> Command {
+    let mut command = Command::new("ghq");
+    command.arg("--root").arg(root).arg("get").arg(url);
+    command
 }
 
 fn fork_repo(config: &Config, db: &Store, fork_url: &str, canonical_url: &str) -> Result<()> {
@@ -1732,6 +1734,24 @@ mod tests {
     fn fork_remote_names_are_stable_and_locator_based() {
         let locator = Locator::parse("git.sr.ht/~alice/project").unwrap();
         assert_eq!(fork_remote_name(&locator), "fork-git.sr.ht-alice-project");
+    }
+
+    #[test]
+    fn ghq_root_is_a_global_option_before_get() {
+        let command = ghq_get_command(Path::new("/tmp/clones"), "https://github.com/owner/repo");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            vec![
+                "--root",
+                "/tmp/clones",
+                "get",
+                "https://github.com/owner/repo"
+            ]
+        );
     }
 
     #[test]
