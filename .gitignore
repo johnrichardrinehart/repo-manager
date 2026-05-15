@@ -1,0 +1,17 @@
+target/
+.direnv/
+.pre-commit-config.yaml
+result
+result-*
+
+# Local editor and OS noise
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Local repo-manager scratch state
+repos.sqlite
+repos.sqlite-*
+*.db
+*.db-*
