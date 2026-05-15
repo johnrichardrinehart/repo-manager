@@ -1,17 +1,22 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 #[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use directories::BaseDirs;
-use log::debug;
+use log::{debug, warn};
 use repo_help_derive::{HelpGroup, HelpTemplate};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -23,7 +28,7 @@ use url::Url;
     version,
     disable_help_subcommand = true,
     about = "Manage local Git repository placement, metadata, forks, worktrees, and old-path aliases",
-    long_about = "Manage local Git repositories using a stable locator model: <authority>/<remote-path>.\n\nCanonical repositories and forks live under the clone root. Development worktrees live under the worktree root."
+    long_about = "Manage local Git repositories using a stable locator model: <authority>/<remote-path>.\n\nCanonical repositories and forks live under the clone root. Development worktrees live under the worktree root.\n\nWhen --config is omitted, repo-manager layers config from each $XDG_CONFIG_DIRS entry before the user config from $XDG_CONFIG_HOME. Environment variables and explicit CLI options override persisted config."
 )]
 pub struct Cli {
     #[arg(
@@ -31,7 +36,7 @@ pub struct Cli {
         env = "REPO_MANAGER_CONFIG",
         value_name = "PATH",
         help = "Config file path (default: $XDG_CONFIG_HOME/repo-manager/config.json)",
-        long_help = "Config file path to load. Defaults to $XDG_CONFIG_HOME/repo-manager/config.json, or ~/.config/repo-manager/config.json when XDG_CONFIG_HOME is unset."
+        long_help = "Config file path to load. When omitted, repo-manager layers /repo-manager/config.json from each $XDG_CONFIG_DIRS entry, then $XDG_CONFIG_HOME/repo-manager/config.json or ~/.config/repo-manager/config.json when XDG_CONFIG_HOME is unset."
     )]
     config: Option<PathBuf>,
 
@@ -97,6 +102,14 @@ pub struct Cli {
         help = "Ask the daemon to look for shared Git history after successful clones"
     )]
     detect_related: Option<bool>,
+
+    #[arg(
+        long,
+        env = "REPO_MANAGER_RPC_RATE_LIMIT_PER_SECOND",
+        value_name = "N",
+        help = "Daemon RPC receive rate limit per client (default: 1; 0 disables)"
+    )]
+    rpc_rate_limit_per_second: Option<u32>,
 
     #[arg(
         long,
@@ -242,6 +255,13 @@ struct SetupArgs {
         help = "Persist daemon-side related-history detection after successful clones"
     )]
     detect_related: Option<bool>,
+
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Persist daemon RPC receive rate limit per client (default: 1; 0 disables)"
+    )]
+    rpc_rate_limit_per_second: Option<u32>,
 }
 
 #[derive(Debug, Args)]
@@ -437,6 +457,7 @@ struct Config {
     rpc_url: String,
     client_id: String,
     detect_related: bool,
+    rpc_rate_limit_per_second: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -453,6 +474,7 @@ struct FileConfig {
     rpc_url: Option<String>,
     client_id: Option<String>,
     detect_related: Option<bool>,
+    rpc_rate_limit_per_second: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -499,6 +521,15 @@ struct CloneFinishedEvent {
     locator: Locator,
     path: PathBuf,
     success: bool,
+}
+
+impl RpcEvent {
+    fn client_id(&self) -> &str {
+        match self {
+            Self::CloneStarted(event) => &event.client_id,
+            Self::CloneFinished(event) => &event.client_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -735,8 +766,14 @@ fn parse_cli() -> Cli {
 
 impl Config {
     fn from_cli(cli: &Cli) -> Result<Self> {
-        let config_path = cli.config.clone().unwrap_or(default_config_path()?);
-        let file_config = FileConfig::load(&config_path)?;
+        let (config_path, file_config) = match &cli.config {
+            Some(config_path) => (config_path.clone(), FileConfig::load(config_path)?),
+            None => {
+                let config_path = default_config_path()?;
+                let file_config = FileConfig::load_xdg_layered(&config_path)?;
+                (config_path, file_config)
+            }
+        };
         let state = cli
             .state
             .clone()
@@ -771,6 +808,10 @@ impl Config {
             .detect_related
             .or(file_config.detect_related)
             .unwrap_or(false);
+        let rpc_rate_limit_per_second = cli
+            .rpc_rate_limit_per_second
+            .or(file_config.rpc_rate_limit_per_second)
+            .unwrap_or(1);
         Ok(Self {
             config_path,
             state,
@@ -780,11 +821,21 @@ impl Config {
             rpc_url,
             client_id,
             detect_related,
+            rpc_rate_limit_per_second,
         })
     }
 }
 
 impl FileConfig {
+    fn load_xdg_layered(user_config_path: &Path) -> Result<Self> {
+        let mut config = Self::default();
+        for path in xdg_config_dir_paths() {
+            config.merge(Self::load(&path)?);
+        }
+        config.merge(Self::load(user_config_path)?);
+        Ok(config)
+    }
+
     fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
@@ -792,6 +843,19 @@ impl FileConfig {
         let content =
             fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         serde_json::from_str(&content).with_context(|| format!("parsing {}", path.display()))
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.state = other.state.or_else(|| self.state.take());
+        self.cache_root = other.cache_root.or_else(|| self.cache_root.take());
+        self.clone_root = other.clone_root.or_else(|| self.clone_root.take());
+        self.worktree_root = other.worktree_root.or_else(|| self.worktree_root.take());
+        self.rpc_url = other.rpc_url.or_else(|| self.rpc_url.take());
+        self.client_id = other.client_id.or_else(|| self.client_id.take());
+        self.detect_related = other.detect_related.or(self.detect_related);
+        self.rpc_rate_limit_per_second = other
+            .rpc_rate_limit_per_second
+            .or(self.rpc_rate_limit_per_second);
     }
 
     fn save(&self, path: &Path) -> Result<()> {
@@ -818,6 +882,10 @@ fn setup_config(config: &Config, output: &Output, args: SetupArgs) -> Result<()>
         rpc_url: Some(args.rpc_url.unwrap_or_else(|| config.rpc_url.clone())),
         client_id: Some(args.client_id.unwrap_or_else(|| config.client_id.clone())),
         detect_related: Some(args.detect_related.unwrap_or(config.detect_related)),
+        rpc_rate_limit_per_second: Some(
+            args.rpc_rate_limit_per_second
+                .unwrap_or(config.rpc_rate_limit_per_second),
+        ),
     };
     file_config.save(&config_path)?;
     let result = SetupResult {
@@ -839,6 +907,15 @@ fn base_dirs() -> Result<BaseDirs> {
 
 fn default_config_path() -> Result<PathBuf> {
     Ok(base_dirs()?.config_dir().join("repo-manager/config.json"))
+}
+
+fn xdg_config_dir_paths() -> Vec<PathBuf> {
+    let dirs = env::var_os("XDG_CONFIG_DIRS")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "/etc/xdg".into());
+    env::split_paths(&dirs)
+        .map(|path| path.join("repo-manager/config.json"))
+        .collect()
 }
 
 fn default_state_path() -> Result<PathBuf> {
@@ -1529,7 +1606,7 @@ fn clone_repo(config: &Config, db: &Store, output: &Output, url: &str) -> Result
     let locator = Locator::parse(url)?;
     let path = locator_path(&config.clone_root, &locator);
     fs::create_dir_all(path.parent().context("clone path has no parent")?)?;
-    let _ = send_rpc_event(
+    send_rpc_event_best_effort(
         &config.rpc_url,
         &RpcEvent::CloneStarted(CloneStartedEvent {
             client_id: config.client_id.clone(),
@@ -1551,7 +1628,7 @@ fn clone_repo(config: &Config, db: &Store, output: &Output, url: &str) -> Result
         run_git(["clone", url, &path.display().to_string()])
     };
     if let Err(error) = clone_result {
-        let _ = send_rpc_event(
+        send_rpc_event_best_effort(
             &config.rpc_url,
             &RpcEvent::CloneFinished(CloneFinishedEvent {
                 client_id: config.client_id.clone(),
@@ -1564,7 +1641,7 @@ fn clone_repo(config: &Config, db: &Store, output: &Output, url: &str) -> Result
         return Err(error);
     }
     db.upsert_repo(&locator, &path, None)?;
-    let _ = send_rpc_event(
+    send_rpc_event_best_effort(
         &config.rpc_url,
         &RpcEvent::CloneFinished(CloneFinishedEvent {
             client_id: config.client_id.clone(),
@@ -1866,6 +1943,37 @@ enum RpcEndpoint {
     Udp(String),
 }
 
+#[derive(Debug)]
+struct RateLimiter {
+    min_interval: Option<Duration>,
+    last_seen: HashMap<String, Instant>,
+}
+
+impl RateLimiter {
+    fn new(requests_per_second: u32) -> Self {
+        let min_interval = (requests_per_second > 0)
+            .then(|| Duration::from_secs_f64(1.0 / f64::from(requests_per_second)));
+        Self {
+            min_interval,
+            last_seen: HashMap::new(),
+        }
+    }
+
+    fn allow(&mut self, key: &str) -> bool {
+        let Some(min_interval) = self.min_interval else {
+            return true;
+        };
+        let now = Instant::now();
+        match self.last_seen.get(key) {
+            Some(last_seen) if now.duration_since(*last_seen) < min_interval => false,
+            _ => {
+                self.last_seen.insert(key.to_string(), now);
+                true
+            }
+        }
+    }
+}
+
 fn parse_rpc_endpoint(input: &str) -> Result<RpcEndpoint> {
     let url = Url::parse(input).with_context(|| format!("invalid RPC endpoint URL: {input}"))?;
     match url.scheme() {
@@ -1921,17 +2029,31 @@ fn send_rpc_event(endpoint: &str, event: &RpcEvent) -> Result<()> {
     }
 }
 
+fn send_rpc_event_best_effort(endpoint: &str, event: &RpcEvent) {
+    match send_rpc_event(endpoint, event) {
+        Ok(()) => debug!("sent RPC event to {endpoint}: {event:?}"),
+        Err(error) => warn!("could not send RPC event to {endpoint}: {error:#}"),
+    }
+}
+
 fn run_daemon(config: &Config, args: DaemonArgs) -> Result<()> {
     let endpoint = parse_rpc_endpoint(args.listen.as_deref().unwrap_or(&config.rpc_url))?;
+    let rate_limiter = Arc::new(Mutex::new(RateLimiter::new(
+        config.rpc_rate_limit_per_second,
+    )));
     match endpoint {
-        RpcEndpoint::Unix(path) => run_unix_daemon(config, &path),
-        RpcEndpoint::Tcp(addr) => run_tcp_daemon(config, &addr),
-        RpcEndpoint::Udp(addr) => run_udp_daemon(config, &addr),
+        RpcEndpoint::Unix(path) => run_unix_daemon(config, &path, rate_limiter),
+        RpcEndpoint::Tcp(addr) => run_tcp_daemon(config, &addr, rate_limiter),
+        RpcEndpoint::Udp(addr) => run_udp_daemon(config, &addr, rate_limiter),
     }
 }
 
 #[cfg(unix)]
-fn run_unix_daemon(config: &Config, path: &Path) -> Result<()> {
+fn run_unix_daemon(
+    config: &Config,
+    path: &Path,
+    rate_limiter: Arc<Mutex<RateLimiter>>,
+) -> Result<()> {
     if path.exists() {
         fs::remove_file(path)
             .with_context(|| format!("removing stale RPC socket {}", path.display()))?;
@@ -1942,13 +2064,18 @@ fn run_unix_daemon(config: &Config, path: &Path) -> Result<()> {
     }
     let listener =
         UnixListener::bind(path).with_context(|| format!("listening on {}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o666))
+        .with_context(|| format!("setting RPC socket permissions on {}", path.display()))?;
     println!("repo-manager daemon listening on unix://{}", path.display());
     for stream in listener.incoming() {
         let stream = stream.context("accepting unix RPC connection")?;
         let peer = unix_peer_description(&stream, path);
         let config = config.clone();
+        let rate_limiter = Arc::clone(&rate_limiter);
         thread::spawn(move || {
-            if let Err(error) = handle_rpc_reader(&config, BufReader::new(stream), peer) {
+            if let Err(error) =
+                handle_rpc_reader(&config, BufReader::new(stream), peer, rate_limiter)
+            {
                 eprintln!("repo-manager daemon: {error:#}");
             }
         });
@@ -1957,11 +2084,19 @@ fn run_unix_daemon(config: &Config, path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn run_unix_daemon(_config: &Config, _path: &Path) -> Result<()> {
+fn run_unix_daemon(
+    _config: &Config,
+    _path: &Path,
+    _rate_limiter: Arc<Mutex<RateLimiter>>,
+) -> Result<()> {
     bail!("unix RPC endpoints are not supported on this platform")
 }
 
-fn run_tcp_daemon(config: &Config, addr: &str) -> Result<()> {
+fn run_tcp_daemon(
+    config: &Config,
+    addr: &str,
+    rate_limiter: Arc<Mutex<RateLimiter>>,
+) -> Result<()> {
     let listener = TcpListener::bind(addr).with_context(|| format!("listening on tcp://{addr}"))?;
     println!("repo-manager daemon listening on tcp://{addr}");
     for stream in listener.incoming() {
@@ -1971,8 +2106,11 @@ fn run_tcp_daemon(config: &Config, addr: &str) -> Result<()> {
             .map(|addr| format!("tcp://{addr}"))
             .unwrap_or_else(|_| "tcp://unknown-peer".to_string());
         let config = config.clone();
+        let rate_limiter = Arc::clone(&rate_limiter);
         thread::spawn(move || {
-            if let Err(error) = handle_rpc_reader(&config, BufReader::new(stream), peer) {
+            if let Err(error) =
+                handle_rpc_reader(&config, BufReader::new(stream), peer, rate_limiter)
+            {
                 eprintln!("repo-manager daemon: {error:#}");
             }
         });
@@ -1980,7 +2118,11 @@ fn run_tcp_daemon(config: &Config, addr: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_udp_daemon(config: &Config, addr: &str) -> Result<()> {
+fn run_udp_daemon(
+    config: &Config,
+    addr: &str,
+    rate_limiter: Arc<Mutex<RateLimiter>>,
+) -> Result<()> {
     let socket = UdpSocket::bind(addr).with_context(|| format!("listening on udp://{addr}"))?;
     println!("repo-manager daemon listening on udp://{addr}");
     let mut buffer = [0_u8; 65_535];
@@ -1990,11 +2132,19 @@ fn run_udp_daemon(config: &Config, addr: &str) -> Result<()> {
         debug!("received RPC message from udp://{peer}: {}", message.trim());
         let event: RpcEvent = serde_json::from_str(message.trim())
             .with_context(|| format!("parsing RPC event: {message}"))?;
+        if !allow_rpc_event(&rate_limiter, &event, &format!("udp://{peer}"))? {
+            continue;
+        }
         handle_rpc_event(config, event)?;
     }
 }
 
-fn handle_rpc_reader<R: BufRead>(config: &Config, mut reader: R, peer: String) -> Result<()> {
+fn handle_rpc_reader<R: BufRead>(
+    config: &Config,
+    mut reader: R,
+    peer: String,
+    rate_limiter: Arc<Mutex<RateLimiter>>,
+) -> Result<()> {
     let mut line = String::new();
     while reader.read_line(&mut line)? != 0 {
         let trimmed = line.trim();
@@ -2002,11 +2152,33 @@ fn handle_rpc_reader<R: BufRead>(config: &Config, mut reader: R, peer: String) -
             debug!("received RPC message from {peer}: {trimmed}");
             let event: RpcEvent =
                 serde_json::from_str(trimmed).context("parsing RPC event JSON")?;
+            if !allow_rpc_event(&rate_limiter, &event, &peer)? {
+                line.clear();
+                continue;
+            }
             handle_rpc_event(config, event)?;
         }
         line.clear();
     }
     Ok(())
+}
+
+fn allow_rpc_event(
+    rate_limiter: &Arc<Mutex<RateLimiter>>,
+    event: &RpcEvent,
+    peer: &str,
+) -> Result<bool> {
+    let mut limiter = rate_limiter
+        .lock()
+        .map_err(|_| anyhow!("RPC rate limiter lock poisoned"))?;
+    let allowed = limiter.allow(event.client_id());
+    if !allowed {
+        warn!(
+            "rate limited RPC message from client {} ({peer})",
+            event.client_id()
+        );
+    }
+    Ok(allowed)
 }
 
 #[cfg(unix)]
@@ -2772,6 +2944,7 @@ mod tests {
             rpc_url: default_rpc_url(),
             client_id: generate_client_id().unwrap(),
             detect_related: false,
+            rpc_rate_limit_per_second: 1,
         };
 
         let report = reconcile_repos(&config, &store).unwrap();
@@ -2834,6 +3007,7 @@ mod tests {
             rpc_url: default_rpc_url(),
             client_id: generate_client_id().unwrap(),
             detect_related: false,
+            rpc_rate_limit_per_second: 1,
         };
 
         let report = reconcile_repos(&config, &store).unwrap();
@@ -2869,6 +3043,7 @@ mod tests {
             rpc_url: Some("tcp://127.0.0.1:47321".to_string()),
             client_id: Some("00000000-0000-4000-8000-000000000001".to_string()),
             detect_related: Some(true),
+            rpc_rate_limit_per_second: Some(7),
         }
         .save(&config_path)
         .unwrap();
@@ -2882,6 +3057,7 @@ mod tests {
             rpc_url: Some("udp://127.0.0.1:47322".to_string()),
             client_id: Some("00000000-0000-4000-8000-000000000002".to_string()),
             detect_related: Some(false),
+            rpc_rate_limit_per_second: Some(3),
             json: false,
             command: Commands::Setup(SetupCommands::Setup(SetupArgs {
                 file: None,
@@ -2892,6 +3068,7 @@ mod tests {
                 rpc_url: None,
                 client_id: None,
                 detect_related: None,
+                rpc_rate_limit_per_second: None,
             })),
         };
         let config = Config::from_cli(&cli).unwrap();
@@ -2904,6 +3081,7 @@ mod tests {
         assert_eq!(config.rpc_url, "udp://127.0.0.1:47322");
         assert_eq!(config.client_id, "00000000-0000-4000-8000-000000000002");
         assert!(!config.detect_related);
+        assert_eq!(config.rpc_rate_limit_per_second, 3);
     }
 
     #[test]
@@ -2918,6 +3096,7 @@ mod tests {
             rpc_url: default_rpc_url(),
             client_id: "00000000-0000-4000-8000-000000000003".to_string(),
             detect_related: false,
+            rpc_rate_limit_per_second: 1,
         };
         let explicit_file = dir.path().join("custom/repo-config.json");
 
@@ -2933,6 +3112,7 @@ mod tests {
                 rpc_url: Some("tcp://127.0.0.1:47321".to_string()),
                 client_id: Some("00000000-0000-4000-8000-000000000004".to_string()),
                 detect_related: Some(true),
+                rpc_rate_limit_per_second: Some(5),
             },
         )
         .unwrap();
@@ -2949,6 +3129,61 @@ mod tests {
             Some("00000000-0000-4000-8000-000000000004".to_string())
         );
         assert_eq!(saved.detect_related, Some(true));
+        assert_eq!(saved.rpc_rate_limit_per_second, Some(5));
+    }
+
+    #[test]
+    fn file_config_merge_lets_later_layers_override_earlier_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut base = FileConfig {
+            state: Some(dir.path().join("state/base.sqlite")),
+            cache_root: Some(dir.path().join("cache/base")),
+            clone_root: None,
+            worktree_root: None,
+            rpc_url: Some("unix:///run/base.sock".to_string()),
+            client_id: None,
+            detect_related: Some(false),
+            rpc_rate_limit_per_second: Some(1),
+        };
+
+        base.merge(FileConfig {
+            state: None,
+            cache_root: Some(dir.path().join("cache/user")),
+            clone_root: Some(dir.path().join("clones/user")),
+            worktree_root: None,
+            rpc_url: None,
+            client_id: Some("00000000-0000-4000-8000-000000000005".to_string()),
+            detect_related: Some(true),
+            rpc_rate_limit_per_second: Some(9),
+        });
+
+        assert_eq!(base.state, Some(dir.path().join("state/base.sqlite")));
+        assert_eq!(base.cache_root, Some(dir.path().join("cache/user")));
+        assert_eq!(base.clone_root, Some(dir.path().join("clones/user")));
+        assert_eq!(base.rpc_url, Some("unix:///run/base.sock".to_string()));
+        assert_eq!(
+            base.client_id,
+            Some("00000000-0000-4000-8000-000000000005".to_string())
+        );
+        assert_eq!(base.detect_related, Some(true));
+        assert_eq!(base.rpc_rate_limit_per_second, Some(9));
+    }
+
+    #[test]
+    fn rate_limiter_defaults_to_one_request_per_second_per_client() {
+        let mut limiter = RateLimiter::new(1);
+
+        assert!(limiter.allow("client-a"));
+        assert!(!limiter.allow("client-a"));
+        assert!(limiter.allow("client-b"));
+    }
+
+    #[test]
+    fn rate_limiter_can_be_disabled() {
+        let mut limiter = RateLimiter::new(0);
+
+        assert!(limiter.allow("client-a"));
+        assert!(limiter.allow("client-a"));
     }
 
     #[test]
