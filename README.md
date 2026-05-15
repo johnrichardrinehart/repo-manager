@@ -23,9 +23,9 @@ symlinks to the latest real path when a move is applied.
 
 ## Remotes
 
-`repo move --apply` updates `origin` to the new locator. `repo reconcile
---apply` does the same for detected moves, preserving the existing remote URL
-style when possible.
+`repo move` updates `origin` to the new locator. `repo reconcile` does the
+same for detected moves, preserving the existing remote URL style when
+possible.
 
 Forks are Git worktrees under the clone root, not development worktrees under
 the worktree root. Each fork gets a stable remote name derived from its locator,

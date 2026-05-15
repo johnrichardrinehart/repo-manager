@@ -16,8 +16,8 @@ use url::Url;
     name = "repo",
     version,
     disable_help_subcommand = true,
-    about = "Manage local Git repository placement, identity metadata, forks, worktrees, and old-path aliases",
-    long_about = "Manage local Git repositories using a stable locator model: <authority>/<remote-path>.\n\nCanonical repositories and forks live under the clone root. Development worktrees live under the worktree root. Commands are dry-run by default unless --apply is provided."
+    about = "Manage local Git repository placement, metadata, forks, worktrees, and old-path aliases",
+    long_about = "Manage local Git repositories using a stable locator model: <authority>/<remote-path>.\n\nCanonical repositories and forks live under the clone root. Development worktrees live under the worktree root."
 )]
 pub struct Cli {
     #[arg(
@@ -95,7 +95,7 @@ enum SetupCommands {
 #[help_group(title = "Repository operations")]
 enum RepositoryOperationCommands {
     #[command(about = "Clone a repository into the managed clone root")]
-    Clone(ApplyUrl),
+    Clone(CloneArgs),
     #[command(about = "Create or register a fork worktree for a canonical repository")]
     Fork(ForkArgs),
     #[command(about = "Manage development worktrees under the managed worktree root")]
@@ -112,16 +112,16 @@ enum OrganizationalChangeCommands {
     // repository records.
     #[command(
         about = "Same repo, new locator (e.g. renamed/transferred GitHub repo)",
-        long_about = "Record and optionally apply a move for the same hosted repository at a new locator.\n\nUse this when the same repository was renamed, transferred, or otherwise kept its hosted repository record but changed locator. `repo move` moves the real directory, records historical locators, updates remotes, and makes old paths aliases of the current path.\n\nDo not use this for canonicalization changes where the old source was archived, source-closed, deleted, or resumed elsewhere as a distinct repository. Use `repo successor set` for that."
+        long_about = "Record and apply a move for the same hosted repository at a new locator.\n\nUse this when the same repository was renamed, transferred, or otherwise kept its hosted repository record but changed locator. `repo move` moves the real directory, records historical locators, updates remotes, and makes old paths aliases of the current path.\n\nDo not use this for canonicalization changes where the old source was archived, source-closed, deleted, or resumed elsewhere as a distinct repository. Use `repo successor set` for that."
     )]
     Move(MoveArgs),
     // Reconcile operates only on repositories already known to the metadata DB.
     // Arbitrary local-directory inventory is intentionally out of scope.
     #[command(
-        about = "Plan/apply URL/path changes for managed repos (e.g. forge redirect or origin drift)",
-        long_about = "Detect managed repositories whose locator changed by probing supported forge metadata first, then by comparing the configured origin URL with the stored current locator.\n\nGitHub repository redirects are probed through the GitHub repository API. When drift is found, reconcile emits the same move plan as `repo move`. Without --apply it only prints that plan. With --apply, it moves the real directory, records the new current locator, and creates historical alias symlinks."
+        about = "Apply URL/path changes for managed repos (e.g. forge redirect or origin drift)",
+        long_about = "Detect managed repositories whose locator changed by probing supported forge metadata first, then by comparing the configured origin URL with the stored current locator.\n\nGitHub repository redirects are probed through the GitHub repository API. When drift is found, reconcile applies the same move behavior as `repo move`: it moves the real directory, records the new current locator, updates origin, and creates historical alias symlinks."
     )]
-    Reconcile(ApplyOnly),
+    Reconcile,
     #[command(
         about = "Canonicalization change (e.g. old source archived/source-closed/deleted)",
         long_about = "Record a canonicalization change without treating it as a repository move.\n\nUse this when the old source was archived, source-closed, deleted, or otherwise stopped being the canonical source, and development resumed under a different organization or repository. Successors are metadata only: they do not move the old checkout, do not create alias symlinks, and do not merge the old and new repository records.\n\nUse `repo move` instead for a rename, transfer, or locator change of the same hosted repository."
@@ -136,7 +136,7 @@ enum OrganizationalAnalysisCommands {
     // aliases and not alternate remotes.
     #[command(
         about = "Show old paths that symlink to the current moved repo path",
-        long_about = "Show historical locator paths and old-path symlinks for a repository after identity-preserving moves.\n\nThese aliases are filesystem paths created by `repo move` or `repo reconcile --apply`; they are not shell aliases and not Git remotes."
+        long_about = "Show historical locator paths and old-path symlinks for a repository after moves.\n\nThese aliases are filesystem paths created by `repo move` or `repo reconcile`; they are not shell aliases and not Git remotes."
     )]
     Aliases(AliasesCommand),
 }
@@ -176,20 +176,13 @@ struct SetupArgs {
 }
 
 #[derive(Debug, Args)]
-struct ApplyUrl {
+struct CloneArgs {
     #[arg(
         value_name = "URL",
         help = "Git URL or locator to clone",
         long_help = "Git URL or locator to clone. The URL is normalized into <authority>/<remote-path> and placed under the clone root."
     )]
     url: String,
-
-    #[arg(
-        long,
-        help = "Execute the clone instead of only printing the plan",
-        long_help = "Execute the clone and record metadata. Without this flag, the command prints the planned path and metadata change only."
-    )]
-    apply: bool,
 }
 
 #[derive(Debug, Args)]
@@ -206,41 +199,20 @@ struct ForkArgs {
         help = "Canonical upstream Git URL or locator for this fork"
     )]
     canonical: String,
-
-    #[arg(
-        long,
-        help = "Create the fork worktree and update metadata instead of only printing the plan"
-    )]
-    apply: bool,
 }
 
 #[derive(Debug, Args)]
 struct MoveArgs {
     #[arg(
         value_name = "REPO_REF",
-        help = "Existing same-identity repository URL, current locator, or historical locator"
+        help = "Existing same-hosted-repository URL, current locator, or historical locator"
     )]
     repo_ref: String,
     #[arg(
         value_name = "NEW_URL",
-        help = "New Git URL or locator for the same repository identity"
+        help = "New Git URL or locator for the same hosted repository"
     )]
     new_url: String,
-
-    #[arg(
-        long,
-        help = "Move the real directory, update origin, create aliases, and record metadata"
-    )]
-    apply: bool,
-}
-
-#[derive(Debug, Args)]
-struct ApplyOnly {
-    #[arg(
-        long,
-        help = "Apply detected reconcile moves instead of only printing suggestions"
-    )]
-    apply: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -292,12 +264,6 @@ struct WorktreeAddArgs {
         help = "After creating the worktree, hard-reset it to START_POINT"
     )]
     reset: bool,
-
-    #[arg(
-        long,
-        help = "Create the worktree instead of only printing the git command plan"
-    )]
-    apply: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -373,7 +339,6 @@ struct FileConfig {
 #[derive(Debug, Serialize)]
 struct ReconcileReport {
     action: &'static str,
-    apply: bool,
     planned_moves: Vec<ReconcileMove>,
     skipped: Vec<ReconcileSkip>,
 }
@@ -512,11 +477,11 @@ pub fn run() -> Result<()> {
         Commands::RepositoryOperations(command) => match command {
             RepositoryOperationCommands::Clone(args) => {
                 let db = Store::open(&config.state)?;
-                clone_repo(&config, &db, &args.url, args.apply)
+                clone_repo(&config, &db, &args.url)
             }
             RepositoryOperationCommands::Fork(args) => {
                 let db = Store::open(&config.state)?;
-                fork_repo(&config, &db, &args.fork_url, &args.canonical, args.apply)
+                fork_repo(&config, &db, &args.fork_url, &args.canonical)
             }
             RepositoryOperationCommands::Worktree(command) => match command.command {
                 WorktreeSubcommand::Add(args) => {
@@ -528,11 +493,11 @@ pub fn run() -> Result<()> {
         Commands::OrganizationalChanges(command) => match command {
             OrganizationalChangeCommands::Move(args) => {
                 let db = Store::open(&config.state)?;
-                move_repo(&config, &db, &args.repo_ref, &args.new_url, args.apply)
+                move_repo(&config, &db, &args.repo_ref, &args.new_url)
             }
-            OrganizationalChangeCommands::Reconcile(args) => {
+            OrganizationalChangeCommands::Reconcile => {
                 let db = Store::open(&config.state)?;
-                reconcile(&config, &db, args.apply)
+                reconcile(&config, &db)
             }
             OrganizationalChangeCommands::Successor(command) => match command.command {
                 SuccessorSubcommand::Set(args) => {
@@ -1155,48 +1120,64 @@ impl Store {
     }
 }
 
-fn clone_repo(config: &Config, db: &Store, url: &str, apply: bool) -> Result<()> {
+fn clone_repo(config: &Config, db: &Store, url: &str) -> Result<()> {
     let locator = Locator::parse(url)?;
     let path = locator_path(&config.clone_root, &locator);
+    fs::create_dir_all(path.parent().context("clone path has no parent")?)?;
+    if which::which("ghq").is_ok() {
+        let status = Command::new("ghq")
+            .arg("get")
+            .arg("--root")
+            .arg(&config.clone_root)
+            .arg(url)
+            .status()
+            .context("running ghq get")?;
+        if !status.success() {
+            run_git(["clone", url, &path.display().to_string()])?;
+        }
+    } else {
+        run_git(["clone", url, &path.display().to_string()])?;
+    }
+    db.upsert_repo(&locator, &path, None)?;
     print_json(&serde_json::json!({
         "action": "clone",
         "locator": locator,
         "path": path,
-        "apply": apply,
-    }))?;
-    if apply {
-        fs::create_dir_all(path.parent().context("clone path has no parent")?)?;
-        if which::which("ghq").is_ok() {
-            let status = Command::new("ghq")
-                .arg("get")
-                .arg("--root")
-                .arg(&config.clone_root)
-                .arg(url)
-                .status()
-                .context("running ghq get")?;
-            if !status.success() {
-                run_git(["clone", url, &path.display().to_string()])?;
-            }
-        } else {
-            run_git(["clone", url, &path.display().to_string()])?;
-        }
-    }
-    db.upsert_repo(&locator, &path, None)?;
-    Ok(())
+    }))
 }
 
-fn fork_repo(
-    config: &Config,
-    db: &Store,
-    fork_url: &str,
-    canonical_url: &str,
-    apply: bool,
-) -> Result<()> {
+fn fork_repo(config: &Config, db: &Store, fork_url: &str, canonical_url: &str) -> Result<()> {
     let fork_locator = Locator::parse(fork_url)?;
     let canonical_locator = Locator::parse(canonical_url)?;
     let fork_path = locator_path(&config.clone_root, &fork_locator);
     let canonical_path = locator_path(&config.clone_root, &canonical_locator);
     let fork_remote = fork_remote_name(&fork_locator);
+    fs::create_dir_all(fork_path.parent().context("fork path has no parent")?)?;
+    ensure_remote(&canonical_path, "origin", canonical_url)?;
+    ensure_remote(&canonical_path, &fork_remote, fork_url)?;
+    run_git_in(&canonical_path, ["fetch", &fork_remote])?;
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(&canonical_path)
+        .args(["remote", "set-head", &fork_remote, "-a"])
+        .status()
+        .context("detecting fork default branch")?;
+    if !status.success() {
+        eprintln!("warning: could not determine fork default branch; using {fork_remote}/HEAD");
+    }
+    let fork_head = format!("{fork_remote}/HEAD");
+    run_git_in(
+        &canonical_path,
+        [
+            "worktree",
+            "add",
+            &fork_path.display().to_string(),
+            &fork_head,
+        ],
+    )?;
+    let canonical_id = db.upsert_repo(&canonical_locator, &canonical_path, None)?;
+    let fork_id = db.upsert_repo(&fork_locator, &fork_path, Some(&canonical_locator.key()))?;
+    db.record_fork(fork_id, canonical_id)?;
     print_json(&serde_json::json!({
         "action": "fork",
         "fork_locator": fork_locator,
@@ -1204,37 +1185,7 @@ fn fork_repo(
         "fork_path": fork_path,
         "canonical_path": canonical_path,
         "fork_remote": fork_remote,
-        "apply": apply,
-    }))?;
-    if apply {
-        fs::create_dir_all(fork_path.parent().context("fork path has no parent")?)?;
-        ensure_remote(&canonical_path, "origin", canonical_url)?;
-        ensure_remote(&canonical_path, &fork_remote, fork_url)?;
-        run_git_in(&canonical_path, ["fetch", &fork_remote])?;
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(&canonical_path)
-            .args(["remote", "set-head", &fork_remote, "-a"])
-            .status()
-            .context("detecting fork default branch")?;
-        if !status.success() {
-            eprintln!("warning: could not determine fork default branch; using {fork_remote}/HEAD");
-        }
-        let fork_head = format!("{fork_remote}/HEAD");
-        run_git_in(
-            &canonical_path,
-            [
-                "worktree",
-                "add",
-                &fork_path.display().to_string(),
-                &fork_head,
-            ],
-        )?;
-    }
-    let canonical_id = db.upsert_repo(&canonical_locator, &canonical_path, None)?;
-    let fork_id = db.upsert_repo(&fork_locator, &fork_path, Some(&canonical_locator.key()))?;
-    db.record_fork(fork_id, canonical_id)?;
-    Ok(())
+    }))
 }
 
 fn add_worktree(config: &Config, db: &Store, args: WorktreeAddArgs) -> Result<()> {
@@ -1251,34 +1202,25 @@ fn add_worktree(config: &Config, db: &Store, args: WorktreeAddArgs) -> Result<()
             force: args.force,
         },
     )?;
-    print_json(&plan)?;
-    if args.apply {
-        fs::create_dir_all(
-            plan.worktree_path
-                .parent()
-                .context("worktree path has no parent")?,
-        )?;
-        let arg_refs: Vec<&str> = plan.git_args.iter().map(String::as_str).collect();
-        run_git_in(&plan.canonical_path, arg_refs)?;
-        if args.reset {
-            let start = args
-                .start_point
-                .as_deref()
-                .ok_or_else(|| anyhow!("--reset requires a start point"))?;
-            run_git_in(&plan.worktree_path, ["reset", "--hard", start])?;
-        }
-        db.upsert_repo(&plan.canonical_locator, &plan.canonical_path, None)?;
+    fs::create_dir_all(
+        plan.worktree_path
+            .parent()
+            .context("worktree path has no parent")?,
+    )?;
+    let arg_refs: Vec<&str> = plan.git_args.iter().map(String::as_str).collect();
+    run_git_in(&plan.canonical_path, arg_refs)?;
+    if args.reset {
+        let start = args
+            .start_point
+            .as_deref()
+            .ok_or_else(|| anyhow!("--reset requires a start point"))?;
+        run_git_in(&plan.worktree_path, ["reset", "--hard", start])?;
     }
-    Ok(())
+    db.upsert_repo(&plan.canonical_locator, &plan.canonical_path, None)?;
+    print_json(&plan)
 }
 
-fn move_repo(
-    config: &Config,
-    db: &Store,
-    repo_ref: &str,
-    new_url: &str,
-    apply: bool,
-) -> Result<()> {
+fn move_repo(config: &Config, db: &Store, repo_ref: &str, new_url: &str) -> Result<()> {
     let new_locator = Locator::parse(new_url)?;
     let (repo_id, old_locator, historical) = match db.find_repo(repo_ref)? {
         Some(record) => {
@@ -1293,21 +1235,18 @@ fn move_repo(
         }
     };
     let plan = plan_move(&config.clone_root, old_locator, new_locator, &historical);
-    print_json(&plan)?;
-    if apply {
-        apply_filesystem_move(&plan)?;
-        ensure_remote(&plan.new_path, "origin", new_url)?;
-    }
+    apply_filesystem_move(&plan)?;
+    ensure_remote(&plan.new_path, "origin", new_url)?;
     db.apply_move_metadata(repo_id, &plan)?;
-    Ok(())
+    print_json(&plan)
 }
 
-fn reconcile(config: &Config, db: &Store, apply: bool) -> Result<()> {
-    let report = reconcile_repos(config, db, apply)?;
+fn reconcile(config: &Config, db: &Store) -> Result<()> {
+    let report = reconcile_repos(config, db)?;
     print_json(&report)
 }
 
-fn reconcile_repos(config: &Config, db: &Store, apply: bool) -> Result<ReconcileReport> {
+fn reconcile_repos(config: &Config, db: &Store) -> Result<ReconcileReport> {
     let mut planned_moves = Vec::new();
     let mut skipped = Vec::new();
 
@@ -1333,13 +1272,10 @@ fn reconcile_repos(config: &Config, db: &Store, apply: bool) -> Result<Reconcile
                 forge_locator,
                 &historical,
             );
-            if apply {
-                apply_filesystem_move(&plan)?;
-                let new_origin_url =
-                    remote_url_for_locator(origin_url.as_deref(), &plan.new_locator);
-                ensure_remote(&plan.new_path, "origin", &new_origin_url)?;
-                db.apply_move_metadata(repo.id, &plan)?;
-            }
+            apply_filesystem_move(&plan)?;
+            let new_origin_url = remote_url_for_locator(origin_url.as_deref(), &plan.new_locator);
+            ensure_remote(&plan.new_path, "origin", &new_origin_url)?;
+            db.apply_move_metadata(repo.id, &plan)?;
             planned_moves.push(ReconcileMove {
                 repo_id: repo.id,
                 repo_path: repo.path,
@@ -1381,11 +1317,9 @@ fn reconcile_repos(config: &Config, db: &Store, apply: bool) -> Result<Reconcile
             origin_locator,
             &historical,
         );
-        if apply {
-            apply_filesystem_move(&plan)?;
-            ensure_remote(&plan.new_path, "origin", &origin_url)?;
-            db.apply_move_metadata(repo.id, &plan)?;
-        }
+        apply_filesystem_move(&plan)?;
+        ensure_remote(&plan.new_path, "origin", &origin_url)?;
+        db.apply_move_metadata(repo.id, &plan)?;
         planned_moves.push(ReconcileMove {
             repo_id: repo.id,
             repo_path: repo.path,
@@ -1396,7 +1330,6 @@ fn reconcile_repos(config: &Config, db: &Store, apply: bool) -> Result<Reconcile
 
     Ok(ReconcileReport {
         action: "reconcile",
-        apply,
         planned_moves,
         skipped,
     })
@@ -1835,7 +1768,7 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_detects_origin_locator_drift() {
+    fn reconcile_applies_origin_locator_drift() {
         let dir = tempfile::tempdir().unwrap();
         let clone_root = dir.path().join("clones");
         let worktree_root = dir.path().join("worktrees");
@@ -1876,7 +1809,7 @@ mod tests {
             worktree_root,
         };
 
-        let report = reconcile_repos(&config, &store, false).unwrap();
+        let report = reconcile_repos(&config, &store).unwrap();
         assert_eq!(report.planned_moves.len(), 1);
         assert_eq!(
             report.planned_moves[0].plan.new_locator,
@@ -1886,7 +1819,7 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_apply_updates_origin_for_forge_redirect() {
+    fn reconcile_updates_origin_for_forge_redirect() {
         let dir = tempfile::tempdir().unwrap();
         let clone_root = dir.path().join("clones");
         let old_locator = Locator::parse("github.com/old-owner/old-name").unwrap();
@@ -1935,7 +1868,7 @@ mod tests {
             worktree_root: dir.path().join("worktrees"),
         };
 
-        let report = reconcile_repos(&config, &store, true).unwrap();
+        let report = reconcile_repos(&config, &store).unwrap();
         assert_eq!(report.planned_moves.len(), 1);
         assert!(new_path.exists());
         assert_eq!(
