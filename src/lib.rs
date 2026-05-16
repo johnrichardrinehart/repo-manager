@@ -2802,6 +2802,7 @@ fn detect_related_history_under_code(
         return Ok(0);
     }
     let current_objects = current_commits.into_iter().collect::<HashSet<_>>();
+    let current_roots = git_root_commits(path)?.into_iter().collect::<HashSet<_>>();
     let current_path = comparable_path(path);
     let mut detected = 0;
 
@@ -2809,7 +2810,7 @@ fn detect_related_history_under_code(
         if comparable_path(&other_path) == current_path {
             continue;
         }
-        let shared = shared_commit_descriptions(&current_objects, &other_path)?;
+        let shared = shared_history_evidence(&current_objects, &current_roots, &other_path)?;
         if shared.is_empty() {
             continue;
         }
@@ -2898,12 +2899,24 @@ fn comparable_path(path: &Path) -> PathBuf {
 }
 
 fn git_commit_objects(path: &Path) -> Result<Vec<String>> {
+    git_lines(path, ["rev-list", "--all"], "reading Git commit graph")
+}
+
+fn git_root_commits(path: &Path) -> Result<Vec<String>> {
+    git_lines(
+        path,
+        ["rev-list", "--max-parents=0", "--all"],
+        "reading Git root commits",
+    )
+}
+
+fn git_lines<const N: usize>(path: &Path, args: [&str; N], action: &str) -> Result<Vec<String>> {
     let output = Command::new("git")
         .arg("-C")
         .arg(path)
-        .args(["rev-list", "--all"])
+        .args(args)
         .output()
-        .with_context(|| format!("reading Git commit graph in {}", path.display()))?;
+        .with_context(|| format!("{action} in {}", path.display()))?;
     if !output.status.success() {
         return Ok(Vec::new());
     }
@@ -2911,16 +2924,43 @@ fn git_commit_objects(path: &Path) -> Result<Vec<String>> {
     Ok(stdout.lines().map(str::to_string).collect())
 }
 
-fn shared_commit_descriptions(
+fn shared_history_evidence(
     current_objects: &HashSet<String>,
+    current_roots: &HashSet<String>,
     other_path: &Path,
 ) -> Result<Vec<String>> {
-    Ok(git_commit_objects(other_path)?
+    let shared_roots = git_root_commits(other_path)?
         .into_iter()
-        .filter(|object| current_objects.contains(object))
-        .take(20)
-        .map(|object| format!("shared commit {}", short_hash(&object)))
-        .collect())
+        .filter(|object| current_roots.contains(object))
+        .take(3)
+        .map(|object| format!("shared root commit {}", short_hash(&object)))
+        .collect::<Vec<_>>();
+    if !shared_roots.is_empty() {
+        return Ok(shared_roots);
+    }
+
+    let mut shared_count = 0_usize;
+    let mut first_shared = None;
+    for object in git_commit_objects(other_path)? {
+        if current_objects.contains(&object) {
+            shared_count += 1;
+            first_shared.get_or_insert(object);
+        }
+    }
+
+    Ok(first_shared
+        .map(|object| {
+            let commit_label = if shared_count == 1 {
+                "commit"
+            } else {
+                "commits"
+            };
+            vec![format!(
+                "{shared_count} shared {commit_label}, including {}",
+                short_hash(&object)
+            )]
+        })
+        .unwrap_or_default())
 }
 
 fn short_hash(hash: &str) -> &str {
@@ -3296,7 +3336,10 @@ fn output_related(output: &Output, suggestions: &[RelatedSuggestion]) -> Result<
         let refs = if suggestion.shared_refs.is_empty() {
             "evidence: unknown".to_string()
         } else {
-            format!("evidence: {}", suggestion.shared_refs.join(", "))
+            format!(
+                "evidence: {}",
+                summarize_shared_history_evidence(&suggestion.shared_refs)
+            )
         };
         println!(
             "#{} {} <-> {} ({refs})",
@@ -3310,6 +3353,29 @@ fn output_related(output: &Output, suggestions: &[RelatedSuggestion]) -> Result<
         );
     }
     Ok(())
+}
+
+fn summarize_shared_history_evidence(shared_refs: &[String]) -> String {
+    let shared_commit_prefix = "shared commit ";
+    if !shared_refs.is_empty()
+        && shared_refs
+            .iter()
+            .all(|evidence| evidence.starts_with(shared_commit_prefix))
+    {
+        let first = shared_refs[0]
+            .strip_prefix(shared_commit_prefix)
+            .unwrap_or(&shared_refs[0]);
+        let commit_label = if shared_refs.len() == 1 {
+            "commit"
+        } else {
+            "commits"
+        };
+        return format!(
+            "{} shared {commit_label}, including {first}",
+            shared_refs.len()
+        );
+    }
+    shared_refs.join(", ")
 }
 
 fn output_related_resolution(output: &Output, resolution: &RelatedResolution) -> Result<()> {
@@ -4032,7 +4098,21 @@ mod tests {
             suggestions[0]
                 .shared_refs
                 .iter()
-                .any(|evidence| evidence.starts_with("shared commit "))
+                .any(|evidence| evidence.starts_with("shared root commit "))
+        );
+    }
+
+    #[test]
+    fn related_evidence_summarizes_legacy_shared_commit_lists() {
+        let evidence = vec![
+            "shared commit aaaaaaaaaaaa".to_string(),
+            "shared commit bbbbbbbbbbbb".to_string(),
+            "shared commit cccccccccccc".to_string(),
+        ];
+
+        assert_eq!(
+            summarize_shared_history_evidence(&evidence),
+            "3 shared commits, including aaaaaaaaaaaa"
         );
     }
 
