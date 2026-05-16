@@ -37,7 +37,10 @@ view: `origin` plus all fork remotes.
 Clone lifecycle RPC is defined in `api/repo_manager/v1/rpc.proto` and encoded
 with Protocol Buffers. The `repo` client sends clone events with its own
 `scan_root`; the `repod` process uses that event root when comparing
-repositories for shared Git history.
+repositories for shared Git history. `repod` is intended to run as the same user
+as the `repo` client, using the same config and state database. Shared-history
+review is enabled by default and can be disabled with `--detect-related=false`
+or `REPO_MANAGER_DETECT_RELATED=false`.
 
 ## Configuration
 

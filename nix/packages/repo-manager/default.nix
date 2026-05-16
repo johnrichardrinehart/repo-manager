@@ -5,6 +5,7 @@
   curl,
   git,
   ghq,
+  libnotify,
 }:
 
 rustPlatform.buildRustPackage {
@@ -48,6 +49,13 @@ rustPlatform.buildRustPackage {
 
     mkdir -p "$repod/bin"
     mv "$out/bin/repod" "$repod/bin/"
+    wrapProgram "$repod/bin/repod" \
+      --prefix PATH : ${
+        lib.makeBinPath [
+          git
+          libnotify
+        ]
+      }
   '';
 
   meta = with lib; {

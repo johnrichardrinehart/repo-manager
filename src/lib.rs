@@ -24,6 +24,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+const DEFAULT_DETECT_RELATED: bool = true;
+
 pub mod api {
     include!(concat!(env!("OUT_DIR"), "/repo_manager.v1.rs"));
 }
@@ -102,8 +104,8 @@ struct ConfigArgs {
         long,
         env = "REPO_MANAGER_RPC_URL",
         value_name = "URL",
-        help = "RPC endpoint for clone lifecycle events (default: unix:///run/repo-manager.socket)",
-        long_help = "RPC endpoint for clone lifecycle events. Supported schemes are unix://, tcp://, and udp://. Defaults to unix:///run/repo-manager.socket."
+        help = "RPC endpoint for clone lifecycle events (default: user runtime socket)",
+        long_help = "RPC endpoint for clone lifecycle events. Supported schemes are unix://, tcp://, and udp://. Defaults to unix://$XDG_RUNTIME_DIR/repo-manager/socket when XDG_RUNTIME_DIR is set."
     )]
     rpc_url: Option<String>,
 
@@ -121,7 +123,7 @@ struct ConfigArgs {
         value_name = "BOOL",
         num_args = 0..=1,
         default_missing_value = "true",
-        help = "Ask the daemon to look for shared Git history after successful clones"
+        help = "Enable daemon shared-history review after successful clones (default: true)"
     )]
     detect_related: Option<bool>,
 
@@ -181,8 +183,8 @@ struct DaemonConfigArgs {
         long,
         env = "REPO_MANAGER_RPC_URL",
         value_name = "URL",
-        help = "RPC endpoint for clone lifecycle events (default: unix:///run/repo-manager.socket)",
-        long_help = "RPC endpoint for clone lifecycle events. Supported schemes are unix://, tcp://, and udp://. Defaults to unix:///run/repo-manager.socket."
+        help = "RPC endpoint for clone lifecycle events (default: user runtime socket)",
+        long_help = "RPC endpoint for clone lifecycle events. Supported schemes are unix://, tcp://, and udp://. Defaults to unix://$XDG_RUNTIME_DIR/repo-manager/socket when XDG_RUNTIME_DIR is set."
     )]
     rpc_url: Option<String>,
 
@@ -192,7 +194,7 @@ struct DaemonConfigArgs {
         value_name = "BOOL",
         num_args = 0..=1,
         default_missing_value = "true",
-        help = "Enable shared-history review after successful clone events"
+        help = "Enable shared-history review after successful clone events (default: true)"
     )]
     detect_related: Option<bool>,
 
@@ -338,7 +340,7 @@ struct SetupArgs {
         value_name = "BOOL",
         num_args = 0..=1,
         default_missing_value = "true",
-        help = "Persist daemon-side related-history detection after successful clones"
+        help = "Persist daemon-side related-history detection after successful clones (default: true)"
     )]
     detect_related: Option<bool>,
 
@@ -970,9 +972,19 @@ pub fn run() -> Result<()> {
 
 pub fn run_repod() -> Result<()> {
     let _ = env_logger::try_init();
+    reject_sudo_repod()?;
     let cli = RepodCli::parse();
     let (config, rpc_url) = DaemonConfig::from_args(&cli.config)?;
     run_daemon(&config, &rpc_url, cli.daemon)
+}
+
+fn reject_sudo_repod() -> Result<()> {
+    if env::var_os("SUDO_USER").is_some() {
+        bail!(
+            "repod is a user daemon; run it without sudo so it uses the same config, state DB, and notification bus as repo"
+        );
+    }
+    Ok(())
 }
 
 fn parse_cli() -> Cli {
@@ -1029,7 +1041,7 @@ impl Config {
         let detect_related = args
             .detect_related
             .or(file_config.detect_related)
-            .unwrap_or(false);
+            .unwrap_or(DEFAULT_DETECT_RELATED);
         let clone_start_ttl_minutes = args
             .clone_start_ttl_minutes
             .or(file_config.clone_start_ttl_minutes)
@@ -1133,7 +1145,7 @@ impl DaemonConfig {
         let detect_related = args
             .detect_related
             .or(file_config.detect_related)
-            .unwrap_or(false);
+            .unwrap_or(DEFAULT_DETECT_RELATED);
         let clone_start_ttl_minutes = args
             .clone_start_ttl_minutes
             .or(file_config.clone_start_ttl_minutes)
@@ -1230,7 +1242,15 @@ fn default_worktree_root() -> Result<PathBuf> {
 }
 
 fn default_rpc_url() -> String {
-    "unix:///run/repo-manager.socket".to_string()
+    let socket_path = env::var_os("XDG_RUNTIME_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let user = env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+            env::temp_dir().join(format!("repo-manager-{user}"))
+        })
+        .join("repo-manager/socket");
+    format!("unix://{}", socket_path.display())
 }
 
 fn generate_client_id() -> Result<String> {
@@ -2549,7 +2569,7 @@ fn run_unix_daemon(
     }
     let listener =
         UnixListener::bind(path).with_context(|| format!("listening on {}", path.display()))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o666))
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
         .with_context(|| format!("setting RPC socket permissions on {}", path.display()))?;
     println!("repo-manager daemon listening on unix://{}", path.display());
     for stream in listener.incoming() {
@@ -2735,6 +2755,11 @@ fn handle_rpc_event(
                     "skipping related-history review for {} because no matching clone-start event was observed",
                     event.locator.key()
                 );
+            } else if event.success {
+                debug!(
+                    "skipping related-history review for {} because shared-history detection is disabled",
+                    event.locator.key()
+                );
             }
             Ok(())
         }
@@ -2908,10 +2933,15 @@ fn notify_related_history(count: usize, locator: &Locator) {
         "{} shares Git history with {count} managed repo(s). Run `repo related list`.",
         locator.key()
     );
-    let _ = Command::new("notify-send")
+    match Command::new("notify-send")
         .arg("repo-manager")
         .arg(&body)
-        .status();
+        .status()
+    {
+        Ok(status) if status.success() => {}
+        Ok(status) => debug!("notify-send exited with {status}"),
+        Err(error) => debug!("could not run notify-send: {error}"),
+    }
 }
 
 #[cfg(test)]
@@ -3685,6 +3715,53 @@ mod tests {
         assert!(!config.detect_related);
         assert_eq!(config.clone_start_ttl_minutes, 30);
         assert_eq!(config.rpc_rate_limit_per_second, 3);
+    }
+
+    #[test]
+    fn shared_history_detection_defaults_to_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("missing/config.json");
+        let cli = Cli {
+            config: ConfigArgs {
+                config: Some(config_path.clone()),
+                state: None,
+                cache_root: None,
+                clone_root: None,
+                worktree_root: None,
+                rpc_url: None,
+                client_id: None,
+                detect_related: None,
+                clone_start_ttl_minutes: None,
+                rpc_rate_limit_per_second: None,
+            },
+            json: false,
+            command: Commands::Setup(SetupCommands::Setup(SetupArgs {
+                file: None,
+                state: None,
+                cache_root: None,
+                clone_root: None,
+                worktree_root: None,
+                rpc_url: None,
+                client_id: None,
+                detect_related: None,
+                clone_start_ttl_minutes: None,
+                rpc_rate_limit_per_second: None,
+            })),
+        };
+
+        let config = Config::from_cli(&cli).unwrap();
+        let (daemon_config, _rpc_url) = DaemonConfig::from_args(&DaemonConfigArgs {
+            config: Some(config_path),
+            state: None,
+            rpc_url: None,
+            detect_related: None,
+            clone_start_ttl_minutes: None,
+            rpc_rate_limit_per_second: None,
+        })
+        .unwrap();
+
+        assert!(config.detect_related);
+        assert!(daemon_config.detect_related);
     }
 
     #[test]
