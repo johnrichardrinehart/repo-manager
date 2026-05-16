@@ -1,7 +1,8 @@
 # repo-manager
 
 `repo-manager` provides the `repo` CLI for managing local Git repository
-placement with stable metadata.
+placement with stable metadata. `repod` is packaged separately as the companion
+RPC daemon. Both binaries reuse the shared `repo-manager-core` crate.
 
 The storage model is based on a generic Git locator:
 
@@ -64,6 +65,14 @@ Disposable forge metadata, such as GitHub API responses used by `repo
 reconcile`, is cached under `$XDG_CACHE_HOME/repo-manager`.
 
 ## Development
+
+The Rust workspace is split into separate binary crates:
+
+- `crates/repo-manager` builds the `repo` client.
+- `crates/repod` builds the `repod` daemon.
+- `crates/repo-manager-core` holds shared implementation code.
+
+The flake exposes separate `repo-manager` and `repod` derivations.
 
 ```sh
 direnv allow

@@ -1,5 +1,5 @@
 use anyhow::Result;
 
 fn main() -> Result<()> {
-    repo_manager::run()
+    repo_manager_core::run_repod()
 }

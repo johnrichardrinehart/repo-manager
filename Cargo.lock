@@ -812,6 +812,14 @@ dependencies = [
 name = "repo-manager"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "repo-manager-core",
+]
+
+[[package]]
+name = "repo-manager-core"
+version = "0.1.0"
+dependencies = [
  "anstyle",
  "anyhow",
  "clap",
@@ -830,6 +838,14 @@ dependencies = [
  "tempfile",
  "url",
  "which",
+]
+
+[[package]]
+name = "repod"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "repo-manager-core",
 ]
 
 [[package]]

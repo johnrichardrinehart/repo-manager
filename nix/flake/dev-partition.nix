@@ -15,7 +15,7 @@
           nixfmt.enable = true;
           rustfmt = {
             enable = true;
-            edition = (builtins.fromTOML (builtins.readFile ../../Cargo.toml)).package.edition;
+            edition = "2024";
           };
           taplo.enable = true;
         };

@@ -1,0 +1,30 @@
+[package]
+name = "repo-manager-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Shared implementation for repo-manager and repod"
+
+[dependencies]
+anyhow = "1"
+anstyle = "1"
+clap = { version = "4", features = ["derive", "env"] }
+directories = "6"
+env_logger = "0.11"
+getrandom = "0.4"
+log = "0.4"
+prost = "0.14"
+repo-help-derive = { path = "../repo-help-derive" }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+signal-hook = "0.3"
+url = "2"
+which = "8"
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+prost-build = "0.14"
+protoc-bin-vendored = "3"

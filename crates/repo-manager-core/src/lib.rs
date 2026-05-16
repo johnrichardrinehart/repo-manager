@@ -114,35 +114,9 @@ struct ConfigArgs {
         long,
         env = "REPO_MANAGER_CLIENT_ID",
         value_name = "UUID",
-        help = "Stable client identifier sent with daemon RPC events"
+        help = "Stable client identifier sent with clone lifecycle RPC events"
     )]
     client_id: Option<String>,
-
-    #[arg(
-        long,
-        env = "REPO_MANAGER_DETECT_RELATED",
-        value_name = "BOOL",
-        num_args = 0..=1,
-        default_missing_value = "true",
-        help = "Enable daemon shared-history review after successful clones (default: true)"
-    )]
-    detect_related: Option<bool>,
-
-    #[arg(
-        long,
-        env = "REPO_MANAGER_CLONE_START_TTL_MINUTES",
-        value_name = "MINUTES",
-        help = "Daemon TTL for in-progress clone events (default: 60)"
-    )]
-    clone_start_ttl_minutes: Option<u64>,
-
-    #[arg(
-        long,
-        env = "REPO_MANAGER_RPC_RATE_LIMIT_PER_SECOND",
-        value_name = "N",
-        help = "Daemon RPC receive rate limit per client (default: 1; 0 disables)"
-    )]
-    rpc_rate_limit_per_second: Option<u32>,
 }
 
 #[derive(Debug, Parser)]
@@ -288,7 +262,7 @@ enum OrganizationalAnalysisCommands {
     Aliases(AliasesCommand),
     #[command(
         about = "Review repositories with shared Git history",
-        long_about = "List and resolve daemon-detected shared-history candidates.\n\nThese are suggestions only: shared Git objects can mean mirrors, forks, moved repositories, vendor trees, or unrelated repositories with common ancestry."
+        long_about = "List and resolve shared-history candidates.\n\nThese are suggestions only: shared Git objects can mean mirrors, forks, moved repositories, vendor trees, or unrelated repositories with common ancestry."
     )]
     Related(RelatedCommand),
 }
@@ -326,7 +300,11 @@ struct SetupArgs {
     )]
     worktree_root: Option<PathBuf>,
 
-    #[arg(long, value_name = "URL", help = "Persist the daemon RPC endpoint")]
+    #[arg(
+        long,
+        value_name = "URL",
+        help = "Persist the clone lifecycle RPC endpoint"
+    )]
     rpc_url: Option<String>,
 
     #[arg(
@@ -335,29 +313,6 @@ struct SetupArgs {
         help = "Persist a stable client identifier (default: generate one)"
     )]
     client_id: Option<String>,
-
-    #[arg(
-        long,
-        value_name = "BOOL",
-        num_args = 0..=1,
-        default_missing_value = "true",
-        help = "Persist daemon-side related-history detection after successful clones (default: true)"
-    )]
-    detect_related: Option<bool>,
-
-    #[arg(
-        long,
-        value_name = "MINUTES",
-        help = "Persist daemon TTL for in-progress clone events (default: 60)"
-    )]
-    clone_start_ttl_minutes: Option<u64>,
-
-    #[arg(
-        long,
-        value_name = "N",
-        help = "Persist daemon RPC receive rate limit per client (default: 1; 0 disables)"
-    )]
-    rpc_rate_limit_per_second: Option<u32>,
 }
 
 #[derive(Debug, Args)]
@@ -552,9 +507,6 @@ struct Config {
     worktree_root: PathBuf,
     rpc_url: String,
     client_id: String,
-    detect_related: bool,
-    clone_start_ttl_minutes: u64,
-    rpc_rate_limit_per_second: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -1084,18 +1036,6 @@ impl Config {
             .clone()
             .or(file_config.client_id)
             .map_or_else(generate_client_id, validate_client_id)?;
-        let detect_related = args
-            .detect_related
-            .or(file_config.detect_related)
-            .unwrap_or(DEFAULT_DETECT_RELATED);
-        let clone_start_ttl_minutes = args
-            .clone_start_ttl_minutes
-            .or(file_config.clone_start_ttl_minutes)
-            .unwrap_or(60);
-        let rpc_rate_limit_per_second = args
-            .rpc_rate_limit_per_second
-            .or(file_config.rpc_rate_limit_per_second)
-            .unwrap_or(1);
         Ok(Self {
             config_path,
             state,
@@ -1104,9 +1044,6 @@ impl Config {
             worktree_root,
             rpc_url,
             client_id,
-            detect_related,
-            clone_start_ttl_minutes,
-            rpc_rate_limit_per_second,
         })
     }
 }
@@ -1154,17 +1091,6 @@ impl FileConfig {
         let content = serde_json::to_string_pretty(self)?;
         fs::write(path, format!("{content}\n"))
             .with_context(|| format!("writing {}", path.display()))
-    }
-}
-
-impl From<&Config> for DaemonConfig {
-    fn from(config: &Config) -> Self {
-        Self {
-            state: config.state.clone(),
-            detect_related: config.detect_related,
-            clone_start_ttl_minutes: config.clone_start_ttl_minutes,
-            rpc_rate_limit_per_second: config.rpc_rate_limit_per_second,
-        }
     }
 }
 
@@ -1225,15 +1151,9 @@ fn setup_config(config: &Config, output: &Output, args: SetupArgs) -> Result<()>
         ),
         rpc_url: Some(args.rpc_url.unwrap_or_else(|| config.rpc_url.clone())),
         client_id: Some(args.client_id.unwrap_or_else(|| config.client_id.clone())),
-        detect_related: Some(args.detect_related.unwrap_or(config.detect_related)),
-        clone_start_ttl_minutes: Some(
-            args.clone_start_ttl_minutes
-                .unwrap_or(config.clone_start_ttl_minutes),
-        ),
-        rpc_rate_limit_per_second: Some(
-            args.rpc_rate_limit_per_second
-                .unwrap_or(config.rpc_rate_limit_per_second),
-        ),
+        detect_related: None,
+        clone_start_ttl_minutes: None,
+        rpc_rate_limit_per_second: None,
     };
     file_config.save(&config_path)?;
     let result = SetupResult {
@@ -3464,6 +3384,26 @@ mod tests {
     }
 
     #[test]
+    fn repo_top_level_help_does_not_advertise_daemon_controls() {
+        let mut command = Cli::command().help_template(<Commands as HelpTemplate>::help_template());
+        let help = command.render_help().to_string();
+
+        assert!(!help.to_lowercase().contains("daemon"));
+        assert!(!help.contains("--detect-related"));
+        assert!(!help.contains("--clone-start-ttl-minutes"));
+        assert!(!help.contains("--rpc-rate-limit-per-second"));
+    }
+
+    #[test]
+    fn repod_help_keeps_daemon_controls() {
+        let help = RepodCli::command().render_help().to_string();
+
+        assert!(help.contains("--detect-related"));
+        assert!(help.contains("--clone-start-ttl-minutes"));
+        assert!(help.contains("--rpc-rate-limit-per-second"));
+    }
+
+    #[test]
     fn normalizes_common_git_urls() {
         let cases = [
             (
@@ -3683,9 +3623,6 @@ mod tests {
             worktree_root,
             rpc_url: default_rpc_url(),
             client_id: generate_client_id().unwrap(),
-            detect_related: false,
-            clone_start_ttl_minutes: 60,
-            rpc_rate_limit_per_second: 1,
         };
 
         let report = reconcile_repos(&config, &store).unwrap();
@@ -3747,9 +3684,6 @@ mod tests {
             worktree_root: dir.path().join("worktrees"),
             rpc_url: default_rpc_url(),
             client_id: generate_client_id().unwrap(),
-            detect_related: false,
-            clone_start_ttl_minutes: 60,
-            rpc_rate_limit_per_second: 1,
         };
 
         let report = reconcile_repos(&config, &store).unwrap();
@@ -3800,9 +3734,6 @@ mod tests {
                 worktree_root: None,
                 rpc_url: Some("udp://127.0.0.1:47322".to_string()),
                 client_id: Some("00000000-0000-4000-8000-000000000002".to_string()),
-                detect_related: Some(false),
-                clone_start_ttl_minutes: Some(30),
-                rpc_rate_limit_per_second: Some(3),
             },
             json: false,
             command: Commands::Setup(SetupCommands::Setup(SetupArgs {
@@ -3813,9 +3744,6 @@ mod tests {
                 worktree_root: None,
                 rpc_url: None,
                 client_id: None,
-                detect_related: None,
-                clone_start_ttl_minutes: None,
-                rpc_rate_limit_per_second: None,
             })),
         };
         let config = Config::from_cli(&cli).unwrap();
@@ -3827,44 +3755,12 @@ mod tests {
         assert_eq!(config.worktree_root, dir.path().join("worktrees/from-file"));
         assert_eq!(config.rpc_url, "udp://127.0.0.1:47322");
         assert_eq!(config.client_id, "00000000-0000-4000-8000-000000000002");
-        assert!(!config.detect_related);
-        assert_eq!(config.clone_start_ttl_minutes, 30);
-        assert_eq!(config.rpc_rate_limit_per_second, 3);
     }
 
     #[test]
-    fn shared_history_detection_defaults_to_enabled() {
+    fn daemon_shared_history_detection_defaults_to_enabled() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("missing/config.json");
-        let cli = Cli {
-            config: ConfigArgs {
-                config: Some(config_path.clone()),
-                state: None,
-                cache_root: None,
-                clone_root: None,
-                worktree_root: None,
-                rpc_url: None,
-                client_id: None,
-                detect_related: None,
-                clone_start_ttl_minutes: None,
-                rpc_rate_limit_per_second: None,
-            },
-            json: false,
-            command: Commands::Setup(SetupCommands::Setup(SetupArgs {
-                file: None,
-                state: None,
-                cache_root: None,
-                clone_root: None,
-                worktree_root: None,
-                rpc_url: None,
-                client_id: None,
-                detect_related: None,
-                clone_start_ttl_minutes: None,
-                rpc_rate_limit_per_second: None,
-            })),
-        };
-
-        let config = Config::from_cli(&cli).unwrap();
         let (daemon_config, _rpc_url) = DaemonConfig::from_args(&DaemonConfigArgs {
             config: Some(config_path),
             state: None,
@@ -3875,7 +3771,6 @@ mod tests {
         })
         .unwrap();
 
-        assert!(config.detect_related);
         assert!(daemon_config.detect_related);
     }
 
@@ -3890,9 +3785,6 @@ mod tests {
             worktree_root: dir.path().join("worktrees"),
             rpc_url: default_rpc_url(),
             client_id: "00000000-0000-4000-8000-000000000003".to_string(),
-            detect_related: false,
-            clone_start_ttl_minutes: 60,
-            rpc_rate_limit_per_second: 1,
         };
         let explicit_file = dir.path().join("custom/repo-config.json");
 
@@ -3907,9 +3799,6 @@ mod tests {
                 worktree_root: None,
                 rpc_url: Some("tcp://127.0.0.1:47321".to_string()),
                 client_id: Some("00000000-0000-4000-8000-000000000004".to_string()),
-                detect_related: Some(true),
-                clone_start_ttl_minutes: Some(15),
-                rpc_rate_limit_per_second: Some(5),
             },
         )
         .unwrap();
@@ -3925,9 +3814,9 @@ mod tests {
             saved.client_id,
             Some("00000000-0000-4000-8000-000000000004".to_string())
         );
-        assert_eq!(saved.detect_related, Some(true));
-        assert_eq!(saved.clone_start_ttl_minutes, Some(15));
-        assert_eq!(saved.rpc_rate_limit_per_second, Some(5));
+        assert_eq!(saved.detect_related, None);
+        assert_eq!(saved.clone_start_ttl_minutes, None);
+        assert_eq!(saved.rpc_rate_limit_per_second, None);
     }
 
     #[test]
@@ -3991,7 +3880,7 @@ mod tests {
     fn daemon_cancellation_removes_matching_clone_start() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
-        let daemon_config = DaemonConfig::from(&config);
+        let daemon_config = test_daemon_config(dir.path());
         let daemon_state = DaemonState::new(0, 60);
         let locator = Locator::parse("example.com/current").unwrap();
         let path = dir.path().join("code/clones/example.com/current");
@@ -4030,7 +3919,7 @@ mod tests {
     fn daemon_ttl_prunes_stale_clone_starts() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
-        let daemon_config = DaemonConfig::from(&config);
+        let daemon_config = test_daemon_config(dir.path());
         let daemon_state = DaemonState::new(0, 0);
         let locator = Locator::parse("example.com/current").unwrap();
         let path = dir.path().join("code/clones/example.com/current");
@@ -4309,6 +4198,12 @@ mod tests {
             worktree_root: root.join("worktrees"),
             rpc_url: default_rpc_url(),
             client_id: "00000000-0000-4000-8000-000000000099".to_string(),
+        }
+    }
+
+    fn test_daemon_config(root: &Path) -> DaemonConfig {
+        DaemonConfig {
+            state: root.join("repos.sqlite"),
             detect_related: true,
             clone_start_ttl_minutes: 60,
             rpc_rate_limit_per_second: 0,

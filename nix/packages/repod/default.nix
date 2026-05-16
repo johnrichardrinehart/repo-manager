@@ -2,13 +2,12 @@
   lib,
   rustPlatform,
   makeWrapper,
-  curl,
   git,
-  ghq,
+  libnotify,
 }:
 
 rustPlatform.buildRustPackage {
-  pname = "repo-manager";
+  pname = "repod";
   version = "0.1.0";
 
   src = lib.fileset.toSource {
@@ -25,38 +24,34 @@ rustPlatform.buildRustPackage {
 
   cargoBuildFlags = [
     "-p"
-    "repo-manager"
+    "repod"
   ];
 
   cargoTestFlags = [
     "-p"
-    "repo-manager"
+    "repod"
     "-p"
     "repo-manager-core"
   ];
 
   nativeBuildInputs = [ makeWrapper ];
 
-  nativeCheckInputs = [
-    git
-    ghq
-  ];
+  nativeCheckInputs = [ git ];
 
   postInstall = ''
-    wrapProgram "$out/bin/repo" \
+    wrapProgram "$out/bin/repod" \
       --prefix PATH : ${
         lib.makeBinPath [
-          curl
           git
-          ghq
+          libnotify
         ]
       }
   '';
 
   meta = with lib; {
-    description = "Opinionated repository placement and lifecycle manager";
+    description = "repo-manager RPC daemon";
     license = licenses.mit;
-    mainProgram = "repo";
+    mainProgram = "repod";
     platforms = platforms.linux ++ platforms.darwin;
   };
 }
