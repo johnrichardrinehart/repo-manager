@@ -42,6 +42,10 @@ as the `repo` client, using the same config and state database. Shared-history
 review is enabled by default and can be disabled with `--detect-related=false`
 or `REPO_MANAGER_DETECT_RELATED=false`.
 
+RPC clients and daemons include an envelope protocol version. The current
+protocol is v1; breaking protobuf changes require a v2 protocol and are
+rejected by mismatched peers.
+
 ## Configuration
 
 Persist common values with:

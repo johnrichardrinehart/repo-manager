@@ -34,6 +34,8 @@ message CloneCancelled {
 }
 
 message CloneEvent {
+  uint32 protocol_version = 4;
+
   oneof event {
     CloneStarted started = 1;
     CloneFinished finished = 2;

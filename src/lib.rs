@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 const DEFAULT_DETECT_RELATED: bool = true;
+const RPC_PROTOCOL_VERSION: u32 = 1;
 
 pub mod api {
     include!(concat!(env!("OUT_DIR"), "/repo_manager.v1.rs"));
@@ -670,11 +671,16 @@ impl RpcEvent {
             }),
         };
 
-        api::CloneEvent { event: Some(event) }
+        api::CloneEvent {
+            protocol_version: RPC_PROTOCOL_VERSION,
+            event: Some(event),
+        }
     }
 
     fn from_proto(message: api::CloneEvent) -> Result<Self> {
         use api::clone_event::Event;
+
+        validate_rpc_protocol_version(message.protocol_version)?;
 
         match message
             .event
@@ -733,6 +739,17 @@ fn locator_to_proto(locator: &Locator) -> api::Locator {
 fn locator_from_proto(locator: Option<api::Locator>) -> Result<Locator> {
     let locator = locator.context("RPC clone event is missing locator")?;
     Locator::new(locator.authority, locator.remote_path)
+}
+
+fn validate_rpc_protocol_version(client_version: u32) -> Result<()> {
+    if client_version != RPC_PROTOCOL_VERSION {
+        bail!(
+            "RPC protocol version mismatch: daemon supports v{}, client sent v{}",
+            RPC_PROTOCOL_VERSION,
+            client_version
+        );
+    }
+    Ok(())
 }
 
 fn required_proto_path(field: &str, value: String) -> Result<PathBuf> {
@@ -4226,6 +4243,7 @@ mod tests {
             .to_proto()
             .encode_length_delimited(&mut message)
             .unwrap();
+        assert_eq!(event.to_proto().protocol_version, RPC_PROTOCOL_VERSION);
 
         let decoded = decode_rpc_event(&message).unwrap();
 
@@ -4244,6 +4262,28 @@ mod tests {
                 assert_eq!(decoded.scan_root, PathBuf::from("/tmp/client/clones"));
             }
             other => panic!("unexpected decoded event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rpc_clone_event_rejects_protocol_version_mismatch() {
+        let event = RpcEvent::Finished(CloneFinishedEvent {
+            client_id: "00000000-0000-4000-8000-000000000007".to_string(),
+            url: "https://example.com/current.git".to_string(),
+            locator: Locator::parse("example.com/current").unwrap(),
+            path: PathBuf::from("/tmp/client/clones/example.com/current"),
+            success: true,
+            scan_root: PathBuf::from("/tmp/client/clones"),
+        });
+        for unsupported_version in [0, RPC_PROTOCOL_VERSION + 1] {
+            let mut proto = event.to_proto();
+            proto.protocol_version = unsupported_version;
+            let mut message = Vec::new();
+            proto.encode_length_delimited(&mut message).unwrap();
+
+            let error = decode_rpc_event(&message).unwrap_err();
+
+            assert!(error.to_string().contains("RPC protocol version mismatch"));
         }
     }
 
