@@ -32,6 +32,13 @@ the worktree root. Each fork gets a stable remote name derived from its locator,
 so the canonical checkout and every fork worktree share the same `git remote -v`
 view: `origin` plus all fork remotes.
 
+## Daemon API
+
+Clone lifecycle RPC is defined in `api/repo_manager/v1/rpc.proto` and encoded
+with Protocol Buffers. The `repo` client sends clone events with its own
+`scan_root`; the `repod` process uses that event root when comparing
+repositories for shared Git history.
+
 ## Configuration
 
 Persist common values with:

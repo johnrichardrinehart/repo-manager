@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -18,10 +18,15 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use directories::BaseDirs;
 use log::{debug, warn};
+use prost::Message;
 use repo_help_derive::{HelpGroup, HelpTemplate};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use url::Url;
+
+pub mod api {
+    include!(concat!(env!("OUT_DIR"), "/repo_manager.v1.rs"));
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -32,6 +37,22 @@ use url::Url;
     long_about = "Manage local Git repositories using a stable locator model: <authority>/<remote-path>.\n\nCanonical repositories and forks live under the clone root. Development worktrees live under the worktree root.\n\nWhen --config is omitted, repo-manager layers config from each $XDG_CONFIG_DIRS entry before the user config from $XDG_CONFIG_HOME. Environment variables and explicit CLI options override persisted config."
 )]
 pub struct Cli {
+    #[command(flatten)]
+    config: ConfigArgs,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Print command results as machine-readable JSON"
+    )]
+    json: bool,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Debug, Clone, Default, Args)]
+struct ConfigArgs {
     #[arg(
         long,
         env = "REPO_MANAGER_CONFIG",
@@ -106,15 +127,6 @@ pub struct Cli {
 
     #[arg(
         long,
-        env = "REPO_MANAGER_RELATED_SCAN_ROOT",
-        value_name = "DIR",
-        help = "Root scanned by the daemon for shared-history review (default: ~/code)",
-        long_help = "Root scanned by the daemon after a client reports a completed clone. Defaults to ~/code."
-    )]
-    related_scan_root: Option<PathBuf>,
-
-    #[arg(
-        long,
         env = "REPO_MANAGER_CLONE_START_TTL_MINUTES",
         value_name = "MINUTES",
         help = "Daemon TTL for in-progress clone events (default: 60)"
@@ -128,16 +140,77 @@ pub struct Cli {
         help = "Daemon RPC receive rate limit per client (default: 1; 0 disables)"
     )]
     rpc_rate_limit_per_second: Option<u32>,
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "repod",
+    version,
+    about = "Run the repo-manager RPC daemon",
+    long_about = "Run the repo-manager RPC daemon.\n\nThe daemon receives clone lifecycle events from clients. When related-history detection is configured, a matching clone-start and successful clone-finished pair makes the daemon scan the client-provided event root for other Git repositories, compare commit history, and record pending relationship decisions."
+)]
+struct RepodCli {
+    #[command(flatten)]
+    config: DaemonConfigArgs,
+
+    #[command(flatten)]
+    daemon: DaemonArgs,
+}
+
+#[derive(Debug, Clone, Default, Args)]
+struct DaemonConfigArgs {
+    #[arg(
+        long,
+        env = "REPO_MANAGER_CONFIG",
+        value_name = "PATH",
+        help = "Config file path (default: $XDG_CONFIG_HOME/repo-manager/config.json)",
+        long_help = "Config file path to load. When omitted, repo-manager layers /repo-manager/config.json from each $XDG_CONFIG_DIRS entry, then $XDG_CONFIG_HOME/repo-manager/config.json or ~/.config/repo-manager/config.json when XDG_CONFIG_HOME is unset."
+    )]
+    config: Option<PathBuf>,
 
     #[arg(
         long,
-        global = true,
-        help = "Print command results as machine-readable JSON"
+        env = "REPO_MANAGER_STATE",
+        value_name = "PATH",
+        help = "SQLite metadata database path (default: $XDG_STATE_HOME/repo-manager/repos.sqlite)",
+        long_help = "SQLite metadata database path. Defaults to $XDG_STATE_HOME/repo-manager/repos.sqlite, or ~/.local/state/repo-manager/repos.sqlite when XDG_STATE_HOME is unset."
     )]
-    json: bool,
+    state: Option<PathBuf>,
 
-    #[command(subcommand)]
-    command: Commands,
+    #[arg(
+        long,
+        env = "REPO_MANAGER_RPC_URL",
+        value_name = "URL",
+        help = "RPC endpoint for clone lifecycle events (default: unix:///run/repo-manager.socket)",
+        long_help = "RPC endpoint for clone lifecycle events. Supported schemes are unix://, tcp://, and udp://. Defaults to unix:///run/repo-manager.socket."
+    )]
+    rpc_url: Option<String>,
+
+    #[arg(
+        long,
+        env = "REPO_MANAGER_DETECT_RELATED",
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        help = "Enable shared-history review after successful clone events"
+    )]
+    detect_related: Option<bool>,
+
+    #[arg(
+        long,
+        env = "REPO_MANAGER_CLONE_START_TTL_MINUTES",
+        value_name = "MINUTES",
+        help = "TTL for in-progress clone events (default: 60)"
+    )]
+    clone_start_ttl_minutes: Option<u64>,
+
+    #[arg(
+        long,
+        env = "REPO_MANAGER_RPC_RATE_LIMIT_PER_SECOND",
+        value_name = "N",
+        help = "RPC receive rate limit per client (default: 1; 0 disables)"
+    )]
+    rpc_rate_limit_per_second: Option<u32>,
 }
 
 #[derive(Debug, Subcommand, HelpTemplate)]
@@ -160,11 +233,6 @@ enum SetupCommands {
         long_about = "Persist common repo-manager settings to a config file.\n\nValues written by setup are loaded on future runs from the selected file. Environment variables and top-level CLI options still override persisted config at runtime."
     )]
     Setup(SetupArgs),
-    #[command(
-        about = "Run the repo-manager RPC daemon",
-        long_about = "Run the repo-manager RPC daemon.\n\nThe daemon receives clone lifecycle events from clients. When related-history detection is configured, a matching clone-start and successful clone-finished pair makes the daemon scan the configured related scan root for other Git repositories, compare commit history, and record pending relationship decisions."
-    )]
-    Daemon(DaemonArgs),
 }
 
 #[derive(Debug, Subcommand, HelpGroup)]
@@ -273,13 +341,6 @@ struct SetupArgs {
         help = "Persist daemon-side related-history detection after successful clones"
     )]
     detect_related: Option<bool>,
-
-    #[arg(
-        long,
-        value_name = "DIR",
-        help = "Persist the daemon shared-history scan root (default: ~/code)"
-    )]
-    related_scan_root: Option<PathBuf>,
 
     #[arg(
         long,
@@ -489,7 +550,14 @@ struct Config {
     rpc_url: String,
     client_id: String,
     detect_related: bool,
-    related_scan_root: PathBuf,
+    clone_start_ttl_minutes: u64,
+    rpc_rate_limit_per_second: u32,
+}
+
+#[derive(Debug, Clone)]
+struct DaemonConfig {
+    state: PathBuf,
+    detect_related: bool,
     clone_start_ttl_minutes: u64,
     rpc_rate_limit_per_second: u32,
 }
@@ -508,7 +576,6 @@ struct FileConfig {
     rpc_url: Option<String>,
     client_id: Option<String>,
     detect_related: Option<bool>,
-    related_scan_root: Option<PathBuf>,
     clone_start_ttl_minutes: Option<u64>,
     rpc_rate_limit_per_second: Option<u32>,
 }
@@ -535,44 +602,108 @@ struct ReconcileSkip {
     reason: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "event")]
+#[derive(Debug, Clone)]
 enum RpcEvent {
-    #[serde(rename = "clone_started")]
     Started(CloneStartedEvent),
-    #[serde(rename = "clone_finished")]
     Finished(CloneFinishedEvent),
-    #[serde(rename = "clone_cancelled")]
     Cancelled(CloneCancelledEvent),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 struct CloneStartedEvent {
     client_id: String,
     url: String,
     locator: Locator,
     path: PathBuf,
+    scan_root: PathBuf,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 struct CloneFinishedEvent {
     client_id: String,
     url: String,
     locator: Locator,
     path: PathBuf,
     success: bool,
+    scan_root: PathBuf,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 struct CloneCancelledEvent {
     client_id: String,
     url: String,
     locator: Locator,
     path: PathBuf,
     reason: String,
+    scan_root: PathBuf,
 }
 
 impl RpcEvent {
+    fn to_proto(&self) -> api::CloneEvent {
+        use api::clone_event::Event;
+
+        let event = match self {
+            Self::Started(event) => Event::Started(api::CloneStarted {
+                client_id: event.client_id.clone(),
+                url: event.url.clone(),
+                locator: Some(locator_to_proto(&event.locator)),
+                path: event.path.display().to_string(),
+                scan_root: event.scan_root.display().to_string(),
+            }),
+            Self::Finished(event) => Event::Finished(api::CloneFinished {
+                client_id: event.client_id.clone(),
+                url: event.url.clone(),
+                locator: Some(locator_to_proto(&event.locator)),
+                path: event.path.display().to_string(),
+                success: event.success,
+                scan_root: event.scan_root.display().to_string(),
+            }),
+            Self::Cancelled(event) => Event::Cancelled(api::CloneCancelled {
+                client_id: event.client_id.clone(),
+                url: event.url.clone(),
+                locator: Some(locator_to_proto(&event.locator)),
+                path: event.path.display().to_string(),
+                reason: event.reason.clone(),
+                scan_root: event.scan_root.display().to_string(),
+            }),
+        };
+
+        api::CloneEvent { event: Some(event) }
+    }
+
+    fn from_proto(message: api::CloneEvent) -> Result<Self> {
+        use api::clone_event::Event;
+
+        match message
+            .event
+            .context("RPC clone event is missing event payload")?
+        {
+            Event::Started(event) => Ok(Self::Started(CloneStartedEvent {
+                client_id: required_proto_string("client_id", event.client_id)?,
+                url: required_proto_string("url", event.url)?,
+                locator: locator_from_proto(event.locator)?,
+                path: required_proto_path("path", event.path)?,
+                scan_root: required_proto_path("scan_root", event.scan_root)?,
+            })),
+            Event::Finished(event) => Ok(Self::Finished(CloneFinishedEvent {
+                client_id: required_proto_string("client_id", event.client_id)?,
+                url: required_proto_string("url", event.url)?,
+                locator: locator_from_proto(event.locator)?,
+                path: required_proto_path("path", event.path)?,
+                success: event.success,
+                scan_root: required_proto_path("scan_root", event.scan_root)?,
+            })),
+            Event::Cancelled(event) => Ok(Self::Cancelled(CloneCancelledEvent {
+                client_id: required_proto_string("client_id", event.client_id)?,
+                url: required_proto_string("url", event.url)?,
+                locator: locator_from_proto(event.locator)?,
+                path: required_proto_path("path", event.path)?,
+                reason: required_proto_string("reason", event.reason)?,
+                scan_root: required_proto_path("scan_root", event.scan_root)?,
+            })),
+        }
+    }
+
     fn client_id(&self) -> &str {
         match self {
             Self::Started(event) => &event.client_id,
@@ -588,6 +719,29 @@ impl RpcEvent {
             Self::Cancelled(_) => "clone_cancelled",
         }
     }
+}
+
+fn locator_to_proto(locator: &Locator) -> api::Locator {
+    api::Locator {
+        authority: locator.authority.clone(),
+        remote_path: locator.remote_path.clone(),
+    }
+}
+
+fn locator_from_proto(locator: Option<api::Locator>) -> Result<Locator> {
+    let locator = locator.context("RPC clone event is missing locator")?;
+    Locator::new(locator.authority, locator.remote_path)
+}
+
+fn required_proto_path(field: &str, value: String) -> Result<PathBuf> {
+    Ok(PathBuf::from(required_proto_string(field, value)?))
+}
+
+fn required_proto_string(field: &str, value: String) -> Result<String> {
+    if value.is_empty() {
+        bail!("RPC clone event is missing required field `{field}`");
+    }
+    Ok(value)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -760,7 +914,6 @@ pub fn run() -> Result<()> {
     match cli.command {
         Commands::Setup(command) => match command {
             SetupCommands::Setup(args) => setup_config(&config, &output, args),
-            SetupCommands::Daemon(args) => run_daemon(&config, args),
         },
         Commands::RepositoryOperations(command) => match command {
             RepositoryOperationCommands::Clone(args) => {
@@ -815,6 +968,13 @@ pub fn run() -> Result<()> {
     }
 }
 
+pub fn run_repod() -> Result<()> {
+    let _ = env_logger::try_init();
+    let cli = RepodCli::parse();
+    let (config, rpc_url) = DaemonConfig::from_args(&cli.config)?;
+    run_daemon(&config, &rpc_url, cli.daemon)
+}
+
 fn parse_cli() -> Cli {
     let matches = Cli::command()
         .help_template(<Commands as HelpTemplate>::help_template())
@@ -824,7 +984,11 @@ fn parse_cli() -> Cli {
 
 impl Config {
     fn from_cli(cli: &Cli) -> Result<Self> {
-        let (config_path, file_config) = match &cli.config {
+        Self::from_args(&cli.config)
+    }
+
+    fn from_args(args: &ConfigArgs) -> Result<Self> {
+        let (config_path, file_config) = match &args.config {
             Some(config_path) => (config_path.clone(), FileConfig::load(config_path)?),
             None => {
                 let config_path = default_config_path()?;
@@ -832,50 +996,45 @@ impl Config {
                 (config_path, file_config)
             }
         };
-        let state = cli
+        let state = args
             .state
             .clone()
             .or(file_config.state)
             .unwrap_or(default_state_path()?);
-        let cache_root = cli
+        let cache_root = args
             .cache_root
             .clone()
             .or(file_config.cache_root)
             .unwrap_or(default_cache_root()?);
-        let clone_root = cli
+        let clone_root = args
             .clone_root
             .clone()
             .or(file_config.clone_root)
             .unwrap_or(default_clone_root()?);
-        let worktree_root = cli
+        let worktree_root = args
             .worktree_root
             .clone()
             .or(file_config.worktree_root)
             .unwrap_or(default_worktree_root()?);
-        let rpc_url = cli
+        let rpc_url = args
             .rpc_url
             .clone()
             .or(file_config.rpc_url)
             .unwrap_or_else(default_rpc_url);
-        let client_id = cli
+        let client_id = args
             .client_id
             .clone()
             .or(file_config.client_id)
             .map_or_else(generate_client_id, validate_client_id)?;
-        let detect_related = cli
+        let detect_related = args
             .detect_related
             .or(file_config.detect_related)
             .unwrap_or(false);
-        let related_scan_root = cli
-            .related_scan_root
-            .clone()
-            .or(file_config.related_scan_root)
-            .unwrap_or(default_related_scan_root()?);
-        let clone_start_ttl_minutes = cli
+        let clone_start_ttl_minutes = args
             .clone_start_ttl_minutes
             .or(file_config.clone_start_ttl_minutes)
             .unwrap_or(60);
-        let rpc_rate_limit_per_second = cli
+        let rpc_rate_limit_per_second = args
             .rpc_rate_limit_per_second
             .or(file_config.rpc_rate_limit_per_second)
             .unwrap_or(1);
@@ -888,7 +1047,6 @@ impl Config {
             rpc_url,
             client_id,
             detect_related,
-            related_scan_root,
             clone_start_ttl_minutes,
             rpc_rate_limit_per_second,
         })
@@ -922,9 +1080,6 @@ impl FileConfig {
         self.rpc_url = other.rpc_url.or_else(|| self.rpc_url.take());
         self.client_id = other.client_id.or_else(|| self.client_id.take());
         self.detect_related = other.detect_related.or(self.detect_related);
-        self.related_scan_root = other
-            .related_scan_root
-            .or_else(|| self.related_scan_root.take());
         self.clone_start_ttl_minutes = other
             .clone_start_ttl_minutes
             .or(self.clone_start_ttl_minutes);
@@ -944,6 +1099,62 @@ impl FileConfig {
     }
 }
 
+impl From<&Config> for DaemonConfig {
+    fn from(config: &Config) -> Self {
+        Self {
+            state: config.state.clone(),
+            detect_related: config.detect_related,
+            clone_start_ttl_minutes: config.clone_start_ttl_minutes,
+            rpc_rate_limit_per_second: config.rpc_rate_limit_per_second,
+        }
+    }
+}
+
+impl DaemonConfig {
+    fn from_args(args: &DaemonConfigArgs) -> Result<(Self, String)> {
+        let (_config_path, file_config) = match &args.config {
+            Some(config_path) => (config_path.clone(), FileConfig::load(config_path)?),
+            None => {
+                let config_path = default_config_path()?;
+                let file_config = FileConfig::load_xdg_layered(&config_path)?;
+                (config_path, file_config)
+            }
+        };
+        let state = args
+            .state
+            .clone()
+            .or(file_config.state)
+            .unwrap_or(default_state_path()?);
+        let rpc_url = args
+            .rpc_url
+            .clone()
+            .or(file_config.rpc_url)
+            .unwrap_or_else(default_rpc_url);
+        let detect_related = args
+            .detect_related
+            .or(file_config.detect_related)
+            .unwrap_or(false);
+        let clone_start_ttl_minutes = args
+            .clone_start_ttl_minutes
+            .or(file_config.clone_start_ttl_minutes)
+            .unwrap_or(60);
+        let rpc_rate_limit_per_second = args
+            .rpc_rate_limit_per_second
+            .or(file_config.rpc_rate_limit_per_second)
+            .unwrap_or(1);
+
+        Ok((
+            Self {
+                state,
+                detect_related,
+                clone_start_ttl_minutes,
+                rpc_rate_limit_per_second,
+            },
+            rpc_url,
+        ))
+    }
+}
+
 fn setup_config(config: &Config, output: &Output, args: SetupArgs) -> Result<()> {
     let config_path = args.file.unwrap_or_else(|| config.config_path.clone());
     let file_config = FileConfig {
@@ -957,10 +1168,6 @@ fn setup_config(config: &Config, output: &Output, args: SetupArgs) -> Result<()>
         rpc_url: Some(args.rpc_url.unwrap_or_else(|| config.rpc_url.clone())),
         client_id: Some(args.client_id.unwrap_or_else(|| config.client_id.clone())),
         detect_related: Some(args.detect_related.unwrap_or(config.detect_related)),
-        related_scan_root: Some(
-            args.related_scan_root
-                .unwrap_or_else(|| config.related_scan_root.clone()),
-        ),
         clone_start_ttl_minutes: Some(
             args.clone_start_ttl_minutes
                 .unwrap_or(config.clone_start_ttl_minutes),
@@ -1020,10 +1227,6 @@ fn default_clone_root() -> Result<PathBuf> {
 
 fn default_worktree_root() -> Result<PathBuf> {
     Ok(home_dir()?.join("code/worktrees"))
-}
-
-fn default_related_scan_root() -> Result<PathBuf> {
-    Ok(home_dir()?.join("code"))
 }
 
 fn default_rpc_url() -> String {
@@ -1708,6 +1911,7 @@ fn clone_repo(config: &Config, db: &Store, output: &Output, url: &str) -> Result
             url: url.to_string(),
             locator: locator.clone(),
             path: path.clone(),
+            scan_root: config.clone_root.clone(),
         }),
     );
     let lifecycle = CloneLifecycle {
@@ -1716,6 +1920,7 @@ fn clone_repo(config: &Config, db: &Store, output: &Output, url: &str) -> Result
         url: url.to_string(),
         locator: locator.clone(),
         path: path.clone(),
+        scan_root: config.clone_root.clone(),
     };
     let clone_result = if which::which("ghq").is_ok() {
         match run_clone_command_with_cancellation(
@@ -1744,6 +1949,7 @@ fn clone_repo(config: &Config, db: &Store, output: &Output, url: &str) -> Result
                 locator,
                 path,
                 success: false,
+                scan_root: config.clone_root.clone(),
             }),
         );
         return Err(error);
@@ -1757,6 +1963,7 @@ fn clone_repo(config: &Config, db: &Store, output: &Output, url: &str) -> Result
             locator: locator.clone(),
             path: path.clone(),
             success: true,
+            scan_root: config.clone_root.clone(),
         }),
     );
     output_clone(
@@ -1788,6 +1995,7 @@ struct CloneLifecycle {
     url: String,
     locator: Locator,
     path: PathBuf,
+    scan_root: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1868,6 +2076,7 @@ fn send_clone_cancelled(lifecycle: &CloneLifecycle, reason: &str) {
             locator: lifecycle.locator.clone(),
             path: lifecycle.path.clone(),
             reason: reason.to_string(),
+            scan_root: lifecycle.scan_root.clone(),
         }),
     );
 }
@@ -2229,13 +2438,17 @@ fn socket_addr_from_url(url: &Url) -> Result<String> {
 }
 
 fn send_rpc_event(endpoint: &str, event: &RpcEvent) -> Result<()> {
-    let message = format!("{}\n", serde_json::to_string(event)?);
+    let mut message = Vec::new();
+    event
+        .to_proto()
+        .encode_length_delimited(&mut message)
+        .context("encoding RPC clone event")?;
     match parse_rpc_endpoint(endpoint)? {
         RpcEndpoint::Unix(path) => {
             #[cfg(unix)]
             {
                 let mut stream = UnixStream::connect(path)?;
-                stream.write_all(message.as_bytes())?;
+                stream.write_all(&message)?;
                 Ok(())
             }
             #[cfg(not(unix))]
@@ -2246,12 +2459,12 @@ fn send_rpc_event(endpoint: &str, event: &RpcEvent) -> Result<()> {
         }
         RpcEndpoint::Tcp(addr) => {
             let mut stream = TcpStream::connect(addr)?;
-            stream.write_all(message.as_bytes())?;
+            stream.write_all(&message)?;
             Ok(())
         }
         RpcEndpoint::Udp(addr) => {
             let socket = UdpSocket::bind("0.0.0.0:0")?;
-            socket.send_to(message.as_bytes(), addr)?;
+            socket.send_to(&message, addr)?;
             Ok(())
         }
     }
@@ -2264,8 +2477,8 @@ fn send_rpc_event_best_effort(endpoint: &str, event: &RpcEvent) {
     }
 }
 
-fn run_daemon(config: &Config, args: DaemonArgs) -> Result<()> {
-    let endpoint = parse_rpc_endpoint(args.listen.as_deref().unwrap_or(&config.rpc_url))?;
+fn run_daemon(config: &DaemonConfig, rpc_url: &str, args: DaemonArgs) -> Result<()> {
+    let endpoint = parse_rpc_endpoint(args.listen.as_deref().unwrap_or(rpc_url))?;
     let daemon_state = Arc::new(DaemonState::new(
         config.rpc_rate_limit_per_second,
         config.clone_start_ttl_minutes,
@@ -2321,7 +2534,11 @@ fn prune_expired_clone_starts(daemon_state: &DaemonState) -> Result<usize> {
 }
 
 #[cfg(unix)]
-fn run_unix_daemon(config: &Config, path: &Path, daemon_state: Arc<DaemonState>) -> Result<()> {
+fn run_unix_daemon(
+    config: &DaemonConfig,
+    path: &Path,
+    daemon_state: Arc<DaemonState>,
+) -> Result<()> {
     if path.exists() {
         fs::remove_file(path)
             .with_context(|| format!("removing stale RPC socket {}", path.display()))?;
@@ -2341,9 +2558,7 @@ fn run_unix_daemon(config: &Config, path: &Path, daemon_state: Arc<DaemonState>)
         let config = config.clone();
         let daemon_state = Arc::clone(&daemon_state);
         thread::spawn(move || {
-            if let Err(error) =
-                handle_rpc_reader(&config, BufReader::new(stream), peer, daemon_state)
-            {
+            if let Err(error) = handle_rpc_stream(&config, stream, peer, daemon_state) {
                 eprintln!("repo-manager daemon: {error:#}");
             }
         });
@@ -2352,11 +2567,15 @@ fn run_unix_daemon(config: &Config, path: &Path, daemon_state: Arc<DaemonState>)
 }
 
 #[cfg(not(unix))]
-fn run_unix_daemon(_config: &Config, _path: &Path, _daemon_state: Arc<DaemonState>) -> Result<()> {
+fn run_unix_daemon(
+    _config: &DaemonConfig,
+    _path: &Path,
+    _daemon_state: Arc<DaemonState>,
+) -> Result<()> {
     bail!("unix RPC endpoints are not supported on this platform")
 }
 
-fn run_tcp_daemon(config: &Config, addr: &str, daemon_state: Arc<DaemonState>) -> Result<()> {
+fn run_tcp_daemon(config: &DaemonConfig, addr: &str, daemon_state: Arc<DaemonState>) -> Result<()> {
     let listener = TcpListener::bind(addr).with_context(|| format!("listening on tcp://{addr}"))?;
     println!("repo-manager daemon listening on tcp://{addr}");
     for stream in listener.incoming() {
@@ -2368,9 +2587,7 @@ fn run_tcp_daemon(config: &Config, addr: &str, daemon_state: Arc<DaemonState>) -
         let config = config.clone();
         let daemon_state = Arc::clone(&daemon_state);
         thread::spawn(move || {
-            if let Err(error) =
-                handle_rpc_reader(&config, BufReader::new(stream), peer, daemon_state)
-            {
+            if let Err(error) = handle_rpc_stream(&config, stream, peer, daemon_state) {
                 eprintln!("repo-manager daemon: {error:#}");
             }
         });
@@ -2378,16 +2595,14 @@ fn run_tcp_daemon(config: &Config, addr: &str, daemon_state: Arc<DaemonState>) -
     Ok(())
 }
 
-fn run_udp_daemon(config: &Config, addr: &str, daemon_state: Arc<DaemonState>) -> Result<()> {
+fn run_udp_daemon(config: &DaemonConfig, addr: &str, daemon_state: Arc<DaemonState>) -> Result<()> {
     let socket = UdpSocket::bind(addr).with_context(|| format!("listening on udp://{addr}"))?;
     println!("repo-manager daemon listening on udp://{addr}");
     let mut buffer = [0_u8; 65_535];
     loop {
         let (len, peer) = socket.recv_from(&mut buffer)?;
-        let message = String::from_utf8_lossy(&buffer[..len]);
-        debug!("received RPC message from udp://{peer}: {}", message.trim());
-        let event: RpcEvent = serde_json::from_str(message.trim())
-            .with_context(|| format!("parsing RPC event: {message}"))?;
+        debug!("received RPC message from udp://{peer}: {len} bytes");
+        let event = decode_rpc_event(&buffer[..len])?;
         if !allow_rpc_event(&daemon_state, &event, &format!("udp://{peer}"))? {
             continue;
         }
@@ -2395,28 +2610,31 @@ fn run_udp_daemon(config: &Config, addr: &str, daemon_state: Arc<DaemonState>) -
     }
 }
 
-fn handle_rpc_reader<R: BufRead>(
-    config: &Config,
-    mut reader: R,
+fn handle_rpc_stream<R: Read>(
+    config: &DaemonConfig,
+    mut stream: R,
     peer: String,
     daemon_state: Arc<DaemonState>,
 ) -> Result<()> {
-    let mut line = String::new();
-    while reader.read_line(&mut line)? != 0 {
-        let trimmed = line.trim();
-        if !trimmed.is_empty() {
-            debug!("received RPC message from {peer}: {trimmed}");
-            let event: RpcEvent =
-                serde_json::from_str(trimmed).context("parsing RPC event JSON")?;
-            if !allow_rpc_event(&daemon_state, &event, &peer)? {
-                line.clear();
-                continue;
-            }
-            handle_rpc_event(config, &daemon_state, event)?;
-        }
-        line.clear();
+    let mut message = Vec::new();
+    stream
+        .read_to_end(&mut message)
+        .with_context(|| format!("reading RPC message from {peer}"))?;
+    if message.is_empty() {
+        return Ok(());
     }
+    debug!("received RPC message from {peer}: {} bytes", message.len());
+    let event = decode_rpc_event(&message)?;
+    if allow_rpc_event(&daemon_state, &event, &peer)? {
+        handle_rpc_event(config, &daemon_state, event)?;
+    }
+
     Ok(())
+}
+
+fn decode_rpc_event(message: &[u8]) -> Result<RpcEvent> {
+    let event = api::CloneEvent::decode_length_delimited(message).context("decoding RPC event")?;
+    RpcEvent::from_proto(event)
 }
 
 fn allow_rpc_event(daemon_state: &DaemonState, event: &RpcEvent, peer: &str) -> Result<bool> {
@@ -2445,15 +2663,20 @@ fn unix_peer_description(stream: &UnixStream, socket_path: &Path) -> String {
     format!("unix://{} peer={addr}", socket_path.display())
 }
 
-fn handle_rpc_event(config: &Config, daemon_state: &DaemonState, event: RpcEvent) -> Result<()> {
+fn handle_rpc_event(
+    config: &DaemonConfig,
+    daemon_state: &DaemonState,
+    event: RpcEvent,
+) -> Result<()> {
     prune_expired_clone_starts(daemon_state)?;
     match event {
         RpcEvent::Started(event) => {
             debug!(
-                "clone started from client {}: {} -> {}",
+                "clone started from client {}: {} -> {} scan_root={}",
                 event.client_id,
                 event.locator.key(),
-                event.path.display()
+                event.path.display(),
+                event.scan_root.display()
             );
             daemon_state
                 .clone_starts
@@ -2470,11 +2693,12 @@ fn handle_rpc_event(config: &Config, daemon_state: &DaemonState, event: RpcEvent
         }
         RpcEvent::Finished(event) => {
             debug!(
-                "clone finished from client {}: {} -> {} success={}",
+                "clone finished from client {}: {} -> {} success={} scan_root={}",
                 event.client_id,
                 event.locator.key(),
                 event.path.display(),
-                event.success
+                event.success,
+                event.scan_root.display()
             );
             let started = daemon_state
                 .clone_starts
@@ -2486,13 +2710,23 @@ fn handle_rpc_event(config: &Config, daemon_state: &DaemonState, event: RpcEvent
                     &event.path,
                 ));
             if event.success && config.detect_related && started.is_some() {
+                debug!(
+                    "reviewing related history for {} under client scan root {}",
+                    event.locator.key(),
+                    event.scan_root.display()
+                );
                 let store = Store::open(&config.state)?;
                 let count = detect_related_history_under_code(
                     &store,
                     &event.locator,
                     &event.path,
-                    &config.related_scan_root,
+                    &event.scan_root,
                 )?;
+                debug!(
+                    "related-history review for {} found {} candidate(s)",
+                    event.locator.key(),
+                    count
+                );
                 if count > 0 {
                     notify_related_history(count, &event.locator);
                 }
@@ -2506,11 +2740,12 @@ fn handle_rpc_event(config: &Config, daemon_state: &DaemonState, event: RpcEvent
         }
         RpcEvent::Cancelled(event) => {
             debug!(
-                "clone cancelled from client {}: {} -> {} reason={}",
+                "clone cancelled from client {}: {} -> {} reason={} scan_root={}",
                 event.client_id,
                 event.locator.key(),
                 event.path.display(),
-                event.reason
+                event.reason,
+                event.scan_root.display()
             );
             daemon_state
                 .clone_starts
@@ -3304,7 +3539,6 @@ mod tests {
             rpc_url: default_rpc_url(),
             client_id: generate_client_id().unwrap(),
             detect_related: false,
-            related_scan_root: dir.path().join("code"),
             clone_start_ttl_minutes: 60,
             rpc_rate_limit_per_second: 1,
         };
@@ -3369,7 +3603,6 @@ mod tests {
             rpc_url: default_rpc_url(),
             client_id: generate_client_id().unwrap(),
             detect_related: false,
-            related_scan_root: dir.path().join("code"),
             clone_start_ttl_minutes: 60,
             rpc_rate_limit_per_second: 1,
         };
@@ -3407,7 +3640,6 @@ mod tests {
             rpc_url: Some("tcp://127.0.0.1:47321".to_string()),
             client_id: Some("00000000-0000-4000-8000-000000000001".to_string()),
             detect_related: Some(true),
-            related_scan_root: Some(dir.path().join("code/from-file")),
             clone_start_ttl_minutes: Some(45),
             rpc_rate_limit_per_second: Some(7),
         }
@@ -3415,17 +3647,18 @@ mod tests {
         .unwrap();
 
         let cli = Cli {
-            config: Some(config_path.clone()),
-            state: None,
-            cache_root: Some(dir.path().join("cache/from-cli")),
-            clone_root: None,
-            worktree_root: None,
-            rpc_url: Some("udp://127.0.0.1:47322".to_string()),
-            client_id: Some("00000000-0000-4000-8000-000000000002".to_string()),
-            detect_related: Some(false),
-            related_scan_root: Some(dir.path().join("code/from-cli")),
-            clone_start_ttl_minutes: Some(30),
-            rpc_rate_limit_per_second: Some(3),
+            config: ConfigArgs {
+                config: Some(config_path.clone()),
+                state: None,
+                cache_root: Some(dir.path().join("cache/from-cli")),
+                clone_root: None,
+                worktree_root: None,
+                rpc_url: Some("udp://127.0.0.1:47322".to_string()),
+                client_id: Some("00000000-0000-4000-8000-000000000002".to_string()),
+                detect_related: Some(false),
+                clone_start_ttl_minutes: Some(30),
+                rpc_rate_limit_per_second: Some(3),
+            },
             json: false,
             command: Commands::Setup(SetupCommands::Setup(SetupArgs {
                 file: None,
@@ -3436,7 +3669,6 @@ mod tests {
                 rpc_url: None,
                 client_id: None,
                 detect_related: None,
-                related_scan_root: None,
                 clone_start_ttl_minutes: None,
                 rpc_rate_limit_per_second: None,
             })),
@@ -3451,7 +3683,6 @@ mod tests {
         assert_eq!(config.rpc_url, "udp://127.0.0.1:47322");
         assert_eq!(config.client_id, "00000000-0000-4000-8000-000000000002");
         assert!(!config.detect_related);
-        assert_eq!(config.related_scan_root, dir.path().join("code/from-cli"));
         assert_eq!(config.clone_start_ttl_minutes, 30);
         assert_eq!(config.rpc_rate_limit_per_second, 3);
     }
@@ -3468,7 +3699,6 @@ mod tests {
             rpc_url: default_rpc_url(),
             client_id: "00000000-0000-4000-8000-000000000003".to_string(),
             detect_related: false,
-            related_scan_root: dir.path().join("code"),
             clone_start_ttl_minutes: 60,
             rpc_rate_limit_per_second: 1,
         };
@@ -3486,7 +3716,6 @@ mod tests {
                 rpc_url: Some("tcp://127.0.0.1:47321".to_string()),
                 client_id: Some("00000000-0000-4000-8000-000000000004".to_string()),
                 detect_related: Some(true),
-                related_scan_root: Some(dir.path().join("custom-code")),
                 clone_start_ttl_minutes: Some(15),
                 rpc_rate_limit_per_second: Some(5),
             },
@@ -3505,10 +3734,6 @@ mod tests {
             Some("00000000-0000-4000-8000-000000000004".to_string())
         );
         assert_eq!(saved.detect_related, Some(true));
-        assert_eq!(
-            saved.related_scan_root,
-            Some(dir.path().join("custom-code"))
-        );
         assert_eq!(saved.clone_start_ttl_minutes, Some(15));
         assert_eq!(saved.rpc_rate_limit_per_second, Some(5));
     }
@@ -3524,7 +3749,6 @@ mod tests {
             rpc_url: Some("unix:///run/base.sock".to_string()),
             client_id: None,
             detect_related: Some(false),
-            related_scan_root: Some(dir.path().join("code/base")),
             clone_start_ttl_minutes: Some(60),
             rpc_rate_limit_per_second: Some(1),
         };
@@ -3537,7 +3761,6 @@ mod tests {
             rpc_url: None,
             client_id: Some("00000000-0000-4000-8000-000000000005".to_string()),
             detect_related: Some(true),
-            related_scan_root: Some(dir.path().join("code/user")),
             clone_start_ttl_minutes: Some(10),
             rpc_rate_limit_per_second: Some(9),
         });
@@ -3546,7 +3769,6 @@ mod tests {
         assert_eq!(base.cache_root, Some(dir.path().join("cache/user")));
         assert_eq!(base.clone_root, Some(dir.path().join("clones/user")));
         assert_eq!(base.rpc_url, Some("unix:///run/base.sock".to_string()));
-        assert_eq!(base.related_scan_root, Some(dir.path().join("code/user")));
         assert_eq!(base.clone_start_ttl_minutes, Some(10));
         assert_eq!(
             base.client_id,
@@ -3577,25 +3799,27 @@ mod tests {
     fn daemon_cancellation_removes_matching_clone_start() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
+        let daemon_config = DaemonConfig::from(&config);
         let daemon_state = DaemonState::new(0, 60);
         let locator = Locator::parse("example.com/current").unwrap();
         let path = dir.path().join("code/clones/example.com/current");
 
         handle_rpc_event(
-            &config,
+            &daemon_config,
             &daemon_state,
             RpcEvent::Started(CloneStartedEvent {
                 client_id: config.client_id.clone(),
                 url: "https://example.com/current.git".to_string(),
                 locator: locator.clone(),
                 path: path.clone(),
+                scan_root: config.clone_root.clone(),
             }),
         )
         .unwrap();
         assert_eq!(daemon_state.clone_starts.lock().unwrap().len(), 1);
 
         handle_rpc_event(
-            &config,
+            &daemon_config,
             &daemon_state,
             RpcEvent::Cancelled(CloneCancelledEvent {
                 client_id: config.client_id.clone(),
@@ -3603,6 +3827,7 @@ mod tests {
                 locator,
                 path,
                 reason: "test cancellation".to_string(),
+                scan_root: config.clone_root.clone(),
             }),
         )
         .unwrap();
@@ -3613,18 +3838,20 @@ mod tests {
     fn daemon_ttl_prunes_stale_clone_starts() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
+        let daemon_config = DaemonConfig::from(&config);
         let daemon_state = DaemonState::new(0, 0);
         let locator = Locator::parse("example.com/current").unwrap();
         let path = dir.path().join("code/clones/example.com/current");
 
         handle_rpc_event(
-            &config,
+            &daemon_config,
             &daemon_state,
             RpcEvent::Started(CloneStartedEvent {
                 client_id: config.client_id.clone(),
                 url: "https://example.com/current.git".to_string(),
                 locator,
                 path,
+                scan_root: config.clone_root.clone(),
             }),
         )
         .unwrap();
@@ -3635,7 +3862,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_reviews_code_root_after_matching_clone_start_and_finish() {
+    fn daemon_reviews_client_scan_root_after_matching_clone_start_and_finish() {
         let dir = tempfile::tempdir().unwrap();
         let code_root = dir.path().join("code");
         let seed = dir.path().join("seed");
@@ -3682,37 +3909,33 @@ mod tests {
         .unwrap();
 
         let state_path = dir.path().join("repos.sqlite");
-        let config = Config {
-            config_path: dir.path().join("config.json"),
+        let client_id = "00000000-0000-4000-8000-000000000006".to_string();
+        let daemon_config = DaemonConfig {
             state: state_path.clone(),
-            cache_root: dir.path().join("cache"),
-            clone_root: dir.path().join("clones"),
-            worktree_root: dir.path().join("worktrees"),
-            rpc_url: default_rpc_url(),
-            client_id: "00000000-0000-4000-8000-000000000006".to_string(),
             detect_related: true,
-            related_scan_root: code_root,
             clone_start_ttl_minutes: 60,
             rpc_rate_limit_per_second: 0,
         };
         let daemon_state = DaemonState::new(0, 60);
         let locator = Locator::parse("example.com/current").unwrap();
         let start = CloneStartedEvent {
-            client_id: config.client_id.clone(),
+            client_id: client_id.clone(),
             url: "https://example.com/current.git".to_string(),
             locator: locator.clone(),
             path: current_path.clone(),
+            scan_root: code_root.clone(),
         };
-        handle_rpc_event(&config, &daemon_state, RpcEvent::Started(start)).unwrap();
+        handle_rpc_event(&daemon_config, &daemon_state, RpcEvent::Started(start)).unwrap();
         handle_rpc_event(
-            &config,
+            &daemon_config,
             &daemon_state,
             RpcEvent::Finished(CloneFinishedEvent {
-                client_id: config.client_id.clone(),
+                client_id: client_id.clone(),
                 url: "https://example.com/current.git".to_string(),
                 locator,
                 path: current_path,
                 success: true,
+                scan_root: code_root,
             }),
         )
         .unwrap();
@@ -3734,6 +3957,42 @@ mod tests {
                 .iter()
                 .any(|evidence| evidence.starts_with("shared commit "))
         );
+    }
+
+    #[test]
+    fn rpc_clone_event_round_trips_through_protobuf() {
+        let event = RpcEvent::Finished(CloneFinishedEvent {
+            client_id: "00000000-0000-4000-8000-000000000007".to_string(),
+            url: "https://example.com/current.git".to_string(),
+            locator: Locator::parse("example.com/current").unwrap(),
+            path: PathBuf::from("/tmp/client/clones/example.com/current"),
+            success: true,
+            scan_root: PathBuf::from("/tmp/client/clones"),
+        });
+        let mut message = Vec::new();
+        event
+            .to_proto()
+            .encode_length_delimited(&mut message)
+            .unwrap();
+
+        let decoded = decode_rpc_event(&message).unwrap();
+
+        match decoded {
+            RpcEvent::Finished(decoded) => {
+                assert_eq!(decoded.client_id, "00000000-0000-4000-8000-000000000007");
+                assert_eq!(
+                    decoded.locator,
+                    Locator::parse("example.com/current").unwrap()
+                );
+                assert_eq!(
+                    decoded.path,
+                    PathBuf::from("/tmp/client/clones/example.com/current")
+                );
+                assert!(decoded.success);
+                assert_eq!(decoded.scan_root, PathBuf::from("/tmp/client/clones"));
+            }
+            other => panic!("unexpected decoded event: {other:?}"),
+        }
     }
 
     fn clone_local_repo(seed: &Path, destination: &Path) {
@@ -3759,7 +4018,6 @@ mod tests {
             rpc_url: default_rpc_url(),
             client_id: "00000000-0000-4000-8000-000000000099".to_string(),
             detect_related: true,
-            related_scan_root: root.join("code"),
             clone_start_ttl_minutes: 60,
             rpc_rate_limit_per_second: 0,
         }

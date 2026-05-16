@@ -10,12 +10,18 @@
 rustPlatform.buildRustPackage {
   pname = "repo-manager";
   version = "0.1.0";
+  outputs = [
+    "out"
+    "repod"
+  ];
 
   src = lib.fileset.toSource {
     root = ../../..;
     fileset = lib.fileset.unions [
       ../../../Cargo.lock
       ../../../Cargo.toml
+      ../../../api
+      ../../../build.rs
       ../../../crates
       ../../../src
     ];
@@ -39,6 +45,9 @@ rustPlatform.buildRustPackage {
           ghq
         ]
       }
+
+    mkdir -p "$repod/bin"
+    mv "$out/bin/repod" "$repod/bin/"
   '';
 
   meta = with lib; {

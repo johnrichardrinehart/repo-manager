@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package repo_manager.v1;
+
+message Locator {
+  string authority = 1;
+  string remote_path = 2;
+}
+
+message CloneStarted {
+  string client_id = 1;
+  string url = 2;
+  Locator locator = 3;
+  string path = 4;
+  string scan_root = 5;
+}
+
+message CloneFinished {
+  string client_id = 1;
+  string url = 2;
+  Locator locator = 3;
+  string path = 4;
+  bool success = 5;
+  string scan_root = 6;
+}
+
+message CloneCancelled {
+  string client_id = 1;
+  string url = 2;
+  Locator locator = 3;
+  string path = 4;
+  string reason = 5;
+  string scan_root = 6;
+}
+
+message CloneEvent {
+  oneof event {
+    CloneStarted started = 1;
+    CloneFinished finished = 2;
+    CloneCancelled cancelled = 3;
+  }
+}

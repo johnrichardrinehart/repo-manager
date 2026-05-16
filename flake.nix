@@ -22,6 +22,8 @@
         fileset = lib.fileset.unions [
           ./Cargo.lock
           ./Cargo.toml
+          ./api
+          ./build.rs
           ./crates
           ./src
           ./nix
