@@ -793,6 +793,35 @@ struct RelatedSuggestion {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct RelatedListReport {
+    action: &'static str,
+    unresolved_count: usize,
+    suggestions: Vec<RelatedSuggestionReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RelatedSuggestionReport {
+    id: i64,
+    repositories: [RelatedRepositoryReport; 2],
+    evidence: RelatedEvidenceReport,
+    resolution: Option<String>,
+    resolve_command: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RelatedRepositoryReport {
+    repo_id: i64,
+    locator: Locator,
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RelatedEvidenceReport {
+    summary: String,
+    details: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct RelatedResolution {
     action: &'static str,
     id: i64,
@@ -3325,42 +3354,68 @@ fn output_aliases(output: &Output, aliases: &[AliasPlan]) -> Result<()> {
 }
 
 fn output_related(output: &Output, suggestions: &[RelatedSuggestion]) -> Result<()> {
+    let report = related_list_report(suggestions);
     if output.json {
-        return print_json(&suggestions);
+        return print_json(&report);
     }
-    if suggestions.is_empty() {
+    if report.suggestions.is_empty() {
         println!("no unresolved shared-history suggestions");
         return Ok(());
     }
-    for suggestion in suggestions {
-        let refs = if suggestion.shared_refs.is_empty() {
-            "evidence: unknown".to_string()
-        } else {
-            format!(
-                "evidence: {}",
-                summarize_shared_history_evidence(&suggestion.shared_refs)
-            )
-        };
-        println!(
-            "#{} {} <-> {} ({refs})",
-            suggestion.id,
-            suggestion.repo_locator.key(),
-            suggestion.related_locator.key()
-        );
-        println!(
-            "  resolve with: repo related resolve {} <kind>",
-            suggestion.id
-        );
+    println!(
+        "unresolved shared-history suggestions: {}",
+        report.unresolved_count
+    );
+    for suggestion in &report.suggestions {
+        let [repo, related] = &suggestion.repositories;
+        println!();
+        println!("#{}  {}", suggestion.id, repo.locator.key());
+        println!("    {}", related.locator.key());
+        println!("    evidence: {}", suggestion.evidence.summary);
+        println!("    resolve:  {}", suggestion.resolve_command);
     }
     Ok(())
 }
 
-fn summarize_shared_history_evidence(shared_refs: &[String]) -> String {
-    let shared_commit_prefix = "shared commit ";
-    if !shared_refs.is_empty()
-        && shared_refs
+fn related_list_report(suggestions: &[RelatedSuggestion]) -> RelatedListReport {
+    RelatedListReport {
+        action: "related-list",
+        unresolved_count: suggestions.len(),
+        suggestions: suggestions
             .iter()
-            .all(|evidence| evidence.starts_with(shared_commit_prefix))
+            .map(|suggestion| RelatedSuggestionReport {
+                id: suggestion.id,
+                repositories: [
+                    RelatedRepositoryReport {
+                        repo_id: suggestion.repo_id,
+                        locator: suggestion.repo_locator.clone(),
+                        path: suggestion.repo_path.clone(),
+                    },
+                    RelatedRepositoryReport {
+                        repo_id: suggestion.related_repo_id,
+                        locator: suggestion.related_locator.clone(),
+                        path: suggestion.related_path.clone(),
+                    },
+                ],
+                evidence: RelatedEvidenceReport {
+                    summary: summarize_shared_history_evidence(&suggestion.shared_refs),
+                    details: suggestion.shared_refs.clone(),
+                },
+                resolution: suggestion.resolution.clone(),
+                resolve_command: format!("repo related resolve {} <kind>", suggestion.id),
+            })
+            .collect(),
+    }
+}
+
+fn summarize_shared_history_evidence(shared_refs: &[String]) -> String {
+    if shared_refs.is_empty() {
+        return "unknown".to_string();
+    }
+    let shared_commit_prefix = "shared commit ";
+    if shared_refs
+        .iter()
+        .all(|evidence| evidence.starts_with(shared_commit_prefix))
     {
         let first = shared_refs[0]
             .strip_prefix(shared_commit_prefix)
