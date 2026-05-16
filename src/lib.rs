@@ -2826,12 +2826,10 @@ fn detect_related_history_under_code(
     scan_root: &Path,
 ) -> Result<usize> {
     let current_id = store.upsert_repo(locator, path, None)?;
-    let current_commits = git_commit_objects(path)?;
-    if current_commits.is_empty() {
+    let current_roots = git_root_commits(path)?.into_iter().collect::<HashSet<_>>();
+    if current_roots.is_empty() {
         return Ok(0);
     }
-    let current_objects = current_commits.into_iter().collect::<HashSet<_>>();
-    let current_roots = git_root_commits(path)?.into_iter().collect::<HashSet<_>>();
     let current_path = comparable_path(path);
     let mut detected = 0;
 
@@ -2839,7 +2837,7 @@ fn detect_related_history_under_code(
         if comparable_path(&other_path) == current_path {
             continue;
         }
-        let shared = shared_history_evidence(&current_objects, &current_roots, &other_path)?;
+        let shared = shared_root_evidence(&current_roots, &other_path)?;
         if shared.is_empty() {
             continue;
         }
@@ -2927,10 +2925,6 @@ fn comparable_path(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn git_commit_objects(path: &Path) -> Result<Vec<String>> {
-    git_lines(path, ["rev-list", "--all"], "reading Git commit graph")
-}
-
 fn git_root_commits(path: &Path) -> Result<Vec<String>> {
     git_lines(
         path,
@@ -2953,43 +2947,13 @@ fn git_lines<const N: usize>(path: &Path, args: [&str; N], action: &str) -> Resu
     Ok(stdout.lines().map(str::to_string).collect())
 }
 
-fn shared_history_evidence(
-    current_objects: &HashSet<String>,
-    current_roots: &HashSet<String>,
-    other_path: &Path,
-) -> Result<Vec<String>> {
-    let shared_roots = git_root_commits(other_path)?
+fn shared_root_evidence(current_roots: &HashSet<String>, other_path: &Path) -> Result<Vec<String>> {
+    Ok(git_root_commits(other_path)?
         .into_iter()
         .filter(|object| current_roots.contains(object))
         .take(3)
         .map(|object| format!("shared root commit {}", short_hash(&object)))
-        .collect::<Vec<_>>();
-    if !shared_roots.is_empty() {
-        return Ok(shared_roots);
-    }
-
-    let mut shared_count = 0_usize;
-    let mut first_shared = None;
-    for object in git_commit_objects(other_path)? {
-        if current_objects.contains(&object) {
-            shared_count += 1;
-            first_shared.get_or_insert(object);
-        }
-    }
-
-    Ok(first_shared
-        .map(|object| {
-            let commit_label = if shared_count == 1 {
-                "commit"
-            } else {
-                "commits"
-            };
-            vec![format!(
-                "{shared_count} shared {commit_label}, including {}",
-                short_hash(&object)
-            )]
-        })
-        .unwrap_or_default())
+        .collect())
 }
 
 fn short_hash(hash: &str) -> &str {
@@ -3397,10 +3361,7 @@ fn related_list_report(suggestions: &[RelatedSuggestion]) -> RelatedListReport {
                         path: suggestion.related_path.clone(),
                     },
                 ],
-                evidence: RelatedEvidenceReport {
-                    summary: summarize_shared_history_evidence(&suggestion.shared_refs),
-                    details: suggestion.shared_refs.clone(),
-                },
+                evidence: related_evidence_report(suggestion),
                 resolution: suggestion.resolution.clone(),
                 resolve_command: format!("repo related resolve {} <kind>", suggestion.id),
             })
@@ -3408,27 +3369,43 @@ fn related_list_report(suggestions: &[RelatedSuggestion]) -> RelatedListReport {
     }
 }
 
+fn related_evidence_report(suggestion: &RelatedSuggestion) -> RelatedEvidenceReport {
+    let details = shared_root_evidence_between(&suggestion.repo_path, &suggestion.related_path)
+        .inspect_err(|error| debug!("could not check shared root evidence: {error:#}"))
+        .ok()
+        .filter(|evidence| !evidence.is_empty())
+        .or_else(|| legacy_shared_root_evidence(&suggestion.shared_refs))
+        .unwrap_or_default();
+
+    RelatedEvidenceReport {
+        summary: summarize_shared_history_evidence(&details),
+        details,
+    }
+}
+
+fn shared_root_evidence_between(first_path: &Path, second_path: &Path) -> Result<Vec<String>> {
+    let first_roots = git_root_commits(first_path)?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    Ok(git_root_commits(second_path)?
+        .into_iter()
+        .filter(|object| first_roots.contains(object))
+        .take(3)
+        .map(|object| format!("shared root commit {}", short_hash(&object)))
+        .collect())
+}
+
+fn legacy_shared_root_evidence(shared_refs: &[String]) -> Option<Vec<String>> {
+    let root_prefix = "shared root commit ";
+    shared_refs
+        .iter()
+        .all(|evidence| evidence.starts_with(root_prefix))
+        .then(|| shared_refs.to_vec())
+}
+
 fn summarize_shared_history_evidence(shared_refs: &[String]) -> String {
     if shared_refs.is_empty() {
         return "unknown".to_string();
-    }
-    let shared_commit_prefix = "shared commit ";
-    if shared_refs
-        .iter()
-        .all(|evidence| evidence.starts_with(shared_commit_prefix))
-    {
-        let first = shared_refs[0]
-            .strip_prefix(shared_commit_prefix)
-            .unwrap_or(&shared_refs[0]);
-        let commit_label = if shared_refs.len() == 1 {
-            "commit"
-        } else {
-            "commits"
-        };
-        return format!(
-            "{} shared {commit_label}, including {first}",
-            shared_refs.len()
-        );
     }
     shared_refs.join(", ")
 }
@@ -4158,17 +4135,80 @@ mod tests {
     }
 
     #[test]
-    fn related_evidence_summarizes_legacy_shared_commit_lists() {
-        let evidence = vec![
-            "shared commit aaaaaaaaaaaa".to_string(),
-            "shared commit bbbbbbbbbbbb".to_string(),
-            "shared commit cccccccccccc".to_string(),
-        ];
+    fn related_report_prefers_shared_root_evidence_for_legacy_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = dir.path().join("seed");
+        let first_path = dir.path().join("clones/example.com/first");
+        let second_path = dir.path().join("clones/example.com/second");
+        fs::create_dir_all(&seed).unwrap();
+        run_git_in(&seed, ["init"]).unwrap();
+        fs::write(seed.join("README.md"), "shared history\n").unwrap();
+        run_git_in(&seed, ["add", "."]).unwrap();
+        run_git_in(
+            &seed,
+            [
+                "-c",
+                "user.name=repo-manager",
+                "-c",
+                "user.email=repo-manager@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        )
+        .unwrap();
+        clone_local_repo(&seed, &first_path);
+        clone_local_repo(&seed, &second_path);
 
-        assert_eq!(
-            summarize_shared_history_evidence(&evidence),
-            "3 shared commits, including aaaaaaaaaaaa"
+        let first_locator = Locator::parse("example.com/first").unwrap();
+        let second_locator = Locator::parse("example.com/second").unwrap();
+        let legacy = RelatedSuggestion {
+            id: 7,
+            repo_id: 1,
+            repo_locator: first_locator.clone(),
+            repo_path: first_path,
+            related_repo_id: 2,
+            related_locator: second_locator,
+            related_path: second_path,
+            shared_refs: vec!["shared commit aaaaaaaaaaaa".to_string()],
+            resolution: None,
+        };
+
+        let report = related_list_report(&[legacy]);
+
+        assert!(
+            report.suggestions[0]
+                .evidence
+                .summary
+                .starts_with("shared root commit ")
         );
+        assert!(
+            report.suggestions[0]
+                .evidence
+                .details
+                .iter()
+                .all(|evidence| evidence.starts_with("shared root commit "))
+        );
+    }
+
+    #[test]
+    fn related_report_does_not_use_legacy_non_root_evidence() {
+        let legacy = RelatedSuggestion {
+            id: 7,
+            repo_id: 1,
+            repo_locator: Locator::parse("example.com/first").unwrap(),
+            repo_path: PathBuf::from("/missing/first"),
+            related_repo_id: 2,
+            related_locator: Locator::parse("example.com/second").unwrap(),
+            related_path: PathBuf::from("/missing/second"),
+            shared_refs: vec!["shared commit aaaaaaaaaaaa".to_string()],
+            resolution: None,
+        };
+
+        let report = related_list_report(&[legacy]);
+
+        assert_eq!(report.suggestions[0].evidence.summary, "unknown");
+        assert!(report.suggestions[0].evidence.details.is_empty());
     }
 
     #[test]
