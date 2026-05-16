@@ -33,6 +33,14 @@ message CloneCancelled {
   string scan_root = 6;
 }
 
+message ManageRequested {
+  string client_id = 1;
+  string url = 2;
+  Locator locator = 3;
+  string path = 4;
+  string scan_root = 5;
+}
+
 message CloneEvent {
   uint32 protocol_version = 4;
 
@@ -40,5 +48,6 @@ message CloneEvent {
     CloneStarted started = 1;
     CloneFinished finished = 2;
     CloneCancelled cancelled = 3;
+    ManageRequested manage_requested = 5;
   }
 }

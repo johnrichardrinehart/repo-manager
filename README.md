@@ -19,8 +19,19 @@ git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux
 ```
 
 Canonical repositories and forks live under `~/code/clones`. Development
-worktrees live under `~/code/worktrees`. Historical locator paths become
+worktrees live under `~/code/dev-worktrees`. Historical locator paths become
 symlinks to the latest real path when a move is applied.
+
+Existing checkouts can be registered without recloning:
+
+```sh
+repo manage ~/src/linux
+```
+
+`repo manage` accepts any subdirectory inside the checkout, moves the Git
+worktree root into its managed locator path when needed, records it in
+repo-manager metadata, and asks `repod` to review repositories under the clone
+root for shared Git history.
 
 ## Remotes
 
@@ -29,19 +40,19 @@ same for detected moves, preserving the existing remote URL style when
 possible.
 
 Forks are Git worktrees under the clone root, not development worktrees under
-the worktree root. Each fork gets a stable remote name derived from its locator,
-so the canonical checkout and every fork worktree share the same `git remote -v`
-view: `origin` plus all fork remotes.
+the dev-worktree root. Each fork gets a stable remote name derived from its
+locator, so the canonical checkout and every fork worktree share the same
+`git remote -v` view: `origin` plus all fork remotes.
 
 ## Daemon API
 
-Clone lifecycle RPC is defined in `api/repo_manager/v1/rpc.proto` and encoded
-with Protocol Buffers. The `repo` client sends clone events with its own
-`scan_root`; the `repod` process uses that event root when comparing
-repositories for shared Git history. `repod` is intended to run as the same user
-as the `repo` client, using the same config and state database. Shared-history
-review is enabled by default and can be disabled with `--detect-related=false`
-or `REPO_MANAGER_DETECT_RELATED=false`.
+Repository lifecycle RPC is defined in `api/repo_manager/v1/rpc.proto` and
+encoded with Protocol Buffers over Unix domain sockets. The `repo` client sends
+clone and manage events with its own `scan_root`; the `repod` process uses that
+event root when comparing repositories for shared Git history. `repod` is
+intended to run as the same user as the `repo` client, using the same config and
+state database. Shared-history review is enabled by default and can be disabled
+with `--detect-related=false` or `REPO_MANAGER_DETECT_RELATED=false`.
 
 RPC clients and daemons include an envelope protocol version. The current
 protocol is v1; breaking protobuf changes require a v2 protocol and are
@@ -52,7 +63,7 @@ rejected by mismatched peers.
 Persist common values with:
 
 ```sh
-repo setup --clone-root ~/code/clones --worktree-root ~/code/worktrees
+repo setup --root ~/code
 ```
 
 Use `repo setup --file <path>` to write a specific config file. The config file

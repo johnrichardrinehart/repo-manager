@@ -1,8 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
@@ -37,7 +36,7 @@ pub mod api {
     version,
     disable_help_subcommand = true,
     about = "Manage local Git repository placement, metadata, forks, worktrees, and old-path aliases",
-    long_about = "Manage local Git repositories using a stable locator model: <authority>/<remote-path>.\n\nCanonical repositories and forks live under the clone root. Development worktrees live under the worktree root.\n\nWhen --config is omitted, repo-manager layers config from each $XDG_CONFIG_DIRS entry before the user config from $XDG_CONFIG_HOME. Environment variables and explicit CLI options override persisted config."
+    long_about = "Manage local Git repositories using a stable locator model: <authority>/<remote-path>.\n\nCanonical repositories and forks live under <root>/clones. Development worktrees live under <root>/dev-worktrees.\n\nWhen --config is omitted, repo-manager layers config from each $XDG_CONFIG_DIRS entry before the user config from $XDG_CONFIG_HOME. Environment variables and explicit CLI options override persisted config."
 )]
 pub struct Cli {
     #[command(flatten)]
@@ -85,28 +84,19 @@ struct ConfigArgs {
 
     #[arg(
         long,
-        env = "REPO_MANAGER_CLONE_ROOT",
+        env = "REPO_MANAGER_ROOT",
         value_name = "DIR",
-        help = "Root directory for canonical clones and fork worktrees (default: ~/code/clones)",
-        long_help = "Root directory for canonical repositories and fork worktrees. Defaults to ~/code/clones."
+        help = "Repo-manager root directory (default: ~/code)",
+        long_help = "Repo-manager root directory. Canonical repositories and forks live under <root>/clones; development worktrees live under <root>/dev-worktrees. Defaults to ~/code."
     )]
-    clone_root: Option<PathBuf>,
-
-    #[arg(
-        long,
-        env = "REPO_MANAGER_WORKTREE_ROOT",
-        value_name = "DIR",
-        help = "Root directory for development worktrees (default: ~/code/worktrees)",
-        long_help = "Root directory for development worktrees created by `repo worktree add`. Defaults to ~/code/worktrees."
-    )]
-    worktree_root: Option<PathBuf>,
+    root: Option<PathBuf>,
 
     #[arg(
         long,
         env = "REPO_MANAGER_RPC_URL",
         value_name = "URL",
-        help = "RPC endpoint for clone lifecycle events (default: user runtime socket)",
-        long_help = "RPC endpoint for clone lifecycle events. Supported schemes are unix://, tcp://, and udp://. Defaults to unix://$XDG_RUNTIME_DIR/repo-manager/socket when XDG_RUNTIME_DIR is set."
+        help = "Unix-domain RPC endpoint for repository lifecycle events (default: user runtime socket)",
+        long_help = "Unix-domain RPC endpoint for repository lifecycle events. Defaults to unix://$XDG_RUNTIME_DIR/repo-manager/socket when XDG_RUNTIME_DIR is set."
     )]
     rpc_url: Option<String>,
 
@@ -114,9 +104,19 @@ struct ConfigArgs {
         long,
         env = "REPO_MANAGER_CLIENT_ID",
         value_name = "UUID",
-        help = "Stable client identifier sent with clone lifecycle RPC events"
+        help = "Stable client identifier sent with repository lifecycle RPC events"
     )]
     client_id: Option<String>,
+
+    #[arg(
+        long,
+        env = "REPO_MANAGER_ASSUME_ORIGIN_AS_CANONICAL",
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        help = "Treat origin as canonical during manage without prompting"
+    )]
+    assume_origin_as_canonical: Option<bool>,
 }
 
 #[derive(Debug, Parser)]
@@ -124,7 +124,7 @@ struct ConfigArgs {
     name = "repod",
     version,
     about = "Run the repo-manager RPC daemon",
-    long_about = "Run the repo-manager RPC daemon.\n\nThe daemon receives clone lifecycle events from clients. When related-history detection is configured, a matching clone-start and successful clone-finished pair makes the daemon scan the client-provided event root for other Git repositories, compare commit history, and record pending relationship decisions."
+    long_about = "Run the repo-manager RPC daemon.\n\nThe daemon receives repository lifecycle events from clients over a Unix domain socket. When related-history detection is configured, clone completion and manage requests make the daemon scan the client-provided event root for other Git repositories, compare commit history, and record pending relationship decisions."
 )]
 struct RepodCli {
     #[command(flatten)]
@@ -158,8 +158,8 @@ struct DaemonConfigArgs {
         long,
         env = "REPO_MANAGER_RPC_URL",
         value_name = "URL",
-        help = "RPC endpoint for clone lifecycle events (default: user runtime socket)",
-        long_help = "RPC endpoint for clone lifecycle events. Supported schemes are unix://, tcp://, and udp://. Defaults to unix://$XDG_RUNTIME_DIR/repo-manager/socket when XDG_RUNTIME_DIR is set."
+        help = "Unix-domain RPC endpoint for repository lifecycle events (default: user runtime socket)",
+        long_help = "Unix-domain RPC endpoint for repository lifecycle events. Defaults to unix://$XDG_RUNTIME_DIR/repo-manager/socket when XDG_RUNTIME_DIR is set."
     )]
     rpc_url: Option<String>,
 
@@ -169,7 +169,7 @@ struct DaemonConfigArgs {
         value_name = "BOOL",
         num_args = 0..=1,
         default_missing_value = "true",
-        help = "Enable shared-history review after successful clone events (default: true)"
+        help = "Enable shared-history review after clone completion and manage requests (default: true)"
     )]
     detect_related: Option<bool>,
 
@@ -217,9 +217,14 @@ enum SetupCommands {
 enum RepositoryOperationCommands {
     #[command(about = "Clone a repository into the managed clone root")]
     Clone(CloneArgs),
+    #[command(
+        about = "Register an existing checkout under the managed clone root",
+        long_about = "Register an existing Git checkout under the managed clone root without cloning it.\n\nUse this for a repository that already exists on disk. The command resolves the Git worktree root, chooses a canonical URL from its remotes or an interactive prompt, moves the checkout into its managed locator path when needed, records it in repo-manager metadata, and asks repod to review repositories under the clone root for shared Git history."
+    )]
+    Manage(ManageArgs),
     #[command(about = "Create or register a fork worktree for a canonical repository")]
     Fork(ForkArgs),
-    #[command(about = "Manage development worktrees under the managed worktree root")]
+    #[command(about = "Manage development worktrees under the managed dev-worktree root")]
     Worktree(WorktreeCommand),
 }
 
@@ -289,21 +294,14 @@ struct SetupArgs {
     #[arg(
         long,
         value_name = "DIR",
-        help = "Persist the root directory for canonical clones and fork worktrees"
+        help = "Persist the repo-manager root directory"
     )]
-    clone_root: Option<PathBuf>,
-
-    #[arg(
-        long,
-        value_name = "DIR",
-        help = "Persist the root directory for development worktrees"
-    )]
-    worktree_root: Option<PathBuf>,
+    root: Option<PathBuf>,
 
     #[arg(
         long,
         value_name = "URL",
-        help = "Persist the clone lifecycle RPC endpoint"
+        help = "Persist the repository lifecycle RPC endpoint"
     )]
     rpc_url: Option<String>,
 
@@ -313,6 +311,15 @@ struct SetupArgs {
         help = "Persist a stable client identifier (default: generate one)"
     )]
     client_id: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        help = "Persist origin-as-canonical behavior for `repo manage`"
+    )]
+    assume_origin_as_canonical: Option<bool>,
 }
 
 #[derive(Debug, Args)]
@@ -320,7 +327,7 @@ struct DaemonArgs {
     #[arg(
         long,
         value_name = "URL",
-        help = "RPC endpoint to listen on (default: configured RPC endpoint)"
+        help = "Unix-domain RPC endpoint to listen on (default: configured RPC endpoint)"
     )]
     listen: Option<String>,
 }
@@ -333,6 +340,19 @@ struct CloneArgs {
         long_help = "Git URL or locator to clone. The URL is normalized into <authority>/<remote-path> and placed under the clone root."
     )]
     url: String,
+}
+
+#[derive(Debug, Args)]
+struct ManageArgs {
+    #[arg(
+        value_name = "PATH",
+        default_value = ".",
+        help = "Existing Git checkout path or subdirectory to register"
+    )]
+    path: PathBuf,
+
+    #[arg(long, help = "Treat origin as canonical without prompting")]
+    assume_origin_as_canonical: bool,
 }
 
 #[derive(Debug, Args)]
@@ -367,7 +387,7 @@ struct MoveArgs {
 
 #[derive(Debug, Subcommand)]
 enum WorktreeSubcommand {
-    #[command(about = "Create a development worktree under the managed worktree root")]
+    #[command(about = "Create a development worktree under the managed dev-worktree root")]
     Add(WorktreeAddArgs),
 }
 
@@ -503,10 +523,12 @@ struct Config {
     config_path: PathBuf,
     state: PathBuf,
     cache_root: PathBuf,
+    root: PathBuf,
     clone_root: PathBuf,
-    worktree_root: PathBuf,
+    dev_worktree_root: PathBuf,
     rpc_url: String,
     client_id: String,
+    assume_origin_as_canonical: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -526,10 +548,10 @@ struct Output {
 struct FileConfig {
     state: Option<PathBuf>,
     cache_root: Option<PathBuf>,
-    clone_root: Option<PathBuf>,
-    worktree_root: Option<PathBuf>,
+    root: Option<PathBuf>,
     rpc_url: Option<String>,
     client_id: Option<String>,
+    assume_origin_as_canonical: Option<bool>,
     detect_related: Option<bool>,
     clone_start_ttl_minutes: Option<u64>,
     rpc_rate_limit_per_second: Option<u32>,
@@ -562,6 +584,7 @@ enum RpcEvent {
     Started(CloneStartedEvent),
     Finished(CloneFinishedEvent),
     Cancelled(CloneCancelledEvent),
+    ManageRequested(ManageRequestedEvent),
 }
 
 #[derive(Debug, Clone)]
@@ -593,6 +616,15 @@ struct CloneCancelledEvent {
     scan_root: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+struct ManageRequestedEvent {
+    client_id: String,
+    url: String,
+    locator: Locator,
+    path: PathBuf,
+    scan_root: PathBuf,
+}
+
 impl RpcEvent {
     fn to_proto(&self) -> api::CloneEvent {
         use api::clone_event::Event;
@@ -619,6 +651,13 @@ impl RpcEvent {
                 locator: Some(locator_to_proto(&event.locator)),
                 path: event.path.display().to_string(),
                 reason: event.reason.clone(),
+                scan_root: event.scan_root.display().to_string(),
+            }),
+            Self::ManageRequested(event) => Event::ManageRequested(api::ManageRequested {
+                client_id: event.client_id.clone(),
+                url: event.url.clone(),
+                locator: Some(locator_to_proto(&event.locator)),
+                path: event.path.display().to_string(),
                 scan_root: event.scan_root.display().to_string(),
             }),
         };
@@ -661,6 +700,13 @@ impl RpcEvent {
                 reason: required_proto_string("reason", event.reason)?,
                 scan_root: required_proto_path("scan_root", event.scan_root)?,
             })),
+            Event::ManageRequested(event) => Ok(Self::ManageRequested(ManageRequestedEvent {
+                client_id: required_proto_string("client_id", event.client_id)?,
+                url: required_proto_string("url", event.url)?,
+                locator: locator_from_proto(event.locator)?,
+                path: required_proto_path("path", event.path)?,
+                scan_root: required_proto_path("scan_root", event.scan_root)?,
+            })),
         }
     }
 
@@ -669,6 +715,7 @@ impl RpcEvent {
             Self::Started(event) => &event.client_id,
             Self::Finished(event) => &event.client_id,
             Self::Cancelled(event) => &event.client_id,
+            Self::ManageRequested(event) => &event.client_id,
         }
     }
 
@@ -677,6 +724,7 @@ impl RpcEvent {
             Self::Started(_) => "clone_started",
             Self::Finished(_) => "clone_finished",
             Self::Cancelled(_) => "clone_cancelled",
+            Self::ManageRequested(_) => "manage_requested",
         }
     }
 }
@@ -720,6 +768,16 @@ struct CloneResult {
     action: &'static str,
     locator: Locator,
     path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ManageResult {
+    action: &'static str,
+    locator: Locator,
+    canonical_url: String,
+    path: PathBuf,
+    moved_from: Option<PathBuf>,
+    history_review_requested: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -920,6 +978,10 @@ pub fn run() -> Result<()> {
                 let db = Store::open(&config.state)?;
                 clone_repo(&config, &db, &output, &args.url)
             }
+            RepositoryOperationCommands::Manage(args) => {
+                let db = Store::open(&config.state)?;
+                manage_repo(&config, &db, &output, args)
+            }
             RepositoryOperationCommands::Fork(args) => {
                 let db = Store::open(&config.state)?;
                 fork_repo(&config, &db, &output, &args.fork_url, &args.canonical)
@@ -1016,16 +1078,13 @@ impl Config {
             .clone()
             .or(file_config.cache_root)
             .unwrap_or(default_cache_root()?);
-        let clone_root = args
-            .clone_root
+        let root = args
+            .root
             .clone()
-            .or(file_config.clone_root)
-            .unwrap_or(default_clone_root()?);
-        let worktree_root = args
-            .worktree_root
-            .clone()
-            .or(file_config.worktree_root)
-            .unwrap_or(default_worktree_root()?);
+            .or(file_config.root)
+            .unwrap_or(default_root()?);
+        let clone_root = clone_root_for(&root);
+        let dev_worktree_root = dev_worktree_root_for(&root);
         let rpc_url = args
             .rpc_url
             .clone()
@@ -1036,14 +1095,20 @@ impl Config {
             .clone()
             .or(file_config.client_id)
             .map_or_else(generate_client_id, validate_client_id)?;
+        let assume_origin_as_canonical = args
+            .assume_origin_as_canonical
+            .or(file_config.assume_origin_as_canonical)
+            .unwrap_or(false);
         Ok(Self {
             config_path,
             state,
             cache_root,
+            root,
             clone_root,
-            worktree_root,
+            dev_worktree_root,
             rpc_url,
             client_id,
+            assume_origin_as_canonical,
         })
     }
 }
@@ -1070,10 +1135,12 @@ impl FileConfig {
     fn merge(&mut self, other: Self) {
         self.state = other.state.or_else(|| self.state.take());
         self.cache_root = other.cache_root.or_else(|| self.cache_root.take());
-        self.clone_root = other.clone_root.or_else(|| self.clone_root.take());
-        self.worktree_root = other.worktree_root.or_else(|| self.worktree_root.take());
+        self.root = other.root.or_else(|| self.root.take());
         self.rpc_url = other.rpc_url.or_else(|| self.rpc_url.take());
         self.client_id = other.client_id.or_else(|| self.client_id.take());
+        self.assume_origin_as_canonical = other
+            .assume_origin_as_canonical
+            .or(self.assume_origin_as_canonical);
         self.detect_related = other.detect_related.or(self.detect_related);
         self.clone_start_ttl_minutes = other
             .clone_start_ttl_minutes
@@ -1144,13 +1211,12 @@ fn setup_config(config: &Config, output: &Output, args: SetupArgs) -> Result<()>
     let file_config = FileConfig {
         state: Some(args.state.unwrap_or_else(|| config.state.clone())),
         cache_root: Some(args.cache_root.unwrap_or_else(|| config.cache_root.clone())),
-        clone_root: Some(args.clone_root.unwrap_or_else(|| config.clone_root.clone())),
-        worktree_root: Some(
-            args.worktree_root
-                .unwrap_or_else(|| config.worktree_root.clone()),
-        ),
+        root: Some(args.root.unwrap_or_else(|| config.root.clone())),
         rpc_url: Some(args.rpc_url.unwrap_or_else(|| config.rpc_url.clone())),
         client_id: Some(args.client_id.unwrap_or_else(|| config.client_id.clone())),
+        assume_origin_as_canonical: args
+            .assume_origin_as_canonical
+            .or(Some(config.assume_origin_as_canonical)),
         detect_related: None,
         clone_start_ttl_minutes: None,
         rpc_rate_limit_per_second: None,
@@ -1199,12 +1265,16 @@ fn default_cache_root() -> Result<PathBuf> {
     Ok(base_dirs()?.cache_dir().join("repo-manager"))
 }
 
-fn default_clone_root() -> Result<PathBuf> {
-    Ok(home_dir()?.join("code/clones"))
+fn default_root() -> Result<PathBuf> {
+    Ok(home_dir()?.join("code"))
 }
 
-fn default_worktree_root() -> Result<PathBuf> {
-    Ok(home_dir()?.join("code/worktrees"))
+fn clone_root_for(root: &Path) -> PathBuf {
+    root.join("clones")
+}
+
+fn dev_worktree_root_for(root: &Path) -> PathBuf {
+    root.join("dev-worktrees")
 }
 
 fn default_rpc_url() -> String {
@@ -1481,6 +1551,12 @@ struct ManagedRepoRecord {
     id: i64,
     current: Locator,
     path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitRemote {
+    name: String,
+    url: String,
 }
 
 impl Store {
@@ -1962,6 +2038,209 @@ fn clone_repo(config: &Config, db: &Store, output: &Output, url: &str) -> Result
     )
 }
 
+fn manage_repo(config: &Config, db: &Store, output: &Output, args: ManageArgs) -> Result<()> {
+    warn_pending_related(db)?;
+    let original_root = git_worktree_root(&args.path)?;
+    let remotes = git_remotes(&original_root)?;
+    let assume_origin_as_canonical =
+        args.assume_origin_as_canonical || config.assume_origin_as_canonical;
+    let canonical_url = choose_manage_canonical_url(&remotes, assume_origin_as_canonical)?;
+    let locator = Locator::parse(&canonical_url)?;
+    let (repo_root, moved_from) = move_repo_into_managed_path(config, &original_root, &locator)?;
+    record_manage_remote_relationships(db, &locator, &repo_root, &remotes)?;
+    let history_review_requested =
+        request_daemon_history_review(config, &locator, &repo_root, &canonical_url);
+    output_manage(
+        output,
+        &ManageResult {
+            action: "manage",
+            locator,
+            canonical_url,
+            path: repo_root,
+            moved_from,
+            history_review_requested,
+        },
+    )
+}
+
+fn choose_manage_canonical_url(
+    remotes: &[GitRemote],
+    assume_origin_as_canonical: bool,
+) -> Result<String> {
+    let origin = remotes.iter().find(|remote| remote.name == "origin");
+    if let Some(origin) = origin
+        && (assume_origin_as_canonical || confirm_origin_as_canonical(origin)?)
+    {
+        return Ok(origin.url.clone());
+    }
+    prompt_canonical_url(remotes)
+}
+
+fn confirm_origin_as_canonical(origin: &GitRemote) -> Result<bool> {
+    loop {
+        eprint!("Use origin as canonical? [{}] [Y/n] ", origin.url);
+        io::stderr().flush().context("flushing prompt")?;
+        let answer = read_prompt_line()?;
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "" | "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => eprintln!("enter y or n"),
+        }
+    }
+}
+
+fn prompt_canonical_url(remotes: &[GitRemote]) -> Result<String> {
+    if remotes.is_empty() {
+        return prompt_manual_canonical_url();
+    }
+    eprintln!("Select the canonical remote:");
+    for (index, remote) in remotes.iter().enumerate() {
+        eprintln!("  {}. {} {}", index + 1, remote.name, remote.url);
+    }
+    eprintln!("  none. Enter a canonical URL manually");
+
+    loop {
+        eprint!("canonical remote [1-{} or none]: ", remotes.len());
+        io::stderr().flush().context("flushing prompt")?;
+        let answer = read_prompt_line()?;
+        let answer = answer.trim();
+        if answer.eq_ignore_ascii_case("none") {
+            return prompt_manual_canonical_url();
+        }
+        if let Ok(index) = answer.parse::<usize>()
+            && let Some(remote) = remotes.get(index.saturating_sub(1))
+        {
+            return Ok(remote.url.clone());
+        }
+        eprintln!("enter a number from 1 to {} or none", remotes.len());
+    }
+}
+
+fn prompt_manual_canonical_url() -> Result<String> {
+    loop {
+        eprint!("canonical URL: ");
+        io::stderr().flush().context("flushing prompt")?;
+        let answer = read_prompt_line()?;
+        let url = answer.trim();
+        if !url.is_empty() {
+            return Ok(url.to_string());
+        }
+        eprintln!("canonical URL is required");
+    }
+}
+
+fn read_prompt_line() -> Result<String> {
+    let mut answer = String::new();
+    let bytes_read = io::stdin()
+        .read_line(&mut answer)
+        .context("reading prompt response")?;
+    if bytes_read == 0 {
+        bail!("prompt response ended before a canonical URL was selected");
+    }
+    Ok(answer)
+}
+
+fn record_manage_remote_relationships(
+    db: &Store,
+    canonical_locator: &Locator,
+    repo_root: &Path,
+    remotes: &[GitRemote],
+) -> Result<()> {
+    let canonical_id = db.upsert_repo(canonical_locator, repo_root, None)?;
+    for remote in remotes {
+        let Ok(remote_locator) = Locator::parse(&remote.url) else {
+            debug!(
+                "skipping non-locator-compatible remote {}: {}",
+                remote.name, remote.url
+            );
+            continue;
+        };
+        if remote_locator == *canonical_locator {
+            continue;
+        }
+        let remote_id =
+            db.upsert_repo(&remote_locator, repo_root, Some(&canonical_locator.key()))?;
+        db.record_fork(remote_id, canonical_id)?;
+    }
+    Ok(())
+}
+
+fn move_repo_into_managed_path(
+    config: &Config,
+    repo_root: &Path,
+    locator: &Locator,
+) -> Result<(PathBuf, Option<PathBuf>)> {
+    let expected_path = locator_path(&config.clone_root, locator);
+    if comparable_path(repo_root) == comparable_path(&expected_path) {
+        return Ok((repo_root.to_path_buf(), None));
+    }
+    if expected_path.exists() {
+        bail!(
+            "managed path for {} already exists: {}",
+            locator.key(),
+            expected_path.display()
+        );
+    }
+    if expected_path.starts_with(repo_root) {
+        bail!(
+            "cannot move {} into its own subtree at {}",
+            repo_root.display(),
+            expected_path.display()
+        );
+    }
+    fs::create_dir_all(
+        expected_path
+            .parent()
+            .context("managed repository path has no parent")?,
+    )
+    .with_context(|| {
+        format!(
+            "creating managed repository parent for {}",
+            expected_path.display()
+        )
+    })?;
+    fs::rename(repo_root, &expected_path).with_context(|| {
+        format!(
+            "moving existing checkout {} to {}",
+            repo_root.display(),
+            expected_path.display()
+        )
+    })?;
+    Ok((expected_path, Some(repo_root.to_path_buf())))
+}
+
+fn request_daemon_history_review(
+    config: &Config,
+    locator: &Locator,
+    path: &Path,
+    canonical_url: &str,
+) -> bool {
+    send_rpc_event_best_effort(
+        &config.rpc_url,
+        &RpcEvent::ManageRequested(ManageRequestedEvent {
+            client_id: config.client_id.clone(),
+            url: canonical_url.to_string(),
+            locator: locator.clone(),
+            path: path.to_path_buf(),
+            scan_root: config.clone_root.clone(),
+        }),
+    )
+}
+
+fn git_worktree_root(path: &Path) -> Result<PathBuf> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .with_context(|| format!("resolving Git worktree root from {}", path.display()))?;
+    if !output.status.success() {
+        bail!("not a Git working tree: {}", path.display());
+    }
+    let root = String::from_utf8(output.stdout).context("Git worktree root is not UTF-8")?;
+    Ok(PathBuf::from(root.trim()))
+}
+
 fn ghq_get_command(root: &Path, url: &str) -> Command {
     let mut command = Command::new("ghq");
     command.env("GHQ_ROOT", root).arg("get").arg(url);
@@ -2124,7 +2403,7 @@ fn add_worktree(config: &Config, db: &Store, output: &Output, args: WorktreeAddA
     let locator = Locator::parse(&args.canonical_url)?;
     let plan = plan_worktree_add(
         &config.clone_root,
-        &config.worktree_root,
+        &config.dev_worktree_root,
         locator,
         &args.name,
         WorktreeAddOptions {
@@ -2336,13 +2615,6 @@ fn warn_pending_related(db: &Store) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-enum RpcEndpoint {
-    Unix(PathBuf),
-    Tcp(String),
-    Udp(String),
-}
-
 #[derive(Debug)]
 struct RateLimiter {
     min_interval: Option<Duration>,
@@ -2397,7 +2669,7 @@ struct InProgressClone {
     started_at: Instant,
 }
 
-fn parse_rpc_endpoint(input: &str) -> Result<RpcEndpoint> {
+fn parse_rpc_endpoint(input: &str) -> Result<PathBuf> {
     let url = Url::parse(input).with_context(|| format!("invalid RPC endpoint URL: {input}"))?;
     match url.scheme() {
         "unix" => {
@@ -2405,22 +2677,10 @@ fn parse_rpc_endpoint(input: &str) -> Result<RpcEndpoint> {
             if path.as_os_str().is_empty() {
                 bail!("unix RPC endpoint requires a socket path");
             }
-            Ok(RpcEndpoint::Unix(path))
+            Ok(path)
         }
-        "tcp" => Ok(RpcEndpoint::Tcp(socket_addr_from_url(&url)?)),
-        "udp" => Ok(RpcEndpoint::Udp(socket_addr_from_url(&url)?)),
-        scheme => bail!("unsupported RPC endpoint scheme: {scheme}; expected unix, tcp, or udp"),
+        scheme => bail!("unsupported RPC endpoint scheme: {scheme}; expected unix"),
     }
-}
-
-fn socket_addr_from_url(url: &Url) -> Result<String> {
-    let host = url
-        .host_str()
-        .ok_or_else(|| anyhow!("RPC endpoint requires a host"))?;
-    let port = url
-        .port()
-        .ok_or_else(|| anyhow!("RPC endpoint requires a port"))?;
-    Ok(format!("{host}:{port}"))
 }
 
 fn send_rpc_event(endpoint: &str, event: &RpcEvent) -> Result<()> {
@@ -2429,52 +2689,41 @@ fn send_rpc_event(endpoint: &str, event: &RpcEvent) -> Result<()> {
         .to_proto()
         .encode_length_delimited(&mut message)
         .context("encoding RPC clone event")?;
-    match parse_rpc_endpoint(endpoint)? {
-        RpcEndpoint::Unix(path) => {
-            #[cfg(unix)]
-            {
-                let mut stream = UnixStream::connect(path)?;
-                stream.write_all(&message)?;
-                Ok(())
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = path;
-                bail!("unix RPC endpoints are not supported on this platform")
-            }
-        }
-        RpcEndpoint::Tcp(addr) => {
-            let mut stream = TcpStream::connect(addr)?;
-            stream.write_all(&message)?;
-            Ok(())
-        }
-        RpcEndpoint::Udp(addr) => {
-            let socket = UdpSocket::bind("0.0.0.0:0")?;
-            socket.send_to(&message, addr)?;
-            Ok(())
-        }
+    let path = parse_rpc_endpoint(endpoint)?;
+    #[cfg(unix)]
+    {
+        let mut stream = UnixStream::connect(path)?;
+        stream.write_all(&message)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        bail!("unix RPC endpoints are not supported on this platform")
     }
 }
 
-fn send_rpc_event_best_effort(endpoint: &str, event: &RpcEvent) {
+fn send_rpc_event_best_effort(endpoint: &str, event: &RpcEvent) -> bool {
     match send_rpc_event(endpoint, event) {
-        Ok(()) => debug!("sent RPC event to {endpoint}: {event:?}"),
-        Err(error) => warn!("could not send RPC event to {endpoint}: {error:#}"),
+        Ok(()) => {
+            debug!("sent RPC event to {endpoint}: {event:?}");
+            true
+        }
+        Err(error) => {
+            warn!("could not send RPC event to {endpoint}: {error:#}");
+            false
+        }
     }
 }
 
 fn run_daemon(config: &DaemonConfig, rpc_url: &str, args: DaemonArgs) -> Result<()> {
-    let endpoint = parse_rpc_endpoint(args.listen.as_deref().unwrap_or(rpc_url))?;
+    let path = parse_rpc_endpoint(args.listen.as_deref().unwrap_or(rpc_url))?;
     let daemon_state = Arc::new(DaemonState::new(
         config.rpc_rate_limit_per_second,
         config.clone_start_ttl_minutes,
     ));
     spawn_clone_ttl_cleanup(Arc::clone(&daemon_state));
-    match endpoint {
-        RpcEndpoint::Unix(path) => run_unix_daemon(config, &path, daemon_state),
-        RpcEndpoint::Tcp(addr) => run_tcp_daemon(config, &addr, daemon_state),
-        RpcEndpoint::Udp(addr) => run_udp_daemon(config, &addr, daemon_state),
-    }
+    run_unix_daemon(config, &path, daemon_state)
 }
 
 fn spawn_clone_ttl_cleanup(daemon_state: Arc<DaemonState>) {
@@ -2559,41 +2808,6 @@ fn run_unix_daemon(
     _daemon_state: Arc<DaemonState>,
 ) -> Result<()> {
     bail!("unix RPC endpoints are not supported on this platform")
-}
-
-fn run_tcp_daemon(config: &DaemonConfig, addr: &str, daemon_state: Arc<DaemonState>) -> Result<()> {
-    let listener = TcpListener::bind(addr).with_context(|| format!("listening on tcp://{addr}"))?;
-    println!("repo-manager daemon listening on tcp://{addr}");
-    for stream in listener.incoming() {
-        let stream = stream.context("accepting TCP RPC connection")?;
-        let peer = stream
-            .peer_addr()
-            .map(|addr| format!("tcp://{addr}"))
-            .unwrap_or_else(|_| "tcp://unknown-peer".to_string());
-        let config = config.clone();
-        let daemon_state = Arc::clone(&daemon_state);
-        thread::spawn(move || {
-            if let Err(error) = handle_rpc_stream(&config, stream, peer, daemon_state) {
-                eprintln!("repo-manager daemon: {error:#}");
-            }
-        });
-    }
-    Ok(())
-}
-
-fn run_udp_daemon(config: &DaemonConfig, addr: &str, daemon_state: Arc<DaemonState>) -> Result<()> {
-    let socket = UdpSocket::bind(addr).with_context(|| format!("listening on udp://{addr}"))?;
-    println!("repo-manager daemon listening on udp://{addr}");
-    let mut buffer = [0_u8; 65_535];
-    loop {
-        let (len, peer) = socket.recv_from(&mut buffer)?;
-        debug!("received RPC message from udp://{peer}: {len} bytes");
-        let event = decode_rpc_event(&buffer[..len])?;
-        if !allow_rpc_event(&daemon_state, &event, &format!("udp://{peer}"))? {
-            continue;
-        }
-        handle_rpc_event(config, &daemon_state, event)?;
-    }
 }
 
 fn handle_rpc_stream<R: Read>(
@@ -2696,26 +2910,7 @@ fn handle_rpc_event(
                     &event.path,
                 ));
             if event.success && config.detect_related && started.is_some() {
-                debug!(
-                    "reviewing related history for {} under client scan root {}",
-                    event.locator.key(),
-                    event.scan_root.display()
-                );
-                let store = Store::open(&config.state)?;
-                let count = detect_related_history_under_code(
-                    &store,
-                    &event.locator,
-                    &event.path,
-                    &event.scan_root,
-                )?;
-                debug!(
-                    "related-history review for {} found {} candidate(s)",
-                    event.locator.key(),
-                    count
-                );
-                if count > 0 {
-                    notify_related_history(count, &event.locator);
-                }
+                review_related_history(config, &event.locator, &event.path, &event.scan_root)?;
             } else if event.success && config.detect_related {
                 debug!(
                     "skipping related-history review for {} because no matching clone-start event was observed",
@@ -2749,11 +2944,53 @@ fn handle_rpc_event(
                 ));
             Ok(())
         }
+        RpcEvent::ManageRequested(event) => {
+            debug!(
+                "manage requested from client {}: {} -> {} scan_root={}",
+                event.client_id,
+                event.locator.key(),
+                event.path.display(),
+                event.scan_root.display()
+            );
+            if config.detect_related {
+                review_related_history(config, &event.locator, &event.path, &event.scan_root)
+            } else {
+                debug!(
+                    "skipping related-history review for {} because shared-history detection is disabled",
+                    event.locator.key()
+                );
+                Ok(())
+            }
+        }
     }
 }
 
 fn clone_event_key(client_id: &str, locator: &Locator, path: &Path) -> String {
     format!("{}\n{}\n{}", client_id, locator.key(), path.display())
+}
+
+fn review_related_history(
+    config: &DaemonConfig,
+    locator: &Locator,
+    path: &Path,
+    scan_root: &Path,
+) -> Result<()> {
+    debug!(
+        "reviewing related history for {} under client scan root {}",
+        locator.key(),
+        scan_root.display()
+    );
+    let store = Store::open(&config.state)?;
+    let count = detect_related_history_under_code(&store, locator, path, scan_root)?;
+    debug!(
+        "related-history review for {} found {} candidate(s)",
+        locator.key(),
+        count
+    );
+    if count > 0 {
+        notify_related_history(count, locator);
+    }
+    Ok(())
 }
 
 fn detect_related_history_under_code(
@@ -3125,6 +3362,40 @@ fn git_origin_url(cwd: &Path) -> Result<Option<String>> {
     git_remote_url(cwd, "origin")
 }
 
+fn git_remotes(cwd: &Path) -> Result<Vec<GitRemote>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["config", "--get-regexp", r"^remote\..*\.url$"])
+        .output()
+        .with_context(|| format!("reading Git remotes in {}", cwd.display()))?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    let stdout = String::from_utf8(output.stdout).context("Git remote output is not UTF-8")?;
+    let mut remotes = Vec::new();
+    for line in stdout.lines() {
+        let Some((key, url)) = line.split_once(' ') else {
+            continue;
+        };
+        let Some(name) = key
+            .strip_prefix("remote.")
+            .and_then(|key| key.strip_suffix(".url"))
+        else {
+            continue;
+        };
+        let url = url.trim();
+        if !name.is_empty() && !url.is_empty() {
+            remotes.push(GitRemote {
+                name: name.to_string(),
+                url: url.to_string(),
+            });
+        }
+    }
+    remotes.sort_by(|first, second| first.name.cmp(&second.name));
+    Ok(remotes)
+}
+
 fn git_remote_url(cwd: &Path, name: &str) -> Result<Option<String>> {
     let output = Command::new("git")
         .arg("-C")
@@ -3161,6 +3432,26 @@ fn output_clone(output: &Output, result: &CloneResult) -> Result<()> {
         result.locator.key(),
         result.path.display()
     );
+    Ok(())
+}
+
+fn output_manage(output: &Output, result: &ManageResult) -> Result<()> {
+    if output.json {
+        return print_json(result);
+    }
+    println!(
+        "managed {} -> {}",
+        result.locator.key(),
+        result.path.display()
+    );
+    if let Some(moved_from) = &result.moved_from {
+        println!("moved from: {}", moved_from.display());
+    }
+    if result.history_review_requested {
+        println!("shared-history review requested via daemon");
+    } else {
+        println!("shared-history review not requested; daemon unavailable");
+    }
     Ok(())
 }
 
@@ -3392,6 +3683,20 @@ mod tests {
         assert!(!help.contains("--detect-related"));
         assert!(!help.contains("--clone-start-ttl-minutes"));
         assert!(!help.contains("--rpc-rate-limit-per-second"));
+        assert!(help.contains("--root"));
+        assert!(!help.contains("--clone-root"));
+        assert!(!help.contains("--worktree-root"));
+    }
+
+    #[test]
+    fn manage_help_uses_canonical_prompt_options() {
+        let mut command = Cli::command();
+        let manage = command.find_subcommand_mut("manage").unwrap();
+        let help = manage.render_long_help().to_string();
+
+        assert!(help.contains("--assume-origin-as-canonical"));
+        assert!(!help.contains("--locator"));
+        assert!(!help.contains("origin or --locator"));
     }
 
     #[test]
@@ -3494,7 +3799,7 @@ mod tests {
         let locator = Locator::parse("github.com/torvalds/linux").unwrap();
         let plan = plan_worktree_add(
             Path::new("/tmp/clones"),
-            Path::new("/tmp/worktrees"),
+            Path::new("/tmp/dev-worktrees"),
             locator,
             "topic",
             WorktreeAddOptions {
@@ -3513,7 +3818,7 @@ mod tests {
                 "--force",
                 "-b",
                 "topic-branch",
-                "/tmp/worktrees/github.com/torvalds/linux/topic",
+                "/tmp/dev-worktrees/github.com/torvalds/linux/topic",
                 "origin/master",
             ]
         );
@@ -3582,10 +3887,149 @@ mod tests {
     }
 
     #[test]
+    fn manage_moves_existing_repo_from_subdirectory_and_registers_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let seed = dir.path().join("seed");
+        let current_path = dir.path().join("imports/current");
+        let managed_path = config.clone_root.join("example.com/current");
+        let other_path = config.clone_root.join("example.com/other");
+        fs::create_dir_all(&seed).unwrap();
+        run_git_in(&seed, ["init"]).unwrap();
+        fs::write(seed.join("README.md"), "shared history\n").unwrap();
+        run_git_in(&seed, ["add", "."]).unwrap();
+        run_git_in(
+            &seed,
+            [
+                "-c",
+                "user.name=repo-manager",
+                "-c",
+                "user.email=repo-manager@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        )
+        .unwrap();
+        clone_local_repo(&seed, &current_path);
+        clone_local_repo(&seed, &other_path);
+        run_git_in(
+            &current_path,
+            [
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.com/current.git",
+            ],
+        )
+        .unwrap();
+        run_git_in(
+            &current_path,
+            [
+                "remote",
+                "add",
+                "upstream",
+                "https://example.com/upstream.git",
+            ],
+        )
+        .unwrap();
+        run_git_in(
+            &other_path,
+            [
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.com/other.git",
+            ],
+        )
+        .unwrap();
+        let nested = current_path.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+
+        let store = Store::open(&config.state).unwrap();
+        manage_repo(
+            &config,
+            &store,
+            &Output { json: true },
+            ManageArgs {
+                path: nested,
+                assume_origin_as_canonical: true,
+            },
+        )
+        .unwrap();
+
+        assert!(!current_path.exists());
+        assert!(managed_path.exists());
+        assert!(store.find_repo("example.com/current").unwrap().is_some());
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM forks", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert!(store.related_suggestions(true).unwrap().is_empty());
+    }
+
+    #[test]
+    fn manage_moves_checkout_when_path_locator_differs_from_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let repo_path = config.clone_root.join("wrong/place");
+        let managed_path = config.clone_root.join("example.com/right");
+        fs::create_dir_all(&repo_path).unwrap();
+        run_git_in(&repo_path, ["init"]).unwrap();
+        run_git_in(
+            &repo_path,
+            ["remote", "add", "origin", "https://example.com/right.git"],
+        )
+        .unwrap();
+        let store = Store::open(&config.state).unwrap();
+
+        manage_repo(
+            &config,
+            &store,
+            &Output { json: true },
+            ManageArgs {
+                path: repo_path,
+                assume_origin_as_canonical: true,
+            },
+        )
+        .unwrap();
+
+        assert!(managed_path.exists());
+        assert!(store.find_repo("example.com/right").unwrap().is_some());
+    }
+
+    #[test]
+    fn manage_rejects_unlocatable_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let repo_path = dir.path().join("outside");
+        fs::create_dir_all(&repo_path).unwrap();
+        run_git_in(&repo_path, ["init"]).unwrap();
+        let store = Store::open(&config.state).unwrap();
+
+        let error = manage_repo(
+            &config,
+            &store,
+            &Output { json: true },
+            ManageArgs {
+                path: repo_path,
+                assume_origin_as_canonical: true,
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("prompt response ended"));
+    }
+
+    #[test]
     fn reconcile_applies_origin_locator_drift() {
         let dir = tempfile::tempdir().unwrap();
-        let clone_root = dir.path().join("clones");
-        let worktree_root = dir.path().join("worktrees");
+        let root = dir.path().join("code");
+        let clone_root = clone_root_for(&root);
+        let dev_worktree_root = dev_worktree_root_for(&root);
         let old_locator = Locator::parse("example.com/old/project").unwrap();
         let repo_path = locator_path(&clone_root, &old_locator);
         fs::create_dir_all(&repo_path).unwrap();
@@ -3619,10 +4063,12 @@ mod tests {
             config_path: dir.path().join("config.json"),
             state: dir.path().join("repos.sqlite"),
             cache_root: dir.path().join("cache"),
+            root,
             clone_root,
-            worktree_root,
+            dev_worktree_root,
             rpc_url: default_rpc_url(),
             client_id: generate_client_id().unwrap(),
+            assume_origin_as_canonical: false,
         };
 
         let report = reconcile_repos(&config, &store).unwrap();
@@ -3637,7 +4083,9 @@ mod tests {
     #[test]
     fn reconcile_updates_origin_for_forge_redirect() {
         let dir = tempfile::tempdir().unwrap();
-        let clone_root = dir.path().join("clones");
+        let root = dir.path().join("code");
+        let clone_root = clone_root_for(&root);
+        let dev_worktree_root = dev_worktree_root_for(&root);
         let old_locator = Locator::parse("github.com/old-owner/old-name").unwrap();
         let new_locator = Locator::parse("github.com/new-owner/new-name").unwrap();
         let old_path = locator_path(&clone_root, &old_locator);
@@ -3680,10 +4128,12 @@ mod tests {
             config_path: dir.path().join("config.json"),
             state: dir.path().join("repos.sqlite"),
             cache_root,
+            root,
             clone_root,
-            worktree_root: dir.path().join("worktrees"),
+            dev_worktree_root,
             rpc_url: default_rpc_url(),
             client_id: generate_client_id().unwrap(),
+            assume_origin_as_canonical: false,
         };
 
         let report = reconcile_repos(&config, &store).unwrap();
@@ -3714,10 +4164,10 @@ mod tests {
         FileConfig {
             state: Some(dir.path().join("state/from-file.sqlite")),
             cache_root: Some(dir.path().join("cache/from-file")),
-            clone_root: Some(dir.path().join("clones/from-file")),
-            worktree_root: Some(dir.path().join("worktrees/from-file")),
-            rpc_url: Some("tcp://127.0.0.1:47321".to_string()),
+            root: Some(dir.path().join("code/from-file")),
+            rpc_url: Some("unix:///tmp/repo-manager-from-file.sock".to_string()),
             client_id: Some("00000000-0000-4000-8000-000000000001".to_string()),
+            assume_origin_as_canonical: Some(false),
             detect_related: Some(true),
             clone_start_ttl_minutes: Some(45),
             rpc_rate_limit_per_second: Some(7),
@@ -3730,20 +4180,20 @@ mod tests {
                 config: Some(config_path.clone()),
                 state: None,
                 cache_root: Some(dir.path().join("cache/from-cli")),
-                clone_root: None,
-                worktree_root: None,
-                rpc_url: Some("udp://127.0.0.1:47322".to_string()),
+                root: Some(dir.path().join("code/from-cli")),
+                rpc_url: Some("unix:///tmp/repo-manager-from-cli.sock".to_string()),
                 client_id: Some("00000000-0000-4000-8000-000000000002".to_string()),
+                assume_origin_as_canonical: Some(true),
             },
             json: false,
             command: Commands::Setup(SetupCommands::Setup(SetupArgs {
                 file: None,
                 state: None,
                 cache_root: None,
-                clone_root: None,
-                worktree_root: None,
+                root: None,
                 rpc_url: None,
                 client_id: None,
+                assume_origin_as_canonical: None,
             })),
         };
         let config = Config::from_cli(&cli).unwrap();
@@ -3751,10 +4201,15 @@ mod tests {
         assert_eq!(config.config_path, config_path);
         assert_eq!(config.state, dir.path().join("state/from-file.sqlite"));
         assert_eq!(config.cache_root, dir.path().join("cache/from-cli"));
-        assert_eq!(config.clone_root, dir.path().join("clones/from-file"));
-        assert_eq!(config.worktree_root, dir.path().join("worktrees/from-file"));
-        assert_eq!(config.rpc_url, "udp://127.0.0.1:47322");
+        assert_eq!(config.root, dir.path().join("code/from-cli"));
+        assert_eq!(config.clone_root, dir.path().join("code/from-cli/clones"));
+        assert_eq!(
+            config.dev_worktree_root,
+            dir.path().join("code/from-cli/dev-worktrees")
+        );
+        assert_eq!(config.rpc_url, "unix:///tmp/repo-manager-from-cli.sock");
         assert_eq!(config.client_id, "00000000-0000-4000-8000-000000000002");
+        assert!(config.assume_origin_as_canonical);
     }
 
     #[test]
@@ -3781,10 +4236,12 @@ mod tests {
             config_path: dir.path().join("default/config.json"),
             state: dir.path().join("state/repos.sqlite"),
             cache_root: dir.path().join("cache"),
-            clone_root: dir.path().join("clones"),
-            worktree_root: dir.path().join("worktrees"),
+            root: dir.path().join("code"),
+            clone_root: dir.path().join("code/clones"),
+            dev_worktree_root: dir.path().join("code/dev-worktrees"),
             rpc_url: default_rpc_url(),
             client_id: "00000000-0000-4000-8000-000000000003".to_string(),
+            assume_origin_as_canonical: false,
         };
         let explicit_file = dir.path().join("custom/repo-config.json");
 
@@ -3795,10 +4252,10 @@ mod tests {
                 file: Some(explicit_file.clone()),
                 state: None,
                 cache_root: None,
-                clone_root: Some(dir.path().join("custom-clones")),
-                worktree_root: None,
-                rpc_url: Some("tcp://127.0.0.1:47321".to_string()),
+                root: Some(dir.path().join("custom-root")),
+                rpc_url: Some("unix:///tmp/repo-manager-explicit.sock".to_string()),
                 client_id: Some("00000000-0000-4000-8000-000000000004".to_string()),
+                assume_origin_as_canonical: Some(true),
             },
         )
         .unwrap();
@@ -3807,13 +4264,16 @@ mod tests {
         let saved = FileConfig::load(&explicit_file).unwrap();
         assert_eq!(saved.state, Some(config.state));
         assert_eq!(saved.cache_root, Some(config.cache_root));
-        assert_eq!(saved.clone_root, Some(dir.path().join("custom-clones")));
-        assert_eq!(saved.worktree_root, Some(config.worktree_root));
-        assert_eq!(saved.rpc_url, Some("tcp://127.0.0.1:47321".to_string()));
+        assert_eq!(saved.root, Some(dir.path().join("custom-root")));
+        assert_eq!(
+            saved.rpc_url,
+            Some("unix:///tmp/repo-manager-explicit.sock".to_string())
+        );
         assert_eq!(
             saved.client_id,
             Some("00000000-0000-4000-8000-000000000004".to_string())
         );
+        assert_eq!(saved.assume_origin_as_canonical, Some(true));
         assert_eq!(saved.detect_related, None);
         assert_eq!(saved.clone_start_ttl_minutes, None);
         assert_eq!(saved.rpc_rate_limit_per_second, None);
@@ -3825,10 +4285,10 @@ mod tests {
         let mut base = FileConfig {
             state: Some(dir.path().join("state/base.sqlite")),
             cache_root: Some(dir.path().join("cache/base")),
-            clone_root: None,
-            worktree_root: None,
+            root: None,
             rpc_url: Some("unix:///run/base.sock".to_string()),
             client_id: None,
+            assume_origin_as_canonical: Some(false),
             detect_related: Some(false),
             clone_start_ttl_minutes: Some(60),
             rpc_rate_limit_per_second: Some(1),
@@ -3837,10 +4297,10 @@ mod tests {
         base.merge(FileConfig {
             state: None,
             cache_root: Some(dir.path().join("cache/user")),
-            clone_root: Some(dir.path().join("clones/user")),
-            worktree_root: None,
+            root: Some(dir.path().join("code/user")),
             rpc_url: None,
             client_id: Some("00000000-0000-4000-8000-000000000005".to_string()),
+            assume_origin_as_canonical: Some(true),
             detect_related: Some(true),
             clone_start_ttl_minutes: Some(10),
             rpc_rate_limit_per_second: Some(9),
@@ -3848,13 +4308,14 @@ mod tests {
 
         assert_eq!(base.state, Some(dir.path().join("state/base.sqlite")));
         assert_eq!(base.cache_root, Some(dir.path().join("cache/user")));
-        assert_eq!(base.clone_root, Some(dir.path().join("clones/user")));
+        assert_eq!(base.root, Some(dir.path().join("code/user")));
         assert_eq!(base.rpc_url, Some("unix:///run/base.sock".to_string()));
         assert_eq!(base.clone_start_ttl_minutes, Some(10));
         assert_eq!(
             base.client_id,
             Some("00000000-0000-4000-8000-000000000005".to_string())
         );
+        assert_eq!(base.assume_origin_as_canonical, Some(true));
         assert_eq!(base.detect_related, Some(true));
         assert_eq!(base.rpc_rate_limit_per_second, Some(9));
     }
@@ -3874,6 +4335,16 @@ mod tests {
 
         assert!(limiter.allow("client-a"));
         assert!(limiter.allow("client-a"));
+    }
+
+    #[test]
+    fn rpc_endpoints_are_unix_only() {
+        assert_eq!(
+            parse_rpc_endpoint("unix:///tmp/repo-manager.sock").unwrap(),
+            PathBuf::from("/tmp/repo-manager.sock")
+        );
+        assert!(parse_rpc_endpoint("tcp://127.0.0.1:47321").is_err());
+        assert!(parse_rpc_endpoint("udp://127.0.0.1:47321").is_err());
     }
 
     #[test]
@@ -4041,6 +4512,79 @@ mod tests {
     }
 
     #[test]
+    fn daemon_reviews_manage_request_without_clone_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let clone_root = dir.path().join("clones");
+        let seed = dir.path().join("seed");
+        let current_path = clone_root.join("example.com/current");
+        let other_path = clone_root.join("example.com/other");
+        fs::create_dir_all(&seed).unwrap();
+        run_git_in(&seed, ["init"]).unwrap();
+        fs::write(seed.join("README.md"), "shared history\n").unwrap();
+        run_git_in(&seed, ["add", "."]).unwrap();
+        run_git_in(
+            &seed,
+            [
+                "-c",
+                "user.name=repo-manager",
+                "-c",
+                "user.email=repo-manager@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        )
+        .unwrap();
+        clone_local_repo(&seed, &current_path);
+        clone_local_repo(&seed, &other_path);
+        run_git_in(
+            &current_path,
+            [
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.com/current.git",
+            ],
+        )
+        .unwrap();
+        run_git_in(
+            &other_path,
+            [
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.com/other.git",
+            ],
+        )
+        .unwrap();
+
+        let state_path = dir.path().join("repos.sqlite");
+        let daemon_config = DaemonConfig {
+            state: state_path.clone(),
+            detect_related: true,
+            clone_start_ttl_minutes: 60,
+            rpc_rate_limit_per_second: 0,
+        };
+        let daemon_state = DaemonState::new(0, 60);
+        handle_rpc_event(
+            &daemon_config,
+            &daemon_state,
+            RpcEvent::ManageRequested(ManageRequestedEvent {
+                client_id: "00000000-0000-4000-8000-000000000088".to_string(),
+                url: "https://example.com/current.git".to_string(),
+                locator: Locator::parse("example.com/current").unwrap(),
+                path: current_path,
+                scan_root: clone_root,
+            }),
+        )
+        .unwrap();
+
+        let store = Store::open(&state_path).unwrap();
+        let suggestions = store.related_suggestions(true).unwrap();
+        assert_eq!(suggestions.len(), 1);
+    }
+
+    #[test]
     fn related_report_prefers_shared_root_evidence_for_legacy_rows() {
         let dir = tempfile::tempdir().unwrap();
         let seed = dir.path().join("seed");
@@ -4119,38 +4663,62 @@ mod tests {
 
     #[test]
     fn rpc_clone_event_round_trips_through_protobuf() {
-        let event = RpcEvent::Finished(CloneFinishedEvent {
-            client_id: "00000000-0000-4000-8000-000000000007".to_string(),
-            url: "https://example.com/current.git".to_string(),
-            locator: Locator::parse("example.com/current").unwrap(),
-            path: PathBuf::from("/tmp/client/clones/example.com/current"),
-            success: true,
-            scan_root: PathBuf::from("/tmp/client/clones"),
-        });
-        let mut message = Vec::new();
-        event
-            .to_proto()
-            .encode_length_delimited(&mut message)
-            .unwrap();
-        assert_eq!(event.to_proto().protocol_version, RPC_PROTOCOL_VERSION);
+        let events = [
+            RpcEvent::Finished(CloneFinishedEvent {
+                client_id: "00000000-0000-4000-8000-000000000007".to_string(),
+                url: "https://example.com/current.git".to_string(),
+                locator: Locator::parse("example.com/current").unwrap(),
+                path: PathBuf::from("/tmp/client/clones/example.com/current"),
+                success: true,
+                scan_root: PathBuf::from("/tmp/client/clones"),
+            }),
+            RpcEvent::ManageRequested(ManageRequestedEvent {
+                client_id: "00000000-0000-4000-8000-000000000008".to_string(),
+                url: "https://example.com/managed.git".to_string(),
+                locator: Locator::parse("example.com/managed").unwrap(),
+                path: PathBuf::from("/tmp/client/clones/example.com/managed"),
+                scan_root: PathBuf::from("/tmp/client/clones"),
+            }),
+        ];
 
-        let decoded = decode_rpc_event(&message).unwrap();
+        for event in events {
+            let mut message = Vec::new();
+            event
+                .to_proto()
+                .encode_length_delimited(&mut message)
+                .unwrap();
+            assert_eq!(event.to_proto().protocol_version, RPC_PROTOCOL_VERSION);
 
-        match decoded {
-            RpcEvent::Finished(decoded) => {
-                assert_eq!(decoded.client_id, "00000000-0000-4000-8000-000000000007");
-                assert_eq!(
-                    decoded.locator,
-                    Locator::parse("example.com/current").unwrap()
-                );
-                assert_eq!(
-                    decoded.path,
-                    PathBuf::from("/tmp/client/clones/example.com/current")
-                );
-                assert!(decoded.success);
-                assert_eq!(decoded.scan_root, PathBuf::from("/tmp/client/clones"));
+            let decoded = decode_rpc_event(&message).unwrap();
+
+            match decoded {
+                RpcEvent::Finished(decoded) => {
+                    assert_eq!(decoded.client_id, "00000000-0000-4000-8000-000000000007");
+                    assert_eq!(
+                        decoded.locator,
+                        Locator::parse("example.com/current").unwrap()
+                    );
+                    assert_eq!(
+                        decoded.path,
+                        PathBuf::from("/tmp/client/clones/example.com/current")
+                    );
+                    assert!(decoded.success);
+                    assert_eq!(decoded.scan_root, PathBuf::from("/tmp/client/clones"));
+                }
+                RpcEvent::ManageRequested(decoded) => {
+                    assert_eq!(decoded.client_id, "00000000-0000-4000-8000-000000000008");
+                    assert_eq!(
+                        decoded.locator,
+                        Locator::parse("example.com/managed").unwrap()
+                    );
+                    assert_eq!(
+                        decoded.path,
+                        PathBuf::from("/tmp/client/clones/example.com/managed")
+                    );
+                    assert_eq!(decoded.scan_root, PathBuf::from("/tmp/client/clones"));
+                }
+                other => panic!("unexpected decoded event: {other:?}"),
             }
-            other => panic!("unexpected decoded event: {other:?}"),
         }
     }
 
@@ -4194,10 +4762,12 @@ mod tests {
             config_path: root.join("config.json"),
             state: root.join("repos.sqlite"),
             cache_root: root.join("cache"),
-            clone_root: root.join("clones"),
-            worktree_root: root.join("worktrees"),
+            root: root.join("code"),
+            clone_root: root.join("code/clones"),
+            dev_worktree_root: root.join("code/dev-worktrees"),
             rpc_url: default_rpc_url(),
             client_id: "00000000-0000-4000-8000-000000000099".to_string(),
+            assume_origin_as_canonical: false,
         }
     }
 
