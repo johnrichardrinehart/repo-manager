@@ -3614,12 +3614,16 @@ fn materialize_related_shared_git_dir(
     }
 
     let controlling_origin = git_origin_url(controlling_path)?;
+    let controlling_url =
+        remote_url_for_locator(controlling_origin.as_deref(), controlling_locator);
+    ensure_remote(controlling_path, "origin", &controlling_url)?;
     let dependent_url = remote_url_for_locator(controlling_origin.as_deref(), dependent_locator);
     let dependent_remote = related_remote_name(relationship, dependent_locator);
     let already_shared = git_common_dir(dependent_path)? == git_common_dir(controlling_path)?;
 
     ensure_remote(controlling_path, &dependent_remote, &dependent_url)?;
     let default_branch = if already_shared {
+        fetch_remote_refs(controlling_path, &dependent_remote)?;
         shared_dependent_default_branch(controlling_path, dependent_path, &dependent_remote)?
     } else {
         dependent_default_branch(dependent_path)?
@@ -3796,6 +3800,12 @@ fn remote_default_branch(cwd: &Path, remote: &str) -> Result<Option<String>> {
         .strip_prefix(&format!("{remote}/"))
         .filter(|branch| !branch.is_empty())
         .map(str::to_string))
+}
+
+fn fetch_remote_refs(cwd: &Path, remote: &str) -> Result<()> {
+    run_git_in(cwd, ["fetch", "--no-tags", remote])?;
+    let _ = run_git_in(cwd, ["remote", "set-head", remote, "-a"]);
+    Ok(())
 }
 
 fn dependent_local_branch(
@@ -4527,6 +4537,13 @@ fn remote_url_for_locator(existing_url: Option<&str>, locator: &Locator) -> Stri
             && parse_scp_like(trimmed).is_some()
         {
             return format!("{prefix}:{}{suffix}", locator.remote_path);
+        }
+
+        if let Ok(mut url) = Url::parse(trimmed)
+            && url.scheme() == "file"
+        {
+            url.set_path(&format!("/{}{}", locator.remote_path, suffix));
+            return url.to_string();
         }
 
         if let Ok(mut url) = Url::parse(trimmed)
@@ -5781,6 +5798,100 @@ mod tests {
         assert_eq!(
             fs::read_to_string(canonical_path.join("README.md")).unwrap(),
             "canonical\n"
+        );
+    }
+
+    #[test]
+    fn repair_fetches_dependent_remote_before_setting_shared_upstream() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let canonical_seed = dir.path().join("canonical-seed");
+        let fork_seed = dir.path().join("fork-seed");
+        fs::create_dir_all(&canonical_seed).unwrap();
+        run_git_in(&canonical_seed, ["init"]).unwrap();
+        run_git_in(&canonical_seed, ["checkout", "-b", "master"]).unwrap();
+        fs::write(canonical_seed.join("README.md"), "canonical\n").unwrap();
+        run_git_in(&canonical_seed, ["add", "."]).unwrap();
+        run_git_in(
+            &canonical_seed,
+            [
+                "-c",
+                "user.name=repo-manager",
+                "-c",
+                "user.email=repo-manager@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        )
+        .unwrap();
+        clone_local_repo(&canonical_seed, &fork_seed);
+        fs::write(fork_seed.join("fork.txt"), "fork\n").unwrap();
+        run_git_in(&fork_seed, ["add", "."]).unwrap();
+        run_git_in(
+            &fork_seed,
+            [
+                "-c",
+                "user.name=repo-manager",
+                "-c",
+                "user.email=repo-manager@example.com",
+                "commit",
+                "-m",
+                "fork",
+            ],
+        )
+        .unwrap();
+
+        let fork_url = format!("file://localhost{}", fork_seed.display());
+        let fork_locator = Locator::parse(&format!("localhost{}", fork_seed.display())).unwrap();
+        let canonical_locator =
+            Locator::parse(&format!("localhost{}", canonical_seed.display())).unwrap();
+        let fork_path = locator_path(&config.clone_root, &fork_locator);
+        let canonical_path = locator_path(&config.clone_root, &canonical_locator);
+        clone_local_repo(&fork_seed, &canonical_path);
+        run_git_in(&canonical_path, ["remote", "set-url", "origin", &fork_url]).unwrap();
+        let local_branch = dependent_local_branch("fork", &fork_locator, "master");
+        run_git_in(&canonical_path, ["branch", &local_branch, "master"]).unwrap();
+        run_git_in(
+            &canonical_path,
+            [
+                "worktree",
+                "add",
+                &fork_path.display().to_string(),
+                &local_branch,
+            ],
+        )
+        .unwrap();
+
+        materialize_related_shared_git_dir(
+            &store,
+            &fork_locator,
+            &fork_path,
+            &canonical_locator,
+            &canonical_path,
+            "fork",
+        )
+        .unwrap();
+
+        assert_eq!(
+            git_remote_url(&canonical_path, "origin").unwrap(),
+            Some(remote_url_for_locator(Some(&fork_url), &canonical_locator))
+        );
+        assert_eq!(
+            git_output(
+                &fork_path,
+                [
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "--symbolic-full-name",
+                    "@{upstream}"
+                ],
+                "reading fork upstream"
+            )
+            .unwrap()
+            .trim(),
+            &format!("{}/master", related_remote_name("fork", &fork_locator))
         );
     }
 
