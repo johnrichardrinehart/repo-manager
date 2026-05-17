@@ -224,6 +224,11 @@ enum RepositoryOperationCommands {
     Manage(ManageArgs),
     #[command(about = "Create or register a fork worktree for a canonical repository")]
     Fork(ForkArgs),
+    #[command(
+        about = "Repair managed repository filesystem structure",
+        long_about = "Repair managed repository filesystem structure from repo-manager metadata.\n\nThis verifies managed paths and rematerializes fork/mirror relationships so dependent checkouts reuse the controlling repository's Git directory as worktrees. Use --check to report drift without changing repositories or metadata."
+    )]
+    Repair(RepairArgs),
     #[command(about = "Manage development worktrees under the managed dev-worktree root")]
     Worktree(WorktreeCommand),
 }
@@ -369,6 +374,15 @@ struct ForkArgs {
         help = "Canonical upstream Git URL or locator for this fork"
     )]
     canonical: String,
+}
+
+#[derive(Debug, Args)]
+struct RepairArgs {
+    #[arg(
+        long,
+        help = "Only report drift; do not change repositories or metadata"
+    )]
+    check: bool,
 }
 
 #[derive(Debug, Args)]
@@ -576,6 +590,51 @@ struct ReconcileMove {
 struct ReconcileSkip {
     repo_id: i64,
     repo_path: PathBuf,
+    reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RepairReport {
+    action: &'static str,
+    check: bool,
+    stale_paths: Vec<RepairStalePath>,
+    relationships: Vec<RepairRelationship>,
+    skipped: Vec<RepairSkip>,
+}
+
+#[derive(Debug, Serialize)]
+struct RepairStalePath {
+    repo_id: i64,
+    locator: Locator,
+    path: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+struct RepairRelationship {
+    relationship: String,
+    dependent_locator: Locator,
+    controlling_locator: Locator,
+    dependent_path: PathBuf,
+    controlling_path: PathBuf,
+    status: RepairStatus,
+    reasons: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shared_git_dir: Option<SharedGitDirResolution>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum RepairStatus {
+    Ok,
+    NeedsRepair,
+    Repaired,
+}
+
+#[derive(Debug, Serialize)]
+struct RepairSkip {
+    relationship: String,
+    dependent_locator: Locator,
+    controlling_locator: Locator,
     reason: String,
 }
 
@@ -819,6 +878,17 @@ struct RelatedSuggestion {
     resolution: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct SharedGitDirRelationship {
+    relationship: String,
+    dependent_repo_id: i64,
+    dependent_locator: Locator,
+    dependent_path: PathBuf,
+    controlling_repo_id: i64,
+    controlling_locator: Locator,
+    controlling_path: PathBuf,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct RelatedListReport {
     action: &'static str,
@@ -1000,6 +1070,10 @@ pub fn run() -> Result<()> {
             RepositoryOperationCommands::Fork(args) => {
                 let db = Store::open(&config.state)?;
                 fork_repo(&config, &db, &output, &args.fork_url, &args.canonical)
+            }
+            RepositoryOperationCommands::Repair(args) => {
+                let db = Store::open(&config.state)?;
+                repair_repos(&db, &output, args.check)
             }
             RepositoryOperationCommands::Worktree(command) => match command.command {
                 WorktreeSubcommand::Add(args) => {
@@ -1967,6 +2041,83 @@ impl Store {
             .ok_or_else(|| anyhow!("unknown related-history suggestion: {id}"))
     }
 
+    fn shared_git_dir_relationships(&self) -> Result<Vec<SharedGitDirRelationship>> {
+        let mut relationships = Vec::new();
+        let mut seen = HashSet::new();
+        for suggestion in self.related_suggestions(false)? {
+            let Some(resolution) = suggestion.resolution.as_deref() else {
+                continue;
+            };
+            if !matches!(resolution, "fork" | "mirror") {
+                continue;
+            }
+            let key = (
+                resolution.to_string(),
+                suggestion.repo_id,
+                suggestion.related_repo_id,
+            );
+            if seen.insert(key) {
+                relationships.push(SharedGitDirRelationship {
+                    relationship: resolution.to_string(),
+                    dependent_repo_id: suggestion.repo_id,
+                    dependent_locator: suggestion.repo_locator,
+                    dependent_path: suggestion.repo_path,
+                    controlling_repo_id: suggestion.related_repo_id,
+                    controlling_locator: suggestion.related_locator,
+                    controlling_path: suggestion.related_path,
+                });
+            }
+        }
+
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT
+              fork.id,
+              fork.current_authority,
+              fork.current_remote_path,
+              fork.current_path,
+              canonical.id,
+              canonical.current_authority,
+              canonical.current_remote_path,
+              canonical.current_path
+            FROM forks
+            JOIN repos fork ON fork.id = forks.fork_repo_id
+            JOIN repos canonical ON canonical.id = forks.canonical_repo_id
+            ORDER BY fork.current_authority, fork.current_remote_path
+            ",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SharedGitDirRelationship {
+                relationship: "fork".to_string(),
+                dependent_repo_id: row.get(0)?,
+                dependent_locator: Locator {
+                    authority: row.get(1)?,
+                    remote_path: row.get(2)?,
+                },
+                dependent_path: PathBuf::from(row.get::<_, String>(3)?),
+                controlling_repo_id: row.get(4)?,
+                controlling_locator: Locator {
+                    authority: row.get(5)?,
+                    remote_path: row.get(6)?,
+                },
+                controlling_path: PathBuf::from(row.get::<_, String>(7)?),
+            })
+        })?;
+        for relationship in rows {
+            let relationship = relationship?;
+            let key = (
+                relationship.relationship.clone(),
+                relationship.dependent_repo_id,
+                relationship.controlling_repo_id,
+            );
+            if seen.insert(key) {
+                relationships.push(relationship);
+            }
+        }
+
+        Ok(relationships)
+    }
+
     fn resolve_related(&self, id: i64, resolution: &str) -> Result<()> {
         let changed = self.conn.execute(
             "
@@ -2423,6 +2574,202 @@ fn fork_repo(
     )
 }
 
+fn repair_repos(db: &Store, output: &Output, check: bool) -> Result<()> {
+    let mut stale_paths = Vec::new();
+    for repo in db.current_repos()? {
+        if !repo.path.exists() {
+            stale_paths.push(RepairStalePath {
+                repo_id: repo.id,
+                locator: repo.current,
+                path: repo.path,
+            });
+        }
+    }
+
+    let mut relationships = Vec::new();
+    let mut skipped = Vec::new();
+    for relationship in db.shared_git_dir_relationships()? {
+        if !relationship.dependent_path.exists() {
+            skipped.push(RepairSkip {
+                relationship: relationship.relationship,
+                dependent_locator: relationship.dependent_locator,
+                controlling_locator: relationship.controlling_locator,
+                reason: format!(
+                    "dependent checkout does not exist: {}",
+                    relationship.dependent_path.display()
+                ),
+            });
+            continue;
+        }
+        if !relationship.controlling_path.exists() {
+            skipped.push(RepairSkip {
+                relationship: relationship.relationship,
+                dependent_locator: relationship.dependent_locator,
+                controlling_locator: relationship.controlling_locator,
+                reason: format!(
+                    "controlling checkout does not exist: {}",
+                    relationship.controlling_path.display()
+                ),
+            });
+            continue;
+        }
+
+        let repair_reasons = match shared_git_dir_relationship_repair_reasons(&relationship) {
+            Ok(repair_reasons) => repair_reasons,
+            Err(error) => {
+                skipped.push(RepairSkip {
+                    relationship: relationship.relationship,
+                    dependent_locator: relationship.dependent_locator,
+                    controlling_locator: relationship.controlling_locator,
+                    reason: error.to_string(),
+                });
+                continue;
+            }
+        };
+
+        if repair_reasons.is_empty() {
+            relationships.push(RepairRelationship {
+                relationship: relationship.relationship,
+                dependent_locator: relationship.dependent_locator,
+                controlling_locator: relationship.controlling_locator,
+                dependent_path: relationship.dependent_path,
+                controlling_path: relationship.controlling_path,
+                status: RepairStatus::Ok,
+                reasons: Vec::new(),
+                shared_git_dir: None,
+            });
+            continue;
+        }
+
+        if check {
+            relationships.push(RepairRelationship {
+                relationship: relationship.relationship,
+                dependent_locator: relationship.dependent_locator,
+                controlling_locator: relationship.controlling_locator,
+                dependent_path: relationship.dependent_path,
+                controlling_path: relationship.controlling_path,
+                status: RepairStatus::NeedsRepair,
+                reasons: repair_reasons,
+                shared_git_dir: None,
+            });
+            continue;
+        }
+
+        match materialize_related_shared_git_dir(
+            db,
+            &relationship.dependent_locator,
+            &relationship.dependent_path,
+            &relationship.controlling_locator,
+            &relationship.controlling_path,
+            &relationship.relationship,
+        ) {
+            Ok(shared_git_dir) => relationships.push(RepairRelationship {
+                relationship: relationship.relationship,
+                dependent_locator: relationship.dependent_locator,
+                controlling_locator: relationship.controlling_locator,
+                dependent_path: relationship.dependent_path,
+                controlling_path: relationship.controlling_path,
+                status: RepairStatus::Repaired,
+                reasons: repair_reasons,
+                shared_git_dir: Some(shared_git_dir),
+            }),
+            Err(error) => skipped.push(RepairSkip {
+                relationship: relationship.relationship,
+                dependent_locator: relationship.dependent_locator,
+                controlling_locator: relationship.controlling_locator,
+                reason: error.to_string(),
+            }),
+        }
+    }
+
+    output_repair(
+        output,
+        &RepairReport {
+            action: "repair",
+            check,
+            stale_paths,
+            relationships,
+            skipped,
+        },
+    )
+}
+
+fn shared_git_dir_relationship_repair_reasons(
+    relationship: &SharedGitDirRelationship,
+) -> Result<Vec<String>> {
+    let mut reasons = Vec::new();
+    let controlling_origin = git_origin_url(&relationship.controlling_path)?;
+    let dependent_url = remote_url_for_locator(
+        controlling_origin.as_deref(),
+        &relationship.dependent_locator,
+    );
+    let dependent_remote =
+        related_remote_name(&relationship.relationship, &relationship.dependent_locator);
+    let current_dependent_remote =
+        git_remote_url(&relationship.controlling_path, &dependent_remote)?;
+    if current_dependent_remote.as_deref() != Some(dependent_url.as_str()) {
+        reasons.push(match current_dependent_remote {
+            Some(current) => format!(
+                "controlling checkout remote `{dependent_remote}` points at {current}, expected {dependent_url}"
+            ),
+            None => format!(
+                "controlling checkout is missing dependent remote `{dependent_remote}` -> {dependent_url}"
+            ),
+        });
+    }
+    let dependent_common_dir = git_common_dir(&relationship.dependent_path)?;
+    let controlling_common_dir = git_common_dir(&relationship.controlling_path)?;
+    if dependent_common_dir != controlling_common_dir {
+        reasons.push(format!(
+            "dependent checkout uses Git directory {}, controlling checkout uses {}",
+            dependent_common_dir.display(),
+            controlling_common_dir.display()
+        ));
+    }
+    let default_branch = shared_dependent_default_branch(
+        &relationship.controlling_path,
+        &relationship.dependent_path,
+        &dependent_remote,
+    )?;
+    let local_branch = dependent_local_branch(
+        &relationship.relationship,
+        &relationship.dependent_locator,
+        &default_branch,
+    );
+    let remote_branch = format!("{dependent_remote}/{default_branch}");
+    let current_branch = git_output(
+        &relationship.dependent_path,
+        ["branch", "--show-current"],
+        "reading dependent current branch",
+    )?;
+    if current_branch.trim() != local_branch {
+        reasons.push(format!(
+            "dependent checkout is on branch `{}`, expected `{local_branch}`",
+            current_branch.trim()
+        ));
+    }
+    let upstream = git_output_optional(
+        &relationship.dependent_path,
+        [
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+        "reading dependent upstream",
+    )?;
+    if upstream.as_deref().map(str::trim) != Some(remote_branch.as_str()) {
+        reasons.push(match upstream {
+            Some(upstream) => format!(
+                "dependent branch upstream is `{}`, expected `{remote_branch}`",
+                upstream.trim()
+            ),
+            None => format!("dependent branch has no upstream, expected `{remote_branch}`"),
+        });
+    }
+    Ok(reasons)
+}
+
 fn add_worktree(config: &Config, db: &Store, output: &Output, args: WorktreeAddArgs) -> Result<()> {
     warn_pending_related(db)?;
     let locator = Locator::parse(&args.canonical_url)?;
@@ -2668,12 +3015,16 @@ fn materialize_related_shared_git_dir(
     let controlling_origin = git_origin_url(controlling_path)?;
     let dependent_url = remote_url_for_locator(controlling_origin.as_deref(), dependent_locator);
     let dependent_remote = related_remote_name(relationship, dependent_locator);
-    let default_branch = dependent_default_branch(dependent_path)?;
-    let local_branch = dependent_local_branch(relationship, dependent_locator, &default_branch);
-    let remote_branch = format!("{dependent_remote}/{default_branch}");
     let already_shared = git_common_dir(dependent_path)? == git_common_dir(controlling_path)?;
 
     ensure_remote(controlling_path, &dependent_remote, &dependent_url)?;
+    let default_branch = if already_shared {
+        shared_dependent_default_branch(controlling_path, dependent_path, &dependent_remote)?
+    } else {
+        dependent_default_branch(dependent_path)?
+    };
+    let local_branch = dependent_local_branch(relationship, dependent_locator, &default_branch);
+    let remote_branch = format!("{dependent_remote}/{default_branch}");
 
     let converted_to_worktree = if already_shared {
         ensure_tracking_branch(controlling_path, &local_branch, &remote_branch)?;
@@ -2800,6 +3151,50 @@ fn dependent_default_branch(path: &Path) -> Result<String> {
         "could not determine dependent checkout default branch from origin/HEAD or current branch: {}",
         path.display()
     )
+}
+
+fn shared_dependent_default_branch(
+    controlling_path: &Path,
+    dependent_path: &Path,
+    dependent_remote: &str,
+) -> Result<String> {
+    if let Some(remote_head) = remote_default_branch(controlling_path, dependent_remote)? {
+        return Ok(remote_head);
+    }
+    let current = git_output(
+        dependent_path,
+        ["branch", "--show-current"],
+        "reading dependent current branch",
+    )?;
+    current
+        .trim()
+        .rsplit('/')
+        .next()
+        .filter(|branch| !branch.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            anyhow!(
+                "could not determine dependent default branch for {}",
+                dependent_path.display()
+            )
+        })
+}
+
+fn remote_default_branch(cwd: &Path, remote: &str) -> Result<Option<String>> {
+    let remote_head_ref = format!("refs/remotes/{remote}/HEAD");
+    let Some(remote_head) = git_output_optional(
+        cwd,
+        ["symbolic-ref", "--quiet", "--short", &remote_head_ref],
+        "reading dependent remote default branch",
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(remote_head
+        .trim()
+        .strip_prefix(&format!("{remote}/"))
+        .filter(|branch| !branch.is_empty())
+        .map(str::to_string))
 }
 
 fn dependent_local_branch(
@@ -3887,6 +4282,70 @@ fn output_aliases(output: &Output, aliases: &[AliasPlan]) -> Result<()> {
             alias.alias_path.display(),
             alias.target_path.display()
         );
+    }
+    Ok(())
+}
+
+fn output_repair(output: &Output, report: &RepairReport) -> Result<()> {
+    if output.json {
+        return print_json(report);
+    }
+    let needs_repair = report
+        .relationships
+        .iter()
+        .filter(|relationship| matches!(relationship.status, RepairStatus::NeedsRepair))
+        .count();
+    let repaired = report
+        .relationships
+        .iter()
+        .filter(|relationship| matches!(relationship.status, RepairStatus::Repaired))
+        .count();
+    println!(
+        "checked {} managed relationship(s)",
+        report.relationships.len() + report.skipped.len()
+    );
+    if report.check {
+        println!("{needs_repair} relationship(s) need repair");
+    } else {
+        println!("repaired {repaired} relationship(s)");
+    }
+    if !report.stale_paths.is_empty() {
+        println!("stale managed path(s): {}", report.stale_paths.len());
+        for stale in &report.stale_paths {
+            println!("  {} {}", stale.locator.key(), stale.path.display());
+        }
+    }
+    for relationship in &report.relationships {
+        match relationship.status {
+            RepairStatus::Ok => {}
+            RepairStatus::NeedsRepair => println!(
+                "needs repair: {} {} -> {}",
+                relationship.relationship,
+                relationship.dependent_locator.key(),
+                relationship.controlling_locator.key()
+            ),
+            RepairStatus::Repaired => println!(
+                "repaired: {} {} -> {}",
+                relationship.relationship,
+                relationship.dependent_locator.key(),
+                relationship.controlling_locator.key()
+            ),
+        }
+        for reason in &relationship.reasons {
+            println!("  reason: {reason}");
+        }
+    }
+    if !report.skipped.is_empty() {
+        println!("skipped {} relationship(s)", report.skipped.len());
+        for skipped in &report.skipped {
+            println!(
+                "  {} {} -> {}: {}",
+                skipped.relationship,
+                skipped.dependent_locator.key(),
+                skipped.controlling_locator.key(),
+                skipped.reason
+            );
+        }
     }
     Ok(())
 }
@@ -5293,6 +5752,102 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM forks", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn repair_check_reports_and_repair_materializes_resolved_fork() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let seed = dir.path().join("seed");
+        let fork_locator = Locator::parse("github.com/example/fork").unwrap();
+        let canonical_locator = Locator::parse("github.com/example/canonical").unwrap();
+        let fork_path = locator_path(&config.clone_root, &fork_locator);
+        let canonical_path = locator_path(&config.clone_root, &canonical_locator);
+        fs::create_dir_all(&seed).unwrap();
+        run_git_in(&seed, ["init"]).unwrap();
+        run_git_in(&seed, ["checkout", "-b", "main"]).unwrap();
+        fs::write(seed.join("README.md"), "shared history\n").unwrap();
+        run_git_in(&seed, ["add", "."]).unwrap();
+        run_git_in(
+            &seed,
+            [
+                "-c",
+                "user.name=repo-manager",
+                "-c",
+                "user.email=repo-manager@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        )
+        .unwrap();
+        clone_local_repo(&seed, &fork_path);
+        clone_local_repo(&seed, &canonical_path);
+        run_git_in(
+            &fork_path,
+            [
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/example/fork.git",
+            ],
+        )
+        .unwrap();
+        run_git_in(
+            &canonical_path,
+            [
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/example/canonical.git",
+            ],
+        )
+        .unwrap();
+        let fork_id = store.upsert_repo(&fork_locator, &fork_path, None).unwrap();
+        let canonical_id = store
+            .upsert_repo(&canonical_locator, &canonical_path, None)
+            .unwrap();
+        store
+            .record_related_history(
+                fork_id,
+                canonical_id,
+                &["shared root commit abc".to_string()],
+            )
+            .unwrap();
+        let suggestion_id = store.related_suggestions(true).unwrap()[0].id;
+        store.resolve_related(suggestion_id, "fork").unwrap();
+        assert_ne!(
+            git_common_dir(&fork_path).unwrap(),
+            git_common_dir(&canonical_path).unwrap()
+        );
+
+        repair_repos(&store, &Output { json: true }, true).unwrap();
+        assert_ne!(
+            git_common_dir(&fork_path).unwrap(),
+            git_common_dir(&canonical_path).unwrap()
+        );
+
+        repair_repos(&store, &Output { json: true }, false).unwrap();
+        assert_eq!(
+            git_common_dir(&fork_path).unwrap(),
+            git_common_dir(&canonical_path).unwrap()
+        );
+        assert_eq!(
+            git_output(
+                &fork_path,
+                [
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "--symbolic-full-name",
+                    "@{upstream}"
+                ],
+                "reading fork upstream"
+            )
+            .unwrap()
+            .trim(),
+            "fork-github.com-example-fork/main"
         );
     }
 
