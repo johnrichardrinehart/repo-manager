@@ -486,7 +486,7 @@ enum RelatedSubcommand {
     List,
     #[command(
         about = "Resolve a shared-history suggestion",
-        long_about = "Resolve a shared-history suggestion with an explicit relationship.\n\nKinds: mirror, fork, canonical, moved, successor, unrelated."
+        long_about = "Resolve a shared-history suggestion with an explicit relationship.\n\nKinds: mirror, fork, canonical, moved, successor, unrelated.\n\nFor fork and mirror, the first repository shown by `repo related list` is treated as the dependent checkout and the second repository is treated as the checkout that controls the shared Git directory. The dependent checkout is converted into a Git worktree of the controlling checkout when possible."
     )]
     Resolve(RelatedResolveArgs),
 }
@@ -853,6 +853,21 @@ struct RelatedResolution {
     action: &'static str,
     id: i64,
     resolution: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shared_git_dir: Option<SharedGitDirResolution>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SharedGitDirResolution {
+    dependent_locator: Locator,
+    controlling_locator: Locator,
+    dependent_path: PathBuf,
+    controlling_path: PathBuf,
+    dependent_remote: String,
+    dependent_url: String,
+    local_branch: String,
+    remote_branch: String,
+    converted_to_worktree: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1945,6 +1960,13 @@ impl Store {
             .map_err(Into::into)
     }
 
+    fn related_suggestion(&self, id: i64) -> Result<RelatedSuggestion> {
+        self.related_suggestions(false)?
+            .into_iter()
+            .find(|suggestion| suggestion.id == id)
+            .ok_or_else(|| anyhow!("unknown related-history suggestion: {id}"))
+    }
+
     fn resolve_related(&self, id: i64, resolution: &str) -> Result<()> {
         let changed = self.conn.execute(
             "
@@ -2228,9 +2250,7 @@ fn request_daemon_history_review(
 }
 
 fn git_worktree_root(path: &Path) -> Result<PathBuf> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(path)
+    let output = git_command(path)
         .args(["rev-parse", "--show-toplevel"])
         .output()
         .with_context(|| format!("resolving Git worktree root from {}", path.display()))?;
@@ -2249,7 +2269,14 @@ fn ghq_get_command(root: &Path, url: &str) -> Command {
 
 fn git_clone_command(url: &str, path: &Path) -> Command {
     let mut command = Command::new("git");
-    command.arg("clone").arg(url).arg(path);
+    command
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_PREFIX")
+        .arg("clone")
+        .arg(url)
+        .arg(path);
     command
 }
 
@@ -2363,9 +2390,7 @@ fn fork_repo(
     ensure_remote(&canonical_path, "origin", canonical_url)?;
     ensure_remote(&canonical_path, &fork_remote, fork_url)?;
     run_git_in(&canonical_path, ["fetch", &fork_remote])?;
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(&canonical_path)
+    let status = git_command(&canonical_path)
         .args(["remote", "set-head", &fork_remote, "-a"])
         .status()
         .context("detecting fork default branch")?;
@@ -2585,6 +2610,9 @@ fn related_list(db: &Store, output: &Output) -> Result<()> {
 
 fn related_resolve(db: &Store, output: &Output, id: i64, kind: &str) -> Result<()> {
     validate_relationship_kind(kind)?;
+    let shared_git_dir = matches!(kind, "fork" | "mirror")
+        .then(|| resolve_related_shared_git_dir(db, id, kind))
+        .transpose()?;
     db.resolve_related(id, kind)?;
     output_related_resolution(
         output,
@@ -2592,8 +2620,268 @@ fn related_resolve(db: &Store, output: &Output, id: i64, kind: &str) -> Result<(
             action: "related-resolve",
             id,
             resolution: kind.to_string(),
+            shared_git_dir,
         },
     )
+}
+
+fn resolve_related_shared_git_dir(
+    db: &Store,
+    id: i64,
+    relationship: &str,
+) -> Result<SharedGitDirResolution> {
+    let suggestion = db.related_suggestion(id)?;
+    if let Some(resolution) = suggestion.resolution {
+        bail!("related-history suggestion #{id} is already resolved as {resolution}");
+    }
+    materialize_related_shared_git_dir(
+        db,
+        &suggestion.repo_locator,
+        &suggestion.repo_path,
+        &suggestion.related_locator,
+        &suggestion.related_path,
+        relationship,
+    )
+}
+
+fn materialize_related_shared_git_dir(
+    db: &Store,
+    dependent_locator: &Locator,
+    dependent_path: &Path,
+    controlling_locator: &Locator,
+    controlling_path: &Path,
+    relationship: &str,
+) -> Result<SharedGitDirResolution> {
+    if !dependent_path.exists() {
+        bail!(
+            "dependent checkout does not exist: {}",
+            dependent_path.display()
+        );
+    }
+    if !controlling_path.exists() {
+        bail!(
+            "controlling checkout does not exist: {}",
+            controlling_path.display()
+        );
+    }
+
+    let controlling_origin = git_origin_url(controlling_path)?;
+    let dependent_url = remote_url_for_locator(controlling_origin.as_deref(), dependent_locator);
+    let dependent_remote = related_remote_name(relationship, dependent_locator);
+    let default_branch = dependent_default_branch(dependent_path)?;
+    let local_branch = dependent_local_branch(relationship, dependent_locator, &default_branch);
+    let remote_branch = format!("{dependent_remote}/{default_branch}");
+    let already_shared = git_common_dir(dependent_path)? == git_common_dir(controlling_path)?;
+
+    ensure_remote(controlling_path, &dependent_remote, &dependent_url)?;
+
+    let converted_to_worktree = if already_shared {
+        ensure_tracking_branch(controlling_path, &local_branch, &remote_branch)?;
+        checkout_branch(dependent_path, &local_branch)?;
+        false
+    } else {
+        convert_checkout_to_worktree(
+            controlling_path,
+            dependent_path,
+            &dependent_remote,
+            &local_branch,
+            &remote_branch,
+        )?
+    };
+
+    let controlling_id = db.upsert_repo(controlling_locator, controlling_path, None)?;
+    let dependent_id = db.upsert_repo(
+        dependent_locator,
+        dependent_path,
+        Some(&controlling_locator.key()),
+    )?;
+    if relationship == "fork" {
+        db.record_fork(dependent_id, controlling_id)?;
+    }
+
+    Ok(SharedGitDirResolution {
+        dependent_locator: dependent_locator.clone(),
+        controlling_locator: controlling_locator.clone(),
+        dependent_path: dependent_path.to_path_buf(),
+        controlling_path: controlling_path.to_path_buf(),
+        dependent_remote,
+        dependent_url,
+        local_branch,
+        remote_branch,
+        converted_to_worktree,
+    })
+}
+
+fn convert_checkout_to_worktree(
+    controlling_path: &Path,
+    dependent_path: &Path,
+    dependent_remote: &str,
+    local_branch: &str,
+    remote_branch: &str,
+) -> Result<bool> {
+    ensure_clean_checkout(dependent_path)?;
+    fetch_local_dependent_refs(controlling_path, dependent_path, dependent_remote)?;
+    ensure_tracking_branch(controlling_path, local_branch, remote_branch)?;
+    let backup_path = unique_backup_path(dependent_path)?;
+    fs::rename(dependent_path, &backup_path).with_context(|| {
+        format!(
+            "moving existing dependent checkout {} to {}",
+            dependent_path.display(),
+            backup_path.display()
+        )
+    })?;
+
+    let add_result = run_git_in(
+        controlling_path,
+        [
+            "worktree",
+            "add",
+            &dependent_path.display().to_string(),
+            local_branch,
+        ],
+    );
+    if let Err(error) = add_result {
+        if !dependent_path.exists() {
+            let _ = fs::rename(&backup_path, dependent_path);
+        }
+        return Err(error).with_context(|| {
+            format!(
+                "creating dependent worktree {} from {}",
+                dependent_path.display(),
+                controlling_path.display()
+            )
+        });
+    }
+
+    fs::remove_dir_all(&backup_path)
+        .with_context(|| format!("removing replaced checkout {}", backup_path.display()))?;
+    Ok(true)
+}
+
+fn ensure_clean_checkout(path: &Path) -> Result<()> {
+    let status = git_output(
+        path,
+        ["status", "--porcelain=v1", "--untracked-files=all"],
+        "checking checkout cleanliness",
+    )?;
+    if !status.trim().is_empty() {
+        bail!(
+            "checkout has uncommitted or untracked changes and cannot be converted safely: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn dependent_default_branch(path: &Path) -> Result<String> {
+    if let Some(remote_head) = git_output_optional(
+        path,
+        [
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ],
+        "reading origin default branch",
+    )? && let Some(branch) = remote_head.trim().strip_prefix("origin/")
+        && !branch.is_empty()
+    {
+        return Ok(branch.to_string());
+    }
+    if let Some(branch) =
+        git_output_optional(path, ["branch", "--show-current"], "reading current branch")?
+    {
+        let branch = branch.trim();
+        if !branch.is_empty() {
+            return Ok(branch.to_string());
+        }
+    }
+    bail!(
+        "could not determine dependent checkout default branch from origin/HEAD or current branch: {}",
+        path.display()
+    )
+}
+
+fn dependent_local_branch(
+    relationship: &str,
+    dependent_locator: &Locator,
+    default_branch: &str,
+) -> String {
+    let plural = match relationship {
+        "mirror" => "mirrors",
+        _ => "forks",
+    };
+    format!(
+        "repo-manager/{plural}/{}/{}",
+        sanitize_remote_name(&dependent_locator.key()),
+        default_branch
+    )
+}
+
+fn ensure_tracking_branch(cwd: &Path, local_branch: &str, remote_branch: &str) -> Result<()> {
+    if git_ref_exists(cwd, &format!("refs/heads/{local_branch}"))? {
+        run_git_in(
+            cwd,
+            ["branch", "--set-upstream-to", remote_branch, local_branch],
+        )
+    } else {
+        run_git_in(cwd, ["branch", "--track", local_branch, remote_branch])
+    }
+}
+
+fn checkout_branch(cwd: &Path, local_branch: &str) -> Result<()> {
+    let current = git_output(cwd, ["branch", "--show-current"], "reading current branch")?;
+    if current.trim() == local_branch {
+        return Ok(());
+    }
+    run_git_in(cwd, ["checkout", local_branch])
+}
+
+fn fetch_local_dependent_refs(
+    controlling_path: &Path,
+    dependent_path: &Path,
+    dependent_remote: &str,
+) -> Result<()> {
+    let heads_refspec = format!("+refs/heads/*:refs/remotes/{dependent_remote}/*");
+    let head_refspec = format!("+HEAD:refs/remotes/{dependent_remote}/HEAD");
+    let tags_refspec =
+        format!("+refs/tags/*:refs/repo-manager/dependents/{dependent_remote}/tags/*");
+    let status = git_command(controlling_path)
+        .args(["fetch", "--no-tags"])
+        .arg(dependent_path)
+        .arg(heads_refspec)
+        .arg(head_refspec)
+        .arg(tags_refspec)
+        .status()
+        .with_context(|| {
+            format!(
+                "fetching local dependent refs from {} into {}",
+                dependent_path.display(),
+                controlling_path.display()
+            )
+        })?;
+    if !status.success() {
+        bail!("git fetch from local dependent checkout failed with status {status}");
+    }
+    Ok(())
+}
+
+fn unique_backup_path(path: &Path) -> Result<PathBuf> {
+    let parent = path.parent().context("fork path has no parent")?;
+    let leaf = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("fork path has no UTF-8 leaf name")?;
+    for index in 0..1000 {
+        let candidate = parent.join(format!(
+            ".repo-manager-replaced-{leaf}-{}-{index}",
+            std::process::id()
+        ));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    bail!("could not allocate backup path for {}", path.display())
 }
 
 fn validate_relationship_kind(kind: &str) -> Result<()> {
@@ -3108,9 +3396,7 @@ fn git_root_commits(path: &Path) -> Result<Vec<String>> {
 }
 
 fn git_lines<const N: usize>(path: &Path, args: [&str; N], action: &str) -> Result<Vec<String>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(path)
+    let output = git_command(path)
         .args(args)
         .output()
         .with_context(|| format!("{action} in {}", path.display()))?;
@@ -3210,7 +3496,11 @@ fn ensure_remote(cwd: &Path, name: &str, url: &str) -> Result<()> {
 }
 
 fn fork_remote_name(locator: &Locator) -> String {
-    format!("fork-{}", sanitize_remote_name(&locator.key()))
+    related_remote_name("fork", locator)
+}
+
+fn related_remote_name(relationship: &str, locator: &Locator) -> String {
+    format!("{}-{}", relationship, sanitize_remote_name(&locator.key()))
 }
 
 fn sanitize_remote_name(value: &str) -> String {
@@ -3271,9 +3561,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
 {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
+    let status = git_command(cwd)
         .args(args)
         .status()
         .with_context(|| format!("running git in {}", cwd.display()))?;
@@ -3281,6 +3569,68 @@ where
         bail!("git command failed with status {status}");
     }
     Ok(())
+}
+
+fn git_output<const N: usize>(cwd: &Path, args: [&str; N], action: &str) -> Result<String> {
+    let output = git_command(cwd)
+        .args(args)
+        .output()
+        .with_context(|| format!("{action} in {}", cwd.display()))?;
+    if !output.status.success() {
+        bail!("{action} failed with status {}", output.status);
+    }
+    String::from_utf8(output.stdout).with_context(|| format!("{action} output is not UTF-8"))
+}
+
+fn git_output_optional<const N: usize>(
+    cwd: &Path,
+    args: [&str; N],
+    action: &str,
+) -> Result<Option<String>> {
+    let output = git_command(cwd)
+        .args(args)
+        .output()
+        .with_context(|| format!("{action} in {}", cwd.display()))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    String::from_utf8(output.stdout)
+        .map(Some)
+        .with_context(|| format!("{action} output is not UTF-8"))
+}
+
+fn git_ref_exists(cwd: &Path, refname: &str) -> Result<bool> {
+    let status = git_command(cwd)
+        .args(["show-ref", "--verify", "--quiet", refname])
+        .status()
+        .with_context(|| format!("checking Git ref {refname} in {}", cwd.display()))?;
+    Ok(status.success())
+}
+
+fn git_command(cwd: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_PREFIX")
+        .arg("-C")
+        .arg(cwd);
+    command
+}
+
+fn git_common_dir(cwd: &Path) -> Result<PathBuf> {
+    let common_dir = git_output(
+        cwd,
+        ["rev-parse", "--git-common-dir"],
+        "reading Git common dir",
+    )?;
+    let common_dir = PathBuf::from(common_dir.trim());
+    if common_dir.is_absolute() {
+        Ok(common_dir)
+    } else {
+        Ok(cwd.join(common_dir))
+    }
 }
 
 fn github_redirect_locator(cache_root: &Path, locator: &Locator) -> Result<Option<Locator>> {
@@ -3363,9 +3713,7 @@ fn git_origin_url(cwd: &Path) -> Result<Option<String>> {
 }
 
 fn git_remotes(cwd: &Path) -> Result<Vec<GitRemote>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
+    let output = git_command(cwd)
         .args(["config", "--get-regexp", r"^remote\..*\.url$"])
         .output()
         .with_context(|| format!("reading Git remotes in {}", cwd.display()))?;
@@ -3397,9 +3745,7 @@ fn git_remotes(cwd: &Path) -> Result<Vec<GitRemote>> {
 }
 
 fn git_remote_url(cwd: &Path, name: &str) -> Result<Option<String>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
+    let output = git_command(cwd)
         .args(["config", "--get"])
         .arg(format!("remote.{name}.url"))
         .output()
@@ -3646,6 +3992,27 @@ fn output_related_resolution(output: &Output, resolution: &RelatedResolution) ->
         "resolved shared-history suggestion #{} as {}",
         resolution.id, resolution.resolution
     );
+    if let Some(shared_git_dir) = &resolution.shared_git_dir {
+        println!(
+            "{} now reuses the Git directory controlled by {}",
+            shared_git_dir.dependent_locator.key(),
+            shared_git_dir.controlling_locator.key()
+        );
+        println!(
+            "remote on controlling checkout: {} -> {}",
+            shared_git_dir.dependent_remote, shared_git_dir.dependent_url
+        );
+        println!(
+            "tracking branch: {} -> {}",
+            shared_git_dir.local_branch, shared_git_dir.remote_branch
+        );
+        if shared_git_dir.converted_to_worktree {
+            println!(
+                "converted dependent checkout to Git worktree: {}",
+                shared_git_dir.dependent_path.display()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -4807,6 +5174,236 @@ mod tests {
 
         assert_eq!(store.pending_related_count().unwrap(), 0);
         assert!(store.related_suggestions(true).unwrap().is_empty());
+    }
+
+    #[test]
+    fn resolving_related_fork_converts_first_repo_to_worktree_of_second() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let seed = dir.path().join("seed");
+        let fork_locator = Locator::parse("github.com/johnrichardrinehart/niri").unwrap();
+        let canonical_locator = Locator::parse("github.com/yalter/niri").unwrap();
+        let fork_path = locator_path(&config.clone_root, &fork_locator);
+        let canonical_path = locator_path(&config.clone_root, &canonical_locator);
+        fs::create_dir_all(&seed).unwrap();
+        run_git_in(&seed, ["init"]).unwrap();
+        run_git_in(&seed, ["checkout", "-b", "main"]).unwrap();
+        fs::write(seed.join("README.md"), "shared history\n").unwrap();
+        run_git_in(&seed, ["add", "."]).unwrap();
+        run_git_in(
+            &seed,
+            [
+                "-c",
+                "user.name=repo-manager",
+                "-c",
+                "user.email=repo-manager@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        )
+        .unwrap();
+        clone_local_repo(&seed, &fork_path);
+        clone_local_repo(&seed, &canonical_path);
+        run_git_in(
+            &fork_path,
+            [
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/johnrichardrinehart/niri.git",
+            ],
+        )
+        .unwrap();
+        run_git_in(
+            &canonical_path,
+            [
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/yalter/niri.git",
+            ],
+        )
+        .unwrap();
+        let fork_head = git_output(&fork_path, ["rev-parse", "HEAD"], "reading fork HEAD")
+            .unwrap()
+            .trim()
+            .to_string();
+        let fork_id = store.upsert_repo(&fork_locator, &fork_path, None).unwrap();
+        let canonical_id = store
+            .upsert_repo(&canonical_locator, &canonical_path, None)
+            .unwrap();
+        store
+            .record_related_history(
+                fork_id,
+                canonical_id,
+                &["shared root commit abc".to_string()],
+            )
+            .unwrap();
+        let suggestion = store.related_suggestions(true).unwrap().remove(0);
+        assert_eq!(suggestion.repo_locator, fork_locator);
+        assert_eq!(suggestion.related_locator, canonical_locator);
+
+        related_resolve(&store, &Output { json: true }, suggestion.id, "fork").unwrap();
+
+        assert_eq!(store.pending_related_count().unwrap(), 0);
+        assert_eq!(
+            git_output(&fork_path, ["rev-parse", "HEAD"], "reading fork HEAD")
+                .unwrap()
+                .trim(),
+            fork_head
+        );
+        assert_eq!(
+            git_common_dir(&fork_path).unwrap(),
+            git_common_dir(&canonical_path).unwrap()
+        );
+        assert_eq!(
+            git_output(
+                &fork_path,
+                ["branch", "--show-current"],
+                "reading fork branch"
+            )
+            .unwrap()
+            .trim(),
+            "repo-manager/forks/github.com-johnrichardrinehart-niri/main"
+        );
+        assert_eq!(
+            git_output(
+                &fork_path,
+                [
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "--symbolic-full-name",
+                    "@{upstream}"
+                ],
+                "reading fork upstream"
+            )
+            .unwrap()
+            .trim(),
+            "fork-github.com-johnrichardrinehart-niri/main"
+        );
+        assert_eq!(
+            git_remote_url(&canonical_path, "fork-github.com-johnrichardrinehart-niri").unwrap(),
+            Some("https://github.com/johnrichardrinehart/niri.git".to_string())
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM forks", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn resolving_related_mirror_reuses_second_repo_git_directory_without_fork_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let seed = dir.path().join("seed");
+        let mirror_locator = Locator::parse("example.com/mirror/project").unwrap();
+        let controlling_locator = Locator::parse("example.com/canonical/project").unwrap();
+        let mirror_path = locator_path(&config.clone_root, &mirror_locator);
+        let controlling_path = locator_path(&config.clone_root, &controlling_locator);
+        fs::create_dir_all(&seed).unwrap();
+        run_git_in(&seed, ["init"]).unwrap();
+        run_git_in(&seed, ["checkout", "-b", "main"]).unwrap();
+        fs::write(seed.join("README.md"), "shared history\n").unwrap();
+        run_git_in(&seed, ["add", "."]).unwrap();
+        run_git_in(
+            &seed,
+            [
+                "-c",
+                "user.name=repo-manager",
+                "-c",
+                "user.email=repo-manager@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        )
+        .unwrap();
+        clone_local_repo(&seed, &mirror_path);
+        clone_local_repo(&seed, &controlling_path);
+        run_git_in(
+            &mirror_path,
+            [
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.com/mirror/project.git",
+            ],
+        )
+        .unwrap();
+        run_git_in(
+            &controlling_path,
+            [
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.com/canonical/project.git",
+            ],
+        )
+        .unwrap();
+        let mirror_id = store
+            .upsert_repo(&mirror_locator, &mirror_path, None)
+            .unwrap();
+        let controlling_id = store
+            .upsert_repo(&controlling_locator, &controlling_path, None)
+            .unwrap();
+        store
+            .record_related_history(
+                mirror_id,
+                controlling_id,
+                &["shared root commit abc".to_string()],
+            )
+            .unwrap();
+        let suggestion = store.related_suggestions(true).unwrap().remove(0);
+
+        related_resolve(&store, &Output { json: true }, suggestion.id, "mirror").unwrap();
+
+        assert_eq!(store.pending_related_count().unwrap(), 0);
+        assert_eq!(
+            git_common_dir(&mirror_path).unwrap(),
+            git_common_dir(&controlling_path).unwrap()
+        );
+        assert_eq!(
+            git_output(
+                &mirror_path,
+                ["branch", "--show-current"],
+                "reading mirror branch"
+            )
+            .unwrap()
+            .trim(),
+            "repo-manager/mirrors/example.com-mirror-project/main"
+        );
+        assert_eq!(
+            git_output(
+                &mirror_path,
+                [
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "--symbolic-full-name",
+                    "@{upstream}"
+                ],
+                "reading mirror upstream"
+            )
+            .unwrap()
+            .trim(),
+            "mirror-example.com-mirror-project/main"
+        );
+        assert_eq!(
+            git_remote_url(&controlling_path, "mirror-example.com-mirror-project").unwrap(),
+            Some("https://example.com/mirror/project.git".to_string())
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM forks", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
