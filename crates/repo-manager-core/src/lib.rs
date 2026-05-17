@@ -607,6 +607,24 @@ struct RepairStalePath {
     repo_id: i64,
     locator: Locator,
     path: PathBuf,
+    status: RepairStalePathStatus,
+    reasons: Vec<String>,
+    blocking_dependents: Vec<RepairStaleDependent>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum RepairStalePathStatus {
+    NeedsPrune,
+    Pruned,
+    Blocked,
+}
+
+#[derive(Debug, Serialize)]
+struct RepairStaleDependent {
+    relationship: String,
+    locator: Locator,
+    path: PathBuf,
 }
 
 #[derive(Debug, Serialize)]
@@ -1849,6 +1867,16 @@ impl Store {
             .map_err(Into::into)
     }
 
+    fn delete_repo(&self, repo_id: i64) -> Result<()> {
+        let changed = self
+            .conn
+            .execute("DELETE FROM repos WHERE id = ?1", params![repo_id])?;
+        if changed == 0 {
+            bail!("unknown repository id: {repo_id}");
+        }
+        Ok(())
+    }
+
     fn historical_locators(&self, repo_id: i64) -> Result<Vec<Locator>> {
         let mut stmt = self.conn.prepare(
             "SELECT authority, remote_path FROM locators WHERE repo_id = ?1 ORDER BY id",
@@ -2575,20 +2603,66 @@ fn fork_repo(
 }
 
 fn repair_repos(db: &Store, output: &Output, check: bool) -> Result<()> {
+    let relationship_snapshot = db.shared_git_dir_relationships()?;
     let mut stale_paths = Vec::new();
+    let mut stale_repo_ids = HashSet::new();
     for repo in db.current_repos()? {
         if !repo.path.exists() {
+            stale_repo_ids.insert(repo.id);
+            let blocking_dependents = relationship_snapshot
+                .iter()
+                .filter(|relationship| {
+                    relationship.controlling_repo_id == repo.id
+                        && relationship.dependent_path.exists()
+                })
+                .map(|relationship| RepairStaleDependent {
+                    relationship: relationship.relationship.clone(),
+                    locator: relationship.dependent_locator.clone(),
+                    path: relationship.dependent_path.clone(),
+                })
+                .collect::<Vec<_>>();
+            let mut reasons = vec!["recorded checkout path does not exist".to_string()];
+            let status = if blocking_dependents.is_empty() {
+                if check {
+                    RepairStalePathStatus::NeedsPrune
+                } else {
+                    db.delete_repo(repo.id)?;
+                    RepairStalePathStatus::Pruned
+                }
+            } else {
+                for dependent in &blocking_dependents {
+                    reasons.push(format!(
+                        "stale checkout controls existing {} checkout {}; choose a new canonical/control repository before pruning this row",
+                        dependent.relationship,
+                        dependent.locator.key()
+                    ));
+                }
+                RepairStalePathStatus::Blocked
+            };
             stale_paths.push(RepairStalePath {
                 repo_id: repo.id,
                 locator: repo.current,
                 path: repo.path,
+                status,
+                reasons,
+                blocking_dependents,
             });
         }
     }
 
     let mut relationships = Vec::new();
     let mut skipped = Vec::new();
-    for relationship in db.shared_git_dir_relationships()? {
+    let relationship_source = if check {
+        relationship_snapshot
+    } else {
+        db.shared_git_dir_relationships()?
+    };
+    for relationship in relationship_source {
+        if stale_repo_ids.contains(&relationship.dependent_repo_id)
+            || stale_repo_ids.contains(&relationship.controlling_repo_id)
+        {
+            continue;
+        }
         if !relationship.dependent_path.exists() {
             skipped.push(RepairSkip {
                 relationship: relationship.relationship,
@@ -4300,19 +4374,59 @@ fn output_repair(output: &Output, report: &RepairReport) -> Result<()> {
         .iter()
         .filter(|relationship| matches!(relationship.status, RepairStatus::Repaired))
         .count();
+    let stale_needs_prune = report
+        .stale_paths
+        .iter()
+        .filter(|stale| matches!(stale.status, RepairStalePathStatus::NeedsPrune))
+        .count();
+    let stale_pruned = report
+        .stale_paths
+        .iter()
+        .filter(|stale| matches!(stale.status, RepairStalePathStatus::Pruned))
+        .count();
+    let stale_blocked = report
+        .stale_paths
+        .iter()
+        .filter(|stale| matches!(stale.status, RepairStalePathStatus::Blocked))
+        .count();
     println!(
         "checked {} managed relationship(s)",
         report.relationships.len() + report.skipped.len()
     );
     if report.check {
         println!("{needs_repair} relationship(s) need repair");
+        println!("{stale_needs_prune} stale path(s) need pruning");
     } else {
         println!("repaired {repaired} relationship(s)");
+        println!("pruned {stale_pruned} stale managed path(s)");
+    }
+    if stale_blocked > 0 {
+        println!("{stale_blocked} stale path(s) blocked by existing dependent checkout(s)");
     }
     if !report.stale_paths.is_empty() {
         println!("stale managed path(s): {}", report.stale_paths.len());
         for stale in &report.stale_paths {
-            println!("  {} {}", stale.locator.key(), stale.path.display());
+            let status = match stale.status {
+                RepairStalePathStatus::NeedsPrune => "needs prune",
+                RepairStalePathStatus::Pruned => "pruned",
+                RepairStalePathStatus::Blocked => "blocked",
+            };
+            println!(
+                "  {status}: {} {}",
+                stale.locator.key(),
+                stale.path.display()
+            );
+            for reason in &stale.reasons {
+                println!("    reason: {reason}");
+            }
+            for dependent in &stale.blocking_dependents {
+                println!(
+                    "    dependent: {} {} {}",
+                    dependent.relationship,
+                    dependent.locator.key(),
+                    dependent.path.display()
+                );
+            }
         }
     }
     for relationship in &report.relationships {
@@ -5848,6 +5962,93 @@ mod tests {
             .unwrap()
             .trim(),
             "fork-github.com-example-fork/main"
+        );
+    }
+
+    #[test]
+    fn repair_prunes_stale_repo_rows_without_existing_dependents() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let stale_locator = Locator::parse("github.com/example/stale").unwrap();
+        let stale_path = locator_path(&config.clone_root, &stale_locator);
+        let repo_id = store
+            .upsert_repo(&stale_locator, &stale_path, None)
+            .unwrap();
+
+        repair_repos(&store, &Output { json: true }, true).unwrap();
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM repos WHERE id = ?1",
+                    params![repo_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+
+        repair_repos(&store, &Output { json: true }, false).unwrap();
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM repos WHERE id = ?1",
+                    params![repo_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM locators WHERE repo_id = ?1",
+                    params![repo_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn repair_blocks_pruning_stale_controlling_repo_with_existing_dependent() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let fork_locator = Locator::parse("github.com/example/fork").unwrap();
+        let canonical_locator = Locator::parse("github.com/example/canonical").unwrap();
+        let fork_path = locator_path(&config.clone_root, &fork_locator);
+        let canonical_path = locator_path(&config.clone_root, &canonical_locator);
+        fs::create_dir_all(&fork_path).unwrap();
+        let fork_id = store.upsert_repo(&fork_locator, &fork_path, None).unwrap();
+        let canonical_id = store
+            .upsert_repo(&canonical_locator, &canonical_path, None)
+            .unwrap();
+        store.record_fork(fork_id, canonical_id).unwrap();
+
+        repair_repos(&store, &Output { json: true }, false).unwrap();
+
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM repos WHERE id = ?1",
+                    params![canonical_id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM forks", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
         );
     }
 
