@@ -852,6 +852,7 @@ struct ManageResult {
     action: &'static str,
     locator: Locator,
     canonical_url: String,
+    relationship: &'static str,
     path: PathBuf,
     moved_from: Option<PathBuf>,
     history_review_requested: bool,
@@ -1666,6 +1667,52 @@ struct GitRemote {
     url: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManageRelationship {
+    Canonical,
+    Fork,
+    Mirror,
+}
+
+impl ManageRelationship {
+    fn as_str(self) -> &'static str {
+        match self {
+            ManageRelationship::Canonical => "canonical",
+            ManageRelationship::Fork => "fork",
+            ManageRelationship::Mirror => "mirror",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ManageChoice {
+    checkout_url: String,
+    canonical_url: String,
+    relationship: ManageRelationship,
+    materialize_canonical: bool,
+}
+
+struct ManageRemoteRelationship<'a> {
+    checkout_locator: &'a Locator,
+    canonical_locator: &'a Locator,
+    checkout_url: &'a str,
+    canonical_url: &'a str,
+    repo_root: &'a Path,
+    remotes: &'a [GitRemote],
+    relationship: ManageRelationship,
+    materialize_canonical: bool,
+}
+
+struct SeedCanonicalPlan<'a> {
+    dependent_locator: &'a Locator,
+    dependent_path: &'a Path,
+    dependent_url: &'a str,
+    controlling_locator: &'a Locator,
+    controlling_path: &'a Path,
+    controlling_url: &'a str,
+    relationship: &'a str,
+}
+
 impl Store {
     fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -2000,6 +2047,25 @@ impl Store {
         Ok(())
     }
 
+    fn record_resolved_related(
+        &self,
+        dependent_repo_id: i64,
+        controlling_repo_id: i64,
+        resolution: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "
+            INSERT INTO related_history (repo_id, related_repo_id, shared_refs_json, resolution, resolved_at)
+            VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP)
+            ON CONFLICT(repo_id, related_repo_id) DO UPDATE SET
+              resolution = excluded.resolution,
+              resolved_at = CURRENT_TIMESTAMP
+            ",
+            params![dependent_repo_id, controlling_repo_id, "[]", resolution],
+        )?;
+        Ok(())
+    }
+
     fn pending_related_count(&self) -> Result<i64> {
         self.conn
             .query_row(
@@ -2245,18 +2311,34 @@ fn manage_repo(config: &Config, db: &Store, output: &Output, args: ManageArgs) -
     let remotes = git_remotes(&original_root)?;
     let assume_origin_as_canonical =
         args.assume_origin_as_canonical || config.assume_origin_as_canonical;
-    let canonical_url = choose_manage_canonical_url(&remotes, assume_origin_as_canonical)?;
-    let locator = Locator::parse(&canonical_url)?;
-    let (repo_root, moved_from) = move_repo_into_managed_path(config, &original_root, &locator)?;
-    record_manage_remote_relationships(db, &locator, &repo_root, &remotes)?;
+    let choice = choose_manage_choice(&remotes, assume_origin_as_canonical)?;
+    let checkout_locator = Locator::parse(&choice.checkout_url)?;
+    let canonical_locator = Locator::parse(&choice.canonical_url)?;
+    let (repo_root, moved_from) =
+        move_repo_into_managed_path(config, &original_root, &checkout_locator)?;
+    record_manage_remote_relationships(
+        config,
+        db,
+        ManageRemoteRelationship {
+            checkout_locator: &checkout_locator,
+            canonical_locator: &canonical_locator,
+            checkout_url: &choice.checkout_url,
+            canonical_url: &choice.canonical_url,
+            repo_root: &repo_root,
+            remotes: &remotes,
+            relationship: choice.relationship,
+            materialize_canonical: choice.materialize_canonical,
+        },
+    )?;
     let history_review_requested =
-        request_daemon_history_review(config, &locator, &repo_root, &canonical_url);
+        request_daemon_history_review(config, &checkout_locator, &repo_root, &choice.canonical_url);
     output_manage(
         output,
         &ManageResult {
             action: "manage",
-            locator,
-            canonical_url,
+            locator: checkout_locator,
+            canonical_url: choice.canonical_url,
+            relationship: choice.relationship.as_str(),
             path: repo_root,
             moved_from,
             history_review_requested,
@@ -2264,17 +2346,63 @@ fn manage_repo(config: &Config, db: &Store, output: &Output, args: ManageArgs) -
     )
 }
 
-fn choose_manage_canonical_url(
+fn choose_manage_choice(
     remotes: &[GitRemote],
     assume_origin_as_canonical: bool,
-) -> Result<String> {
+) -> Result<ManageChoice> {
     let origin = remotes.iter().find(|remote| remote.name == "origin");
     if let Some(origin) = origin
         && (assume_origin_as_canonical || confirm_origin_as_canonical(origin)?)
     {
-        return Ok(origin.url.clone());
+        return Ok(ManageChoice {
+            checkout_url: origin.url.clone(),
+            canonical_url: origin.url.clone(),
+            relationship: ManageRelationship::Canonical,
+            materialize_canonical: false,
+        });
     }
-    prompt_canonical_url(remotes)
+    let canonical_choice = prompt_canonical_url(remotes)?;
+    match canonical_choice {
+        CanonicalPromptAnswer::Remote(canonical_url) => {
+            let Some(origin) = origin else {
+                return Ok(ManageChoice {
+                    checkout_url: canonical_url.clone(),
+                    canonical_url,
+                    relationship: ManageRelationship::Canonical,
+                    materialize_canonical: false,
+                });
+            };
+            if canonical_url == origin.url {
+                return Ok(ManageChoice {
+                    checkout_url: origin.url.clone(),
+                    canonical_url,
+                    relationship: ManageRelationship::Canonical,
+                    materialize_canonical: false,
+                });
+            }
+            Ok(ManageChoice {
+                checkout_url: origin.url.clone(),
+                canonical_url,
+                relationship: prompt_dependent_relationship()?,
+                materialize_canonical: true,
+            })
+        }
+        CanonicalPromptAnswer::NoCanonicalRemote => {
+            let checkout_url = match origin {
+                Some(origin) => origin.url.clone(),
+                None => prompt_checkout_url(remotes)?,
+            };
+            let relationship = prompt_dependent_relationship()?;
+            let canonical_url = prompt_required_url("canonical URL (not cloned now)")?;
+            Ok(ManageChoice {
+                checkout_url,
+                canonical_url,
+                relationship,
+                materialize_canonical: false,
+            })
+        }
+        CanonicalPromptAnswer::Invalid => unreachable!("prompt returns only valid selections"),
+    }
 }
 
 fn confirm_origin_as_canonical(origin: &GitRemote) -> Result<bool> {
@@ -2290,43 +2418,129 @@ fn confirm_origin_as_canonical(origin: &GitRemote) -> Result<bool> {
     }
 }
 
-fn prompt_canonical_url(remotes: &[GitRemote]) -> Result<String> {
+fn prompt_canonical_url(remotes: &[GitRemote]) -> Result<CanonicalPromptAnswer> {
     if remotes.is_empty() {
-        return prompt_manual_canonical_url();
+        return Ok(CanonicalPromptAnswer::NoCanonicalRemote);
     }
     eprintln!("Select the canonical remote:");
     for (index, remote) in remotes.iter().enumerate() {
         eprintln!("  {}. {} {}", index + 1, remote.name, remote.url);
     }
-    eprintln!("  none. Enter a canonical URL manually");
+    eprintln!("  skip. Canonical is not configured as a remote");
+    eprintln!("  Or paste a canonical URL directly.");
 
     loop {
-        eprint!("canonical remote [1-{} or none]: ", remotes.len());
+        eprint!("canonical remote [1-{}], URL, or skip: ", remotes.len());
         io::stderr().flush().context("flushing prompt")?;
         let answer = read_prompt_line()?;
-        let answer = answer.trim();
-        if answer.eq_ignore_ascii_case("none") {
-            return prompt_manual_canonical_url();
+        match parse_canonical_prompt_answer(&answer, remotes) {
+            answer @ (CanonicalPromptAnswer::Remote(_)
+            | CanonicalPromptAnswer::NoCanonicalRemote) => {
+                return Ok(answer);
+            }
+            CanonicalPromptAnswer::Invalid => {
+                eprintln!(
+                    "enter a number from 1 to {}, a canonical URL, or skip",
+                    remotes.len()
+                );
+            }
         }
-        if let Ok(index) = answer.parse::<usize>()
-            && let Some(remote) = remotes.get(index.saturating_sub(1))
-        {
-            return Ok(remote.url.clone());
-        }
-        eprintln!("enter a number from 1 to {} or none", remotes.len());
     }
 }
 
-fn prompt_manual_canonical_url() -> Result<String> {
+#[derive(Debug, PartialEq, Eq)]
+enum CanonicalPromptAnswer {
+    Remote(String),
+    NoCanonicalRemote,
+    Invalid,
+}
+
+fn parse_canonical_prompt_answer(answer: &str, remotes: &[GitRemote]) -> CanonicalPromptAnswer {
+    let answer = answer.trim();
+    if answer.eq_ignore_ascii_case("skip") || answer.eq_ignore_ascii_case("none") {
+        return CanonicalPromptAnswer::NoCanonicalRemote;
+    }
+    if let Ok(index) = answer.parse::<usize>() {
+        if (1..=remotes.len()).contains(&index) {
+            return CanonicalPromptAnswer::Remote(remotes[index - 1].url.clone());
+        }
+        return CanonicalPromptAnswer::Invalid;
+    }
+    if !answer.is_empty() && Locator::parse(answer).is_ok() {
+        return CanonicalPromptAnswer::Remote(answer.to_string());
+    }
+    CanonicalPromptAnswer::Invalid
+}
+
+fn prompt_required_url(label: &str) -> Result<String> {
     loop {
-        eprint!("canonical URL: ");
+        eprint!("{label}: ");
         io::stderr().flush().context("flushing prompt")?;
         let answer = read_prompt_line()?;
         let url = answer.trim();
         if !url.is_empty() {
             return Ok(url.to_string());
         }
-        eprintln!("canonical URL is required");
+        eprintln!("{label} is required");
+    }
+}
+
+fn prompt_checkout_url(remotes: &[GitRemote]) -> Result<String> {
+    if remotes.is_empty() {
+        return prompt_required_url("checkout URL");
+    }
+    eprintln!("Select the remote that identifies this checkout:");
+    for (index, remote) in remotes.iter().enumerate() {
+        eprintln!("  {}. {} {}", index + 1, remote.name, remote.url);
+    }
+    eprintln!("  Or paste a checkout URL directly.");
+
+    loop {
+        eprint!("checkout remote [1-{}] or URL: ", remotes.len());
+        io::stderr().flush().context("flushing prompt")?;
+        let answer = read_prompt_line()?;
+        match parse_checkout_prompt_answer(&answer, remotes) {
+            Some(url) => return Ok(url),
+            None => eprintln!(
+                "enter a number from 1 to {} or a checkout URL",
+                remotes.len()
+            ),
+        }
+    }
+}
+
+fn parse_checkout_prompt_answer(answer: &str, remotes: &[GitRemote]) -> Option<String> {
+    let answer = answer.trim();
+    if let Ok(index) = answer.parse::<usize>()
+        && (1..=remotes.len()).contains(&index)
+    {
+        return Some(remotes[index - 1].url.clone());
+    }
+    (!answer.is_empty() && Locator::parse(answer).is_ok()).then(|| answer.to_string())
+}
+
+fn prompt_dependent_relationship() -> Result<ManageRelationship> {
+    eprintln!(
+        "This checkout is not canonical. Select its relationship to the canonical repository:"
+    );
+    eprintln!("  1. fork");
+    eprintln!("  2. mirror");
+    loop {
+        eprint!("relationship [1-2, fork, or mirror]: ");
+        io::stderr().flush().context("flushing prompt")?;
+        let answer = read_prompt_line()?;
+        match parse_dependent_relationship_answer(&answer) {
+            Some(relationship) => return Ok(relationship),
+            None => eprintln!("enter fork or mirror"),
+        }
+    }
+}
+
+fn parse_dependent_relationship_answer(answer: &str) -> Option<ManageRelationship> {
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "1" | "f" | "fork" => Some(ManageRelationship::Fork),
+        "2" | "m" | "mirror" => Some(ManageRelationship::Mirror),
+        _ => None,
     }
 }
 
@@ -2342,13 +2556,66 @@ fn read_prompt_line() -> Result<String> {
 }
 
 fn record_manage_remote_relationships(
+    config: &Config,
     db: &Store,
-    canonical_locator: &Locator,
-    repo_root: &Path,
-    remotes: &[GitRemote],
+    plan: ManageRemoteRelationship<'_>,
 ) -> Result<()> {
-    let canonical_id = db.upsert_repo(canonical_locator, repo_root, None)?;
-    for remote in remotes {
+    if plan.relationship != ManageRelationship::Canonical {
+        if plan.materialize_canonical {
+            let canonical_path = locator_path(&config.clone_root, plan.canonical_locator);
+            if !canonical_path.exists() {
+                return seed_canonical_from_dependent_checkout(
+                    db,
+                    SeedCanonicalPlan {
+                        dependent_locator: plan.checkout_locator,
+                        dependent_path: plan.repo_root,
+                        dependent_url: plan.checkout_url,
+                        controlling_locator: plan.canonical_locator,
+                        controlling_path: &canonical_path,
+                        controlling_url: plan.canonical_url,
+                        relationship: plan.relationship.as_str(),
+                    },
+                )
+                .map(|_| ());
+            }
+            ensure_remote(&canonical_path, "origin", plan.canonical_url)?;
+            materialize_related_shared_git_dir(
+                db,
+                plan.checkout_locator,
+                plan.repo_root,
+                plan.canonical_locator,
+                &canonical_path,
+                plan.relationship.as_str(),
+            )?;
+            return Ok(());
+        }
+
+        ensure_deferred_dependent_remotes(
+            plan.repo_root,
+            plan.checkout_locator,
+            plan.checkout_url,
+            plan.canonical_url,
+            plan.relationship,
+        )?;
+        let canonical_path = locator_path(&config.clone_root, plan.canonical_locator);
+        let canonical_id = db.upsert_repo(plan.canonical_locator, &canonical_path, None)?;
+        let checkout_id = db.upsert_repo(
+            plan.checkout_locator,
+            plan.repo_root,
+            Some(&plan.canonical_locator.key()),
+        )?;
+        match plan.relationship {
+            ManageRelationship::Fork => db.record_fork(checkout_id, canonical_id)?,
+            ManageRelationship::Mirror => {
+                db.record_resolved_related(checkout_id, canonical_id, "mirror")?;
+            }
+            ManageRelationship::Canonical => unreachable!("handled above"),
+        }
+        return Ok(());
+    }
+
+    let canonical_id = db.upsert_repo(plan.canonical_locator, plan.repo_root, None)?;
+    for remote in plan.remotes {
         let Ok(remote_locator) = Locator::parse(&remote.url) else {
             debug!(
                 "skipping non-locator-compatible remote {}: {}",
@@ -2356,12 +2623,272 @@ fn record_manage_remote_relationships(
             );
             continue;
         };
-        if remote_locator == *canonical_locator {
+        if remote_locator == *plan.canonical_locator {
             continue;
         }
-        let remote_id =
-            db.upsert_repo(&remote_locator, repo_root, Some(&canonical_locator.key()))?;
+        let remote_id = db.upsert_repo(
+            &remote_locator,
+            plan.repo_root,
+            Some(&plan.canonical_locator.key()),
+        )?;
         db.record_fork(remote_id, canonical_id)?;
+    }
+    Ok(())
+}
+
+fn seed_canonical_from_dependent_checkout(
+    db: &Store,
+    plan: SeedCanonicalPlan<'_>,
+) -> Result<SharedGitDirResolution> {
+    if plan.controlling_path.exists() {
+        bail!(
+            "controlling checkout already exists: {}",
+            plan.controlling_path.display()
+        );
+    }
+    if !plan.dependent_path.exists() {
+        bail!(
+            "dependent checkout does not exist: {}",
+            plan.dependent_path.display()
+        );
+    }
+
+    let dependent_remote = related_remote_name(plan.relationship, plan.dependent_locator);
+    let default_branch = dependent_default_branch(plan.dependent_path)?;
+    let local_branch =
+        dependent_local_branch(plan.relationship, plan.dependent_locator, &default_branch);
+    let remote_branch = format!("{dependent_remote}/{default_branch}");
+
+    fs::create_dir_all(
+        plan.controlling_path
+            .parent()
+            .context("controlling repository path has no parent")?,
+    )
+    .with_context(|| {
+        format!(
+            "creating controlling repository parent for {}",
+            plan.controlling_path.display()
+        )
+    })?;
+    fs::rename(plan.dependent_path, plan.controlling_path).with_context(|| {
+        format!(
+            "moving seed checkout {} to controlling path {}",
+            plan.dependent_path.display(),
+            plan.controlling_path.display()
+        )
+    })?;
+
+    let seed_result = (|| -> Result<SharedGitDirResolution> {
+        ensure_seed_controlling_remotes(
+            plan.controlling_path,
+            &dependent_remote,
+            plan.dependent_url,
+            plan.controlling_url,
+        )?;
+        ensure_tracking_branch(plan.controlling_path, &local_branch, &remote_branch)?;
+        run_git_in(
+            plan.controlling_path,
+            [
+                "worktree",
+                "add",
+                &plan.dependent_path.display().to_string(),
+                &local_branch,
+            ],
+        )?;
+        restore_dependent_worktree_state(plan.controlling_path, plan.dependent_path)?;
+        checkout_controlling_default_branch(plan.controlling_path, &default_branch)?;
+
+        let controlling_id =
+            db.upsert_repo(plan.controlling_locator, plan.controlling_path, None)?;
+        let dependent_id = db.upsert_repo(
+            plan.dependent_locator,
+            plan.dependent_path,
+            Some(&plan.controlling_locator.key()),
+        )?;
+        if plan.relationship == "fork" {
+            db.record_fork(dependent_id, controlling_id)?;
+        } else {
+            db.record_resolved_related(dependent_id, controlling_id, plan.relationship)?;
+        }
+
+        Ok(SharedGitDirResolution {
+            dependent_locator: plan.dependent_locator.clone(),
+            controlling_locator: plan.controlling_locator.clone(),
+            dependent_path: plan.dependent_path.to_path_buf(),
+            controlling_path: plan.controlling_path.to_path_buf(),
+            dependent_remote,
+            dependent_url: plan.dependent_url.to_string(),
+            local_branch,
+            remote_branch,
+            converted_to_worktree: true,
+        })
+    })();
+
+    match seed_result {
+        Ok(resolution) => Ok(resolution),
+        Err(error) => {
+            if !plan.dependent_path.exists() && plan.controlling_path.exists() {
+                let _ = fs::rename(plan.controlling_path, plan.dependent_path);
+            }
+            Err(error)
+        }
+    }
+}
+
+fn ensure_seed_controlling_remotes(
+    controlling_path: &Path,
+    dependent_remote: &str,
+    dependent_url: &str,
+    controlling_url: &str,
+) -> Result<()> {
+    if git_remote_url(controlling_path, dependent_remote)?.is_none()
+        && git_remote_url(controlling_path, "origin")?.is_some()
+    {
+        run_git_in(
+            controlling_path,
+            ["remote", "rename", "origin", dependent_remote],
+        )?;
+    }
+    ensure_remote(controlling_path, dependent_remote, dependent_url)?;
+    ensure_remote(controlling_path, "origin", controlling_url)?;
+    run_git_in(controlling_path, ["fetch", "origin"])?;
+    let _ = run_git_in(controlling_path, ["remote", "set-head", "origin", "-a"]);
+    let _ = run_git_in(controlling_path, ["fetch", dependent_remote]);
+    let _ = run_git_in(
+        controlling_path,
+        ["remote", "set-head", dependent_remote, "-a"],
+    );
+    Ok(())
+}
+
+fn restore_dependent_worktree_state(seed_path: &Path, dependent_path: &Path) -> Result<()> {
+    clear_worktree_contents(dependent_path)?;
+    copy_worktree_contents(seed_path, dependent_path)?;
+    let seed_index = git_dir(seed_path)?.join("index");
+    if seed_index.exists() {
+        let dependent_index = git_dir(dependent_path)?.join("index");
+        fs::copy(&seed_index, &dependent_index).with_context(|| {
+            format!(
+                "copying index {} to {}",
+                seed_index.display(),
+                dependent_index.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn checkout_controlling_default_branch(
+    controlling_path: &Path,
+    fallback_branch: &str,
+) -> Result<()> {
+    let default_branch = remote_default_branch(controlling_path, "origin")?
+        .unwrap_or_else(|| fallback_branch.to_string());
+    let remote_branch = format!("origin/{default_branch}");
+    run_git_in(
+        controlling_path,
+        ["checkout", "-B", &default_branch, &remote_branch],
+    )?;
+    run_git_in(
+        controlling_path,
+        [
+            "branch",
+            "--set-upstream-to",
+            &remote_branch,
+            &default_branch,
+        ],
+    )?;
+    run_git_in(controlling_path, ["reset", "--hard"])?;
+    run_git_in(controlling_path, ["clean", "-fdx"])?;
+    Ok(())
+}
+
+fn clear_worktree_contents(path: &Path) -> Result<()> {
+    for entry in fs::read_dir(path).with_context(|| format!("reading {}", path.display()))? {
+        let entry = entry?;
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        let entry_path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() && !file_type.is_symlink() {
+            fs::remove_dir_all(&entry_path)
+                .with_context(|| format!("removing {}", entry_path.display()))?;
+        } else {
+            fs::remove_file(&entry_path)
+                .with_context(|| format!("removing {}", entry_path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_worktree_contents(from: &Path, to: &Path) -> Result<()> {
+    for entry in fs::read_dir(from).with_context(|| format!("reading {}", from.display()))? {
+        let entry = entry?;
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        copy_path(&entry.path(), &to.join(entry.file_name()))?;
+    }
+    Ok(())
+}
+
+fn copy_path(from: &Path, to: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(from)
+        .with_context(|| format!("reading metadata for {}", from.display()))?;
+    if metadata.file_type().is_symlink() {
+        let target =
+            fs::read_link(from).with_context(|| format!("reading symlink {}", from.display()))?;
+        symlink_any(&target, to)?;
+    } else if metadata.is_dir() {
+        fs::create_dir_all(to).with_context(|| format!("creating {}", to.display()))?;
+        for entry in fs::read_dir(from).with_context(|| format!("reading {}", from.display()))? {
+            let entry = entry?;
+            copy_path(&entry.path(), &to.join(entry.file_name()))?;
+        }
+    } else {
+        if let Some(parent) = to.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        fs::copy(from, to)
+            .with_context(|| format!("copying {} to {}", from.display(), to.display()))?;
+        fs::set_permissions(to, metadata.permissions())
+            .with_context(|| format!("copying permissions to {}", to.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn symlink_any(target: &Path, link: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(target, link)
+        .with_context(|| format!("symlinking {} -> {}", link.display(), target.display()))
+}
+
+#[cfg(windows)]
+fn symlink_any(target: &Path, link: &Path) -> Result<()> {
+    if target.is_dir() {
+        std::os::windows::fs::symlink_dir(target, link)
+    } else {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+    .with_context(|| format!("symlinking {} -> {}", link.display(), target.display()))
+}
+
+fn ensure_deferred_dependent_remotes(
+    repo_root: &Path,
+    checkout_locator: &Locator,
+    checkout_url: &str,
+    canonical_url: &str,
+    relationship: ManageRelationship,
+) -> Result<()> {
+    ensure_remote(repo_root, "canonical", canonical_url)?;
+    ensure_remote(
+        repo_root,
+        &related_remote_name(relationship.as_str(), checkout_locator),
+        checkout_url,
+    )?;
+    if git_remote_url(repo_root, "origin")?.is_none() {
+        ensure_remote(repo_root, "origin", checkout_url)?;
     }
     Ok(())
 }
@@ -4088,6 +4615,16 @@ fn git_command(cwd: &Path) -> Command {
     command
 }
 
+fn git_dir(cwd: &Path) -> Result<PathBuf> {
+    let git_dir = git_output(cwd, ["rev-parse", "--git-dir"], "reading Git dir")?;
+    let path = PathBuf::from(git_dir.trim());
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(cwd.join(path))
+    }
+}
+
 fn git_common_dir(cwd: &Path) -> Result<PathBuf> {
     let common_dir = git_output(
         cwd,
@@ -4640,6 +5177,75 @@ mod tests {
     }
 
     #[test]
+    fn canonical_prompt_accepts_direct_url_or_number() {
+        let remotes = vec![GitRemote {
+            name: "origin".to_string(),
+            url: "https://github.com/johnrichardrinehart/neovim".to_string(),
+        }];
+
+        assert_eq!(
+            parse_canonical_prompt_answer("1", &remotes),
+            CanonicalPromptAnswer::Remote(
+                "https://github.com/johnrichardrinehart/neovim".to_string()
+            )
+        );
+        assert_eq!(
+            parse_canonical_prompt_answer("https://github.com/neovim/neovim", &remotes),
+            CanonicalPromptAnswer::Remote("https://github.com/neovim/neovim".to_string())
+        );
+        assert_eq!(
+            parse_canonical_prompt_answer("git@github.com:neovim/neovim.git", &remotes),
+            CanonicalPromptAnswer::Remote("git@github.com:neovim/neovim.git".to_string())
+        );
+    }
+
+    #[test]
+    fn canonical_prompt_rejects_zero_and_unknown_text() {
+        let remotes = vec![GitRemote {
+            name: "origin".to_string(),
+            url: "https://github.com/johnrichardrinehart/neovim".to_string(),
+        }];
+
+        assert_eq!(
+            parse_canonical_prompt_answer("0", &remotes),
+            CanonicalPromptAnswer::Invalid
+        );
+        assert_eq!(
+            parse_canonical_prompt_answer("origin", &remotes),
+            CanonicalPromptAnswer::Invalid
+        );
+        assert_eq!(
+            parse_canonical_prompt_answer("skip", &remotes),
+            CanonicalPromptAnswer::NoCanonicalRemote
+        );
+        assert_eq!(
+            parse_canonical_prompt_answer("none", &remotes),
+            CanonicalPromptAnswer::NoCanonicalRemote
+        );
+    }
+
+    #[test]
+    fn dependent_relationship_prompt_accepts_fork_and_mirror_aliases() {
+        assert_eq!(
+            parse_dependent_relationship_answer("fork"),
+            Some(ManageRelationship::Fork)
+        );
+        assert_eq!(
+            parse_dependent_relationship_answer("1"),
+            Some(ManageRelationship::Fork)
+        );
+        assert_eq!(
+            parse_dependent_relationship_answer("mirror"),
+            Some(ManageRelationship::Mirror)
+        );
+        assert_eq!(
+            parse_dependent_relationship_answer("2"),
+            Some(ManageRelationship::Mirror)
+        );
+        assert_eq!(parse_dependent_relationship_answer("canonical"), None);
+    }
+
+    #[test]
     fn repod_help_keeps_daemon_controls() {
         let help = RepodCli::command().render_help().to_string();
 
@@ -4939,6 +5545,243 @@ mod tests {
 
         assert!(managed_path.exists());
         assert!(store.find_repo("example.com/right").unwrap().is_some());
+    }
+
+    #[test]
+    fn manage_records_unmaterialized_canonical_for_dependent_fork() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let fork_locator = Locator::parse("github.com/johnrichardrinehart/neovim").unwrap();
+        let canonical_locator = Locator::parse("github.com/neovim/neovim").unwrap();
+        let fork_path = locator_path(&config.clone_root, &fork_locator);
+        let canonical_path = locator_path(&config.clone_root, &canonical_locator);
+        fs::create_dir_all(&fork_path).unwrap();
+        run_git_in(&fork_path, ["init"]).unwrap();
+
+        record_manage_remote_relationships(
+            &config,
+            &store,
+            ManageRemoteRelationship {
+                checkout_locator: &fork_locator,
+                canonical_locator: &canonical_locator,
+                checkout_url: "https://github.com/johnrichardrinehart/neovim",
+                canonical_url: "https://github.com/neovim/neovim",
+                repo_root: &fork_path,
+                remotes: &[],
+                relationship: ManageRelationship::Fork,
+                materialize_canonical: false,
+            },
+        )
+        .unwrap();
+
+        let fork = store
+            .find_repo("github.com/johnrichardrinehart/neovim")
+            .unwrap()
+            .unwrap();
+        let canonical = store
+            .find_repo("github.com/neovim/neovim")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT current_path FROM repos WHERE id = ?1",
+                    params![fork.id],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            fork_path.display().to_string()
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT current_path FROM repos WHERE id = ?1",
+                    params![canonical.id],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            canonical_path.display().to_string()
+        );
+        assert!(!canonical_path.exists());
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM forks", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn manage_records_unmaterialized_canonical_for_dependent_mirror() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let mirror_locator = Locator::parse("github.com/example/mirror").unwrap();
+        let canonical_locator = Locator::parse("github.com/example/canonical").unwrap();
+        let mirror_path = locator_path(&config.clone_root, &mirror_locator);
+        let canonical_path = locator_path(&config.clone_root, &canonical_locator);
+        fs::create_dir_all(&mirror_path).unwrap();
+        run_git_in(&mirror_path, ["init"]).unwrap();
+
+        record_manage_remote_relationships(
+            &config,
+            &store,
+            ManageRemoteRelationship {
+                checkout_locator: &mirror_locator,
+                canonical_locator: &canonical_locator,
+                checkout_url: "https://github.com/example/mirror",
+                canonical_url: "https://github.com/example/canonical",
+                repo_root: &mirror_path,
+                remotes: &[],
+                relationship: ManageRelationship::Mirror,
+                materialize_canonical: false,
+            },
+        )
+        .unwrap();
+
+        let relationships = store.shared_git_dir_relationships().unwrap();
+        assert_eq!(relationships.len(), 1);
+        assert_eq!(relationships[0].relationship, "mirror");
+        assert_eq!(relationships[0].dependent_locator, mirror_locator);
+        assert_eq!(relationships[0].controlling_locator, canonical_locator);
+        assert_eq!(relationships[0].dependent_path, mirror_path);
+        assert_eq!(relationships[0].controlling_path, canonical_path);
+        assert!(!canonical_path.exists());
+    }
+
+    #[test]
+    fn manage_seeds_missing_canonical_from_dirty_dependent_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let canonical_seed = dir.path().join("canonical-seed");
+        let fork_seed = dir.path().join("fork-seed");
+        fs::create_dir_all(&canonical_seed).unwrap();
+        run_git_in(&canonical_seed, ["init"]).unwrap();
+        run_git_in(&canonical_seed, ["checkout", "-b", "main"]).unwrap();
+        fs::write(canonical_seed.join("README.md"), "canonical\n").unwrap();
+        run_git_in(&canonical_seed, ["add", "."]).unwrap();
+        run_git_in(
+            &canonical_seed,
+            [
+                "-c",
+                "user.name=repo-manager",
+                "-c",
+                "user.email=repo-manager@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        )
+        .unwrap();
+        clone_local_repo(&canonical_seed, &fork_seed);
+        fs::write(fork_seed.join("fork.txt"), "fork\n").unwrap();
+        run_git_in(&fork_seed, ["add", "."]).unwrap();
+        run_git_in(
+            &fork_seed,
+            [
+                "-c",
+                "user.name=repo-manager",
+                "-c",
+                "user.email=repo-manager@example.com",
+                "commit",
+                "-m",
+                "fork",
+            ],
+        )
+        .unwrap();
+
+        let fork_locator = Locator::parse("localhost/tmp/fork-seed").unwrap();
+        let canonical_locator = Locator::parse("localhost/tmp/canonical-seed").unwrap();
+        let fork_path = locator_path(&config.clone_root, &fork_locator);
+        let canonical_path = locator_path(&config.clone_root, &canonical_locator);
+        clone_local_repo(&fork_seed, &fork_path);
+        fs::write(fork_path.join("README.md"), "dirty worktree\n").unwrap();
+        fs::write(fork_path.join("staged.txt"), "staged\n").unwrap();
+        run_git_in(&fork_path, ["add", "staged.txt"]).unwrap();
+        fs::write(fork_path.join("untracked.txt"), "untracked\n").unwrap();
+        fs::write(fork_path.join(".gitignore"), "ignored.txt\n").unwrap();
+        fs::write(fork_path.join("ignored.txt"), "ignored\n").unwrap();
+        run_git_in(&fork_path, ["tag", "local-only"]).unwrap();
+
+        let fork_url = format!("file://localhost{}", fork_seed.display());
+        let canonical_url = format!("file://localhost{}", canonical_seed.display());
+        let resolution = seed_canonical_from_dependent_checkout(
+            &store,
+            SeedCanonicalPlan {
+                dependent_locator: &fork_locator,
+                dependent_path: &fork_path,
+                dependent_url: &fork_url,
+                controlling_locator: &canonical_locator,
+                controlling_path: &canonical_path,
+                controlling_url: &canonical_url,
+                relationship: "fork",
+            },
+        )
+        .unwrap();
+
+        assert!(resolution.converted_to_worktree);
+        assert_eq!(
+            git_common_dir(&fork_path).unwrap(),
+            git_common_dir(&canonical_path).unwrap()
+        );
+        assert_eq!(
+            git_remote_url(&fork_path, "origin").unwrap(),
+            Some(canonical_url)
+        );
+        assert_eq!(
+            git_remote_url(&fork_path, "fork-localhost-tmp-fork-seed").unwrap(),
+            Some(fork_url)
+        );
+        assert_eq!(
+            fs::read_to_string(fork_path.join("README.md")).unwrap(),
+            "dirty worktree\n"
+        );
+        assert_eq!(
+            fs::read_to_string(fork_path.join("untracked.txt")).unwrap(),
+            "untracked\n"
+        );
+        assert_eq!(
+            fs::read_to_string(fork_path.join("ignored.txt")).unwrap(),
+            "ignored\n"
+        );
+        let status = git_output(
+            &fork_path,
+            ["status", "--porcelain=v1", "--ignored"],
+            "reading fork status",
+        )
+        .unwrap();
+        assert!(status.lines().any(|line| line == " M README.md"));
+        assert!(status.lines().any(|line| line == "A  staged.txt"));
+        assert!(status.lines().any(|line| line == "?? untracked.txt"));
+        assert!(status.lines().any(|line| line == "!! ignored.txt"));
+        assert!(
+            git_output(
+                &canonical_path,
+                ["show-ref", "--tags", "local-only"],
+                "reading local tag",
+            )
+            .unwrap()
+            .contains("refs/tags/local-only")
+        );
+        assert!(
+            git_output(
+                &canonical_path,
+                ["status", "--porcelain=v1"],
+                "reading canonical status",
+            )
+            .unwrap()
+            .trim()
+            .is_empty()
+        );
+        assert_eq!(
+            fs::read_to_string(canonical_path.join("README.md")).unwrap(),
+            "canonical\n"
+        );
     }
 
     #[test]
