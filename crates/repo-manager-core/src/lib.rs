@@ -226,7 +226,7 @@ enum RepositoryOperationCommands {
     Fork(ForkArgs),
     #[command(
         about = "Repair managed repository filesystem structure",
-        long_about = "Repair managed repository filesystem structure from repo-manager metadata.\n\nThis verifies managed paths and rematerializes fork/mirror relationships so dependent checkouts reuse the controlling repository's Git directory as worktrees. Use --check to report drift without changing repositories or metadata."
+        long_about = "Repair managed repository filesystem structure from repo-manager metadata.\n\nThis verifies managed paths and rematerializes fork/mirror relationships so fork and mirror checkouts reuse the canonical repository's Git directory as worktrees. Use --check to report drift without changing repositories or metadata."
     )]
     Repair(RepairArgs),
     #[command(about = "Manage development worktrees under the managed dev-worktree root")]
@@ -500,7 +500,7 @@ enum RelatedSubcommand {
     List,
     #[command(
         about = "Resolve a shared-history suggestion",
-        long_about = "Resolve a shared-history suggestion with an explicit relationship.\n\nKinds: mirror, fork, canonical, moved, successor, unrelated.\n\nFor fork and mirror, the first repository shown by `repo related list` is treated as the dependent checkout and the second repository is treated as the checkout that controls the shared Git directory. The dependent checkout is converted into a Git worktree of the controlling checkout when possible."
+        long_about = "Resolve a shared-history suggestion with an explicit relationship.\n\nKinds: mirror, fork, canonical, moved, successor, unrelated.\n\nFor fork and mirror, the first repository shown by `repo related list` is treated as the fork or mirror checkout and the second repository is treated as the canonical checkout. The fork or mirror checkout is converted into a Git worktree of the canonical checkout when possible."
     )]
     Resolve(RelatedResolveArgs),
 }
@@ -609,6 +609,7 @@ struct RepairStalePath {
     path: PathBuf,
     status: RepairStalePathStatus,
     reasons: Vec<String>,
+    #[serde(rename = "blocking_checkouts")]
     blocking_dependents: Vec<RepairStaleDependent>,
 }
 
@@ -630,9 +631,13 @@ struct RepairStaleDependent {
 #[derive(Debug, Serialize)]
 struct RepairRelationship {
     relationship: String,
+    #[serde(rename = "checkout_locator")]
     dependent_locator: Locator,
+    #[serde(rename = "canonical_locator")]
     controlling_locator: Locator,
+    #[serde(rename = "checkout_path")]
     dependent_path: PathBuf,
+    #[serde(rename = "canonical_path")]
     controlling_path: PathBuf,
     status: RepairStatus,
     reasons: Vec<String>,
@@ -651,7 +656,9 @@ enum RepairStatus {
 #[derive(Debug, Serialize)]
 struct RepairSkip {
     relationship: String,
+    #[serde(rename = "checkout_locator")]
     dependent_locator: Locator,
+    #[serde(rename = "canonical_locator")]
     controlling_locator: Locator,
     reason: String,
 }
@@ -948,11 +955,17 @@ struct RelatedResolution {
 
 #[derive(Debug, Clone, Serialize)]
 struct SharedGitDirResolution {
+    #[serde(rename = "checkout_locator")]
     dependent_locator: Locator,
+    #[serde(rename = "canonical_locator")]
     controlling_locator: Locator,
+    #[serde(rename = "checkout_path")]
     dependent_path: PathBuf,
+    #[serde(rename = "canonical_path")]
     controlling_path: PathBuf,
+    #[serde(rename = "relationship_remote")]
     dependent_remote: String,
+    #[serde(rename = "relationship_url")]
     dependent_url: String,
     local_branch: String,
     remote_branch: String,
@@ -2642,13 +2655,14 @@ fn seed_canonical_from_dependent_checkout(
 ) -> Result<SharedGitDirResolution> {
     if plan.controlling_path.exists() {
         bail!(
-            "controlling checkout already exists: {}",
+            "canonical checkout already exists: {}",
             plan.controlling_path.display()
         );
     }
     if !plan.dependent_path.exists() {
         bail!(
-            "dependent checkout does not exist: {}",
+            "{} checkout does not exist: {}",
+            plan.relationship,
             plan.dependent_path.display()
         );
     }
@@ -2662,17 +2676,17 @@ fn seed_canonical_from_dependent_checkout(
     fs::create_dir_all(
         plan.controlling_path
             .parent()
-            .context("controlling repository path has no parent")?,
+            .context("canonical repository path has no parent")?,
     )
     .with_context(|| {
         format!(
-            "creating controlling repository parent for {}",
+            "creating canonical repository parent for {}",
             plan.controlling_path.display()
         )
     })?;
     fs::rename(plan.dependent_path, plan.controlling_path).with_context(|| {
         format!(
-            "moving seed checkout {} to controlling path {}",
+            "moving seed checkout {} to canonical path {}",
             plan.dependent_path.display(),
             plan.controlling_path.display()
         )
@@ -3159,7 +3173,7 @@ fn repair_repos(db: &Store, output: &Output, check: bool) -> Result<()> {
             } else {
                 for dependent in &blocking_dependents {
                     reasons.push(format!(
-                        "stale checkout controls existing {} checkout {}; choose a new canonical/control repository before pruning this row",
+                        "stale checkout is canonical for existing {} checkout {}; choose a new canonical before pruning this row",
                         dependent.relationship,
                         dependent.locator.key()
                     ));
@@ -3191,14 +3205,16 @@ fn repair_repos(db: &Store, output: &Output, check: bool) -> Result<()> {
             continue;
         }
         if !relationship.dependent_path.exists() {
+            let reason = format!(
+                "{} checkout does not exist: {}",
+                relationship.relationship,
+                relationship.dependent_path.display()
+            );
             skipped.push(RepairSkip {
                 relationship: relationship.relationship,
                 dependent_locator: relationship.dependent_locator,
                 controlling_locator: relationship.controlling_locator,
-                reason: format!(
-                    "dependent checkout does not exist: {}",
-                    relationship.dependent_path.display()
-                ),
+                reason,
             });
             continue;
         }
@@ -3208,7 +3224,7 @@ fn repair_repos(db: &Store, output: &Output, check: bool) -> Result<()> {
                 dependent_locator: relationship.dependent_locator,
                 controlling_locator: relationship.controlling_locator,
                 reason: format!(
-                    "controlling checkout does not exist: {}",
+                    "canonical checkout does not exist: {}",
                     relationship.controlling_path.display()
                 ),
             });
@@ -3311,10 +3327,12 @@ fn shared_git_dir_relationship_repair_reasons(
     if current_dependent_remote.as_deref() != Some(dependent_url.as_str()) {
         reasons.push(match current_dependent_remote {
             Some(current) => format!(
-                "controlling checkout remote `{dependent_remote}` points at {current}, expected {dependent_url}"
+                "canonical checkout remote for {} `{dependent_remote}` points at {current}, expected {dependent_url}",
+                relationship.relationship
             ),
             None => format!(
-                "controlling checkout is missing dependent remote `{dependent_remote}` -> {dependent_url}"
+                "canonical checkout is missing {} remote `{dependent_remote}` -> {dependent_url}",
+                relationship.relationship
             ),
         });
     }
@@ -3322,7 +3340,9 @@ fn shared_git_dir_relationship_repair_reasons(
     let controlling_common_dir = git_common_dir(&relationship.controlling_path)?;
     if dependent_common_dir != controlling_common_dir {
         reasons.push(format!(
-            "dependent checkout uses Git directory {}, controlling checkout uses {}",
+            "{} does not use canonical Git directory; {} uses {}, canonical uses {}",
+            relationship.relationship,
+            relationship.relationship,
             dependent_common_dir.display(),
             controlling_common_dir.display()
         ));
@@ -3338,17 +3358,20 @@ fn shared_git_dir_relationship_repair_reasons(
         &default_branch,
     );
     let remote_branch = format!("{dependent_remote}/{default_branch}");
+    let branch_action = format!("reading {} current branch", relationship.relationship);
     let current_branch = git_output(
         &relationship.dependent_path,
         ["branch", "--show-current"],
-        "reading dependent current branch",
+        &branch_action,
     )?;
     if current_branch.trim() != local_branch {
         reasons.push(format!(
-            "dependent checkout is on branch `{}`, expected `{local_branch}`",
+            "{} checkout is on branch `{}`, expected `{local_branch}`",
+            relationship.relationship,
             current_branch.trim()
         ));
     }
+    let upstream_action = format!("reading {} upstream", relationship.relationship);
     let upstream = git_output_optional(
         &relationship.dependent_path,
         [
@@ -3357,15 +3380,19 @@ fn shared_git_dir_relationship_repair_reasons(
             "--symbolic-full-name",
             "@{upstream}",
         ],
-        "reading dependent upstream",
+        &upstream_action,
     )?;
     if upstream.as_deref().map(str::trim) != Some(remote_branch.as_str()) {
         reasons.push(match upstream {
             Some(upstream) => format!(
-                "dependent branch upstream is `{}`, expected `{remote_branch}`",
+                "{} branch upstream is `{}`, expected `{remote_branch}`",
+                relationship.relationship,
                 upstream.trim()
             ),
-            None => format!("dependent branch has no upstream, expected `{remote_branch}`"),
+            None => format!(
+                "{} branch has no upstream, expected `{remote_branch}`",
+                relationship.relationship
+            ),
         });
     }
     Ok(reasons)
@@ -3602,13 +3629,13 @@ fn materialize_related_shared_git_dir(
 ) -> Result<SharedGitDirResolution> {
     if !dependent_path.exists() {
         bail!(
-            "dependent checkout does not exist: {}",
+            "{relationship} checkout does not exist: {}",
             dependent_path.display()
         );
     }
     if !controlling_path.exists() {
         bail!(
-            "controlling checkout does not exist: {}",
+            "canonical checkout does not exist: {}",
             controlling_path.display()
         );
     }
@@ -3681,7 +3708,7 @@ fn convert_checkout_to_worktree(
     let backup_path = unique_backup_path(dependent_path)?;
     fs::rename(dependent_path, &backup_path).with_context(|| {
         format!(
-            "moving existing dependent checkout {} to {}",
+            "moving existing managed checkout {} to {}",
             dependent_path.display(),
             backup_path.display()
         )
@@ -3702,7 +3729,7 @@ fn convert_checkout_to_worktree(
         }
         return Err(error).with_context(|| {
             format!(
-                "creating dependent worktree {} from {}",
+                "creating managed worktree {} from canonical checkout {}",
                 dependent_path.display(),
                 controlling_path.display()
             )
@@ -3753,7 +3780,7 @@ fn dependent_default_branch(path: &Path) -> Result<String> {
         }
     }
     bail!(
-        "could not determine dependent checkout default branch from origin/HEAD or current branch: {}",
+        "could not determine managed checkout default branch from origin/HEAD or current branch: {}",
         path.display()
     )
 }
@@ -3769,7 +3796,7 @@ fn shared_dependent_default_branch(
     let current = git_output(
         dependent_path,
         ["branch", "--show-current"],
-        "reading dependent current branch",
+        "reading managed current branch",
     )?;
     current
         .trim()
@@ -3779,7 +3806,7 @@ fn shared_dependent_default_branch(
         .map(str::to_string)
         .ok_or_else(|| {
             anyhow!(
-                "could not determine dependent default branch for {}",
+                "could not determine managed default branch for {}",
                 dependent_path.display()
             )
         })
@@ -3790,7 +3817,7 @@ fn remote_default_branch(cwd: &Path, remote: &str) -> Result<Option<String>> {
     let Some(remote_head) = git_output_optional(
         cwd,
         ["symbolic-ref", "--quiet", "--short", &remote_head_ref],
-        "reading dependent remote default branch",
+        "reading managed remote default branch",
     )?
     else {
         return Ok(None);
@@ -3861,13 +3888,13 @@ fn fetch_local_dependent_refs(
         .status()
         .with_context(|| {
             format!(
-                "fetching local dependent refs from {} into {}",
+                "fetching local managed-checkout refs from {} into {}",
                 dependent_path.display(),
                 controlling_path.display()
             )
         })?;
     if !status.success() {
-        bail!("git fetch from local dependent checkout failed with status {status}");
+        bail!("git fetch from local managed checkout failed with status {status}");
     }
     Ok(())
 }
@@ -4955,7 +4982,7 @@ fn output_repair(output: &Output, report: &RepairReport) -> Result<()> {
         println!("pruned {stale_pruned} stale managed path(s)");
     }
     if stale_blocked > 0 {
-        println!("{stale_blocked} stale path(s) blocked by existing dependent checkout(s)");
+        println!("{stale_blocked} stale path(s) blocked by existing fork/mirror checkout(s)");
     }
     if !report.stale_paths.is_empty() {
         println!("stale managed path(s): {}", report.stale_paths.len());
@@ -4975,7 +5002,7 @@ fn output_repair(output: &Output, report: &RepairReport) -> Result<()> {
             }
             for dependent in &stale.blocking_dependents {
                 println!(
-                    "    dependent: {} {} {}",
+                    "    {}: {} {}",
                     dependent.relationship,
                     dependent.locator.key(),
                     dependent.path.display()
@@ -5121,12 +5148,12 @@ fn output_related_resolution(output: &Output, resolution: &RelatedResolution) ->
     );
     if let Some(shared_git_dir) = &resolution.shared_git_dir {
         println!(
-            "{} now reuses the Git directory controlled by {}",
+            "{} now reuses canonical Git directory {}",
             shared_git_dir.dependent_locator.key(),
             shared_git_dir.controlling_locator.key()
         );
         println!(
-            "remote on controlling checkout: {} -> {}",
+            "remote on canonical checkout: {} -> {}",
             shared_git_dir.dependent_remote, shared_git_dir.dependent_url
         );
         println!(
@@ -5135,7 +5162,7 @@ fn output_related_resolution(output: &Output, resolution: &RelatedResolution) ->
         );
         if shared_git_dir.converted_to_worktree {
             println!(
-                "converted dependent checkout to Git worktree: {}",
+                "converted fork/mirror checkout to Git worktree: {}",
                 shared_git_dir.dependent_path.display()
             );
         }
@@ -6890,6 +6917,11 @@ mod tests {
             git_common_dir(&fork_path).unwrap(),
             git_common_dir(&canonical_path).unwrap()
         );
+        let relationship = store.shared_git_dir_relationships().unwrap().remove(0);
+        let reasons = shared_git_dir_relationship_repair_reasons(&relationship).unwrap();
+        assert!(reasons.iter().any(|reason| {
+            reason.starts_with("fork does not use canonical Git directory; fork uses ")
+        }));
 
         repair_repos(&store, &Output { json: true }, true).unwrap();
         assert_ne!(
