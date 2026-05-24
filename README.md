@@ -49,7 +49,9 @@ Set `clone-as-bare` to `true` in the config file to keep clone-root repositories
 bare. In that mode, `repo clone` creates bare repositories, `repo fork` records
 bare fork repositories instead of fork worktrees, and fork/mirror repair avoids
 creating checked-out dependent trees. Checked-out working trees should be
-created under the dev-worktree root with `repo worktree add`.
+created under the dev-worktree root with `repo worktree add`. `repo check`
+reports existing non-bare clone-root repositories as repairable; `repo check
+--repair` converts clean managed checkouts to bare repositories.
 
 ## Daemon API
 

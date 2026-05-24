@@ -656,6 +656,7 @@ struct ReconcileSkip {
 struct RepairReport {
     action: &'static str,
     check: bool,
+    repository_formats: Vec<RepairRepositoryFormat>,
     stale_paths: Vec<RepairStalePath>,
     untracked_checkouts: Vec<RepairUntrackedCheckout>,
     relationships: Vec<RepairRelationship>,
@@ -739,6 +740,23 @@ struct RepairUntrackedCheckout {
     path: PathBuf,
     status: RepairUntrackedCheckoutStatus,
     reasons: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RepairRepositoryFormat {
+    repo_id: i64,
+    locator: Locator,
+    path: PathBuf,
+    status: RepairRepositoryFormatStatus,
+    reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum RepairRepositoryFormatStatus {
+    NeedsBareConversion,
+    ConvertedToBare,
+    Skipped,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -3716,6 +3734,41 @@ fn repair_repos(config: &Config, db: &Store, output: &Output, check: bool) -> Re
     }
 
     let relationship_snapshot = db.shared_git_dir_relationships()?;
+    let relationship_dependent_repo_ids = relationship_snapshot
+        .iter()
+        .map(|relationship| relationship.dependent_repo_id)
+        .collect::<HashSet<_>>();
+    let mut repository_formats = Vec::new();
+    if config.clone_as_bare {
+        for repo in &current_repos {
+            if !repo.path.exists() || !path_is_under(&repo.path, &config.clone_root) {
+                continue;
+            }
+            match is_bare_repository(&repo.path) {
+                Ok(true) => {}
+                Ok(false) => {
+                    if relationship_dependent_repo_ids.contains(&repo.id)
+                        && checkout_uses_shared_git_dir(&repo.path)
+                    {
+                        continue;
+                    }
+                    if check {
+                        repository_formats.push(bare_conversion_needed(repo));
+                    } else {
+                        repository_formats.push(convert_repo_format_to_bare(repo));
+                    }
+                }
+                Err(error) => repository_formats.push(RepairRepositoryFormat {
+                    repo_id: repo.id,
+                    locator: repo.current.clone(),
+                    path: repo.path.clone(),
+                    status: RepairRepositoryFormatStatus::Skipped,
+                    reasons: vec![error.to_string()],
+                }),
+            }
+        }
+    }
+
     let mut stale_paths = Vec::new();
     let mut stale_repo_ids = HashSet::new();
     for repo in current_repos {
@@ -3878,6 +3931,7 @@ fn repair_repos(config: &Config, db: &Store, output: &Output, check: bool) -> Re
     let report = RepairReport {
         action: "check",
         check,
+        repository_formats,
         stale_paths,
         untracked_checkouts,
         relationships,
@@ -3891,7 +3945,12 @@ fn repair_repos(config: &Config, db: &Store, output: &Output, check: bool) -> Re
 }
 
 fn repair_report_needs_repair(report: &RepairReport) -> bool {
-    report
+    report.repository_formats.iter().any(|format| {
+        matches!(
+            format.status,
+            RepairRepositoryFormatStatus::NeedsBareConversion
+        )
+    }) || report
         .stale_paths
         .iter()
         .any(|stale| matches!(stale.status, RepairStalePathStatus::NeedsPrune))
@@ -3905,6 +3964,47 @@ fn repair_report_needs_repair(report: &RepairReport) -> bool {
             .relationships
             .iter()
             .any(|relationship| matches!(relationship.status, RepairStatus::NeedsRepair))
+}
+
+fn checkout_uses_shared_git_dir(path: &Path) -> bool {
+    let expected_git_dir = path.join(".git");
+    git_dir(path)
+        .map(|actual| comparable_path(&actual) != comparable_path(&expected_git_dir))
+        .unwrap_or(false)
+}
+
+fn bare_conversion_needed(repo: &ManagedRepoRecord) -> RepairRepositoryFormat {
+    RepairRepositoryFormat {
+        repo_id: repo.id,
+        locator: repo.current.clone(),
+        path: repo.path.clone(),
+        status: RepairRepositoryFormatStatus::NeedsBareConversion,
+        reasons: vec![
+            "clone-as-bare is enabled but this managed clone-root repository is non-bare"
+                .to_string(),
+        ],
+    }
+}
+
+fn convert_repo_format_to_bare(repo: &ManagedRepoRecord) -> RepairRepositoryFormat {
+    match convert_standalone_checkout_to_bare_repository(&repo.path) {
+        Ok(()) => RepairRepositoryFormat {
+            repo_id: repo.id,
+            locator: repo.current.clone(),
+            path: repo.path.clone(),
+            status: RepairRepositoryFormatStatus::ConvertedToBare,
+            reasons: vec![
+                "converted clean managed clone-root checkout to a bare repository".to_string(),
+            ],
+        },
+        Err(error) => RepairRepositoryFormat {
+            repo_id: repo.id,
+            locator: repo.current.clone(),
+            path: repo.path.clone(),
+            status: RepairRepositoryFormatStatus::Skipped,
+            reasons: vec![error.to_string()],
+        },
+    }
 }
 
 fn shared_git_dir_relationship_repair_reasons(
@@ -3933,11 +4033,25 @@ fn shared_git_dir_relationship_repair_reasons(
             ),
         });
     }
-    if clone_as_bare
-        && is_bare_repository(&relationship.dependent_path)?
-        && is_bare_repository(&relationship.controlling_path)?
-    {
-        return Ok(reasons);
+    if clone_as_bare {
+        let dependent_is_bare = is_bare_repository(&relationship.dependent_path)?;
+        let controlling_is_bare = is_bare_repository(&relationship.controlling_path)?;
+        if !controlling_is_bare {
+            reasons.push(format!(
+                "canonical checkout is non-bare but clone-as-bare is enabled: {}",
+                relationship.controlling_path.display()
+            ));
+        }
+        if !dependent_is_bare {
+            reasons.push(format!(
+                "{} checkout is non-bare but clone-as-bare is enabled: {}",
+                relationship.relationship,
+                relationship.dependent_path.display()
+            ));
+        }
+        if dependent_is_bare && controlling_is_bare {
+            return Ok(reasons);
+        }
     }
     let dependent_common_dir = git_common_dir(&relationship.dependent_path)?;
     let controlling_common_dir = git_common_dir(&relationship.controlling_path)?;
@@ -4340,8 +4454,12 @@ fn materialize_related_bare_repo(
     ensure_remote(controlling_path, "origin", &controlling_url)?;
     let dependent_url = remote_url_for_locator(controlling_origin.as_deref(), dependent_locator);
     if dependent_path.exists() {
-        ensure_bare_repository(dependent_path)?;
-        ensure_remote(dependent_path, "origin", &dependent_url)?;
+        if is_bare_repository(dependent_path)? {
+            ensure_remote(dependent_path, "origin", &dependent_url)?;
+        } else {
+            replace_checkout_with_bare_clone(dependent_path, Some(controlling_path))?;
+            ensure_remote(dependent_path, "origin", &dependent_url)?;
+        }
     } else {
         fs::create_dir_all(
             dependent_path
@@ -4442,6 +4560,120 @@ fn ensure_clean_checkout(path: &Path) -> Result<()> {
             "checkout has uncommitted or untracked changes and cannot be converted safely: {}",
             path.display()
         );
+    }
+    Ok(())
+}
+
+fn convert_standalone_checkout_to_bare_repository(path: &Path) -> Result<()> {
+    ensure_clean_checkout(path)?;
+    let expected_git_dir = path.join(".git");
+    let actual_git_dir = git_dir(path)?;
+    if comparable_path(&actual_git_dir) != comparable_path(&expected_git_dir)
+        || !expected_git_dir.is_dir()
+    {
+        bail!(
+            "checkout uses a shared Git directory and cannot be converted as a standalone repository: {}",
+            path.display()
+        );
+    }
+
+    let linked_worktrees = linked_worktree_paths(path)?
+        .into_iter()
+        .filter(|worktree_path| comparable_path(worktree_path) != comparable_path(path))
+        .collect::<Vec<_>>();
+    let backup_path = unique_backup_path(path)?;
+    fs::rename(path, &backup_path).with_context(|| {
+        format!(
+            "moving existing checkout {} to {}",
+            path.display(),
+            backup_path.display()
+        )
+    })?;
+
+    let backup_git_dir = backup_path.join(".git");
+    if let Err(error) = fs::rename(&backup_git_dir, path).with_context(|| {
+        format!(
+            "moving Git directory {} to bare repository {}",
+            backup_git_dir.display(),
+            path.display()
+        )
+    }) {
+        let _ = fs::rename(&backup_path, path);
+        return Err(error);
+    }
+
+    let configure_result = (|| -> Result<()> {
+        set_git_config_value(&path.join("config"), "core.bare", "true")?;
+        unset_git_config_value(&path.join("config"), "core.worktree")?;
+        for worktree_path in linked_worktrees {
+            let worktree_arg = worktree_path.display().to_string();
+            run_git_in(path, ["worktree", "repair", worktree_arg.as_str()])?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = configure_result {
+        let _ = fs::rename(path, &backup_git_dir);
+        let _ = fs::rename(&backup_path, path);
+        return Err(error);
+    }
+
+    fs::remove_dir_all(&backup_path)
+        .with_context(|| format!("removing replaced checkout {}", backup_path.display()))?;
+    Ok(())
+}
+
+fn replace_checkout_with_bare_clone(path: &Path, controlling_path: Option<&Path>) -> Result<()> {
+    ensure_clean_checkout(path)?;
+    let remotes = git_remotes(path)?;
+    let expected_git_dir = path.join(".git");
+    let actual_git_dir = git_dir(path)?;
+    let is_standalone = comparable_path(&actual_git_dir) == comparable_path(&expected_git_dir)
+        && expected_git_dir.is_dir();
+    let temp_bare_path = unique_temp_bare_path(path)?;
+    run_git_clone(&path.display().to_string(), &temp_bare_path, true)?;
+    restore_remote_urls(&temp_bare_path, &remotes)?;
+
+    let backup_path = unique_backup_path(path)?;
+    let remove_result = if is_standalone {
+        fs::rename(path, &backup_path).with_context(|| {
+            format!(
+                "moving checkout {} to {}",
+                path.display(),
+                backup_path.display()
+            )
+        })
+    } else if let Some(controlling_path) = controlling_path {
+        let path_arg = path.display().to_string();
+        run_git_in(
+            controlling_path,
+            ["worktree", "remove", "--force", path_arg.as_str()],
+        )
+    } else {
+        bail!(
+            "checkout uses a shared Git directory and no controlling repository was provided: {}",
+            path.display()
+        );
+    };
+    if let Err(error) = remove_result {
+        let _ = fs::remove_dir_all(&temp_bare_path);
+        return Err(error);
+    }
+
+    if let Err(error) = fs::rename(&temp_bare_path, path).with_context(|| {
+        format!(
+            "moving replacement bare repository {} to {}",
+            temp_bare_path.display(),
+            path.display()
+        )
+    }) {
+        if backup_path.exists() {
+            let _ = fs::rename(&backup_path, path);
+        }
+        return Err(error);
+    }
+    if backup_path.exists() {
+        fs::remove_dir_all(&backup_path)
+            .with_context(|| format!("removing replaced checkout {}", backup_path.display()))?;
     }
     Ok(())
 }
@@ -4605,6 +4837,27 @@ fn unique_backup_path(path: &Path) -> Result<PathBuf> {
         }
     }
     bail!("could not allocate backup path for {}", path.display())
+}
+
+fn unique_temp_bare_path(path: &Path) -> Result<PathBuf> {
+    let parent = path.parent().context("repository path has no parent")?;
+    let leaf = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("repository path has no UTF-8 leaf name")?;
+    for index in 0..1000 {
+        let candidate = parent.join(format!(
+            ".repo-manager-bare-{leaf}-{}-{index}",
+            std::process::id()
+        ));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    bail!(
+        "could not allocate temporary bare path for {}",
+        path.display()
+    )
 }
 
 fn validate_relationship_kind(kind: &str) -> Result<()> {
@@ -5279,6 +5532,10 @@ fn comparable_path(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn path_is_under(path: &Path, root: &Path) -> bool {
+    comparable_path(path).starts_with(comparable_path(root))
+}
+
 fn git_root_commits(path: &Path) -> Result<Vec<String>> {
     git_lines(
         path,
@@ -5385,6 +5642,25 @@ fn ensure_remote(cwd: &Path, name: &str, url: &str) -> Result<()> {
     } else {
         run_git_in(cwd, ["remote", "add", name, url])
     }
+}
+
+fn remove_remote(cwd: &Path, name: &str) -> Result<()> {
+    if git_remote_url(cwd, name)?.is_some() {
+        run_git_in(cwd, ["remote", "remove", name])
+    } else {
+        Ok(())
+    }
+}
+
+fn restore_remote_urls(cwd: &Path, remotes: &[GitRemote]) -> Result<()> {
+    if remotes.is_empty() {
+        remove_remote(cwd, "origin")?;
+        return Ok(());
+    }
+    for remote in remotes {
+        ensure_remote(cwd, &remote.name, &remote.url)?;
+    }
+    Ok(())
 }
 
 fn fork_remote_name(locator: &Locator) -> String {
@@ -5518,6 +5794,33 @@ fn git_command(cwd: &Path) -> Command {
     command
 }
 
+fn set_git_config_value(config_path: &Path, key: &str, value: &str) -> Result<()> {
+    let status = Command::new("git")
+        .args(["config", "--file"])
+        .arg(config_path)
+        .arg(key)
+        .arg(value)
+        .status()
+        .with_context(|| format!("setting {key} in {}", config_path.display()))?;
+    if !status.success() {
+        bail!("git config failed with status {status}");
+    }
+    Ok(())
+}
+
+fn unset_git_config_value(config_path: &Path, key: &str) -> Result<()> {
+    let status = Command::new("git")
+        .args(["config", "--file"])
+        .arg(config_path)
+        .args(["--unset", key])
+        .status()
+        .with_context(|| format!("unsetting {key} in {}", config_path.display()))?;
+    if status.success() {
+        return Ok(());
+    }
+    Ok(())
+}
+
 fn git_dir(cwd: &Path) -> Result<PathBuf> {
     let git_dir = git_output(cwd, ["rev-parse", "--git-dir"], "reading Git dir")?;
     let path = PathBuf::from(git_dir.trim());
@@ -5540,6 +5843,22 @@ fn git_common_dir(cwd: &Path) -> Result<PathBuf> {
     } else {
         Ok(cwd.join(common_dir))
     }
+}
+
+fn linked_worktree_paths(cwd: &Path) -> Result<Vec<PathBuf>> {
+    let output = git_command(cwd)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .with_context(|| format!("listing Git worktrees in {}", cwd.display()))?;
+    if !output.status.success() {
+        bail!("listing Git worktrees failed with status {}", output.status);
+    }
+    let stdout = String::from_utf8(output.stdout).context("Git worktree output is not UTF-8")?;
+    Ok(stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .map(PathBuf::from)
+        .collect())
 }
 
 fn is_bare_repository(path: &Path) -> Result<bool> {
@@ -5842,6 +6161,26 @@ fn output_repair(output: &Output, report: &RepairReport) -> Result<()> {
         .iter()
         .filter(|relationship| matches!(relationship.status, RepairStatus::Repaired))
         .count();
+    let format_needs_conversion = report
+        .repository_formats
+        .iter()
+        .filter(|format| {
+            matches!(
+                format.status,
+                RepairRepositoryFormatStatus::NeedsBareConversion
+            )
+        })
+        .count();
+    let format_converted = report
+        .repository_formats
+        .iter()
+        .filter(|format| matches!(format.status, RepairRepositoryFormatStatus::ConvertedToBare))
+        .count();
+    let format_skipped = report
+        .repository_formats
+        .iter()
+        .filter(|format| matches!(format.status, RepairRepositoryFormatStatus::Skipped))
+        .count();
     let stale_needs_prune = report
         .stale_paths
         .iter()
@@ -5883,12 +6222,17 @@ fn output_repair(output: &Output, report: &RepairReport) -> Result<()> {
     );
     if report.check {
         println!("{needs_repair} relationship(s) need repair");
+        println!("{format_needs_conversion} repository format(s) need conversion");
         println!("{stale_needs_prune} stale path(s) need pruning");
         println!("{untracked_needs_tracking} unmanaged checkout(s) need tracking");
     } else {
         println!("repaired {repaired} relationship(s)");
+        println!("converted {format_converted} repository format(s)");
         println!("pruned {stale_pruned} stale managed path(s)");
         println!("tracked {untracked_tracked} unmanaged checkout(s)");
+    }
+    if format_skipped > 0 {
+        println!("{format_skipped} repository format conversion(s) skipped");
     }
     if stale_blocked > 0 {
         println!("{stale_blocked} stale path(s) blocked by existing fork/mirror checkout(s)");
@@ -5919,6 +6263,27 @@ fn output_repair(output: &Output, report: &RepairReport) -> Result<()> {
                     dependent.locator.key(),
                     dependent.path.display()
                 );
+            }
+        }
+    }
+    if !report.repository_formats.is_empty() {
+        println!(
+            "managed repository format issue(s): {}",
+            report.repository_formats.len()
+        );
+        for format in &report.repository_formats {
+            let status = match format.status {
+                RepairRepositoryFormatStatus::NeedsBareConversion => "needs bare conversion",
+                RepairRepositoryFormatStatus::ConvertedToBare => "converted to bare",
+                RepairRepositoryFormatStatus::Skipped => "skipped",
+            };
+            println!(
+                "  {status}: {} {}",
+                format.locator.key(),
+                format.path.display()
+            );
+            for reason in &format.reasons {
+                println!("    reason: {reason}");
             }
         }
     }
@@ -8290,6 +8655,86 @@ mod tests {
     }
 
     #[test]
+    fn repair_converts_existing_related_worktree_to_bare_when_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let seed = dir.path().join("seed");
+        let fork_remote = dir.path().join("fork-remote");
+        let canonical_remote = dir.path().join("canonical-remote");
+        fs::create_dir_all(&seed).unwrap();
+        run_git_in(&seed, ["init"]).unwrap();
+        run_git_in(&seed, ["checkout", "-b", "main"]).unwrap();
+        fs::write(seed.join("README.md"), "shared history\n").unwrap();
+        run_git_in(&seed, ["add", "."]).unwrap();
+        run_git_in(
+            &seed,
+            [
+                "-c",
+                "user.name=repo-manager",
+                "-c",
+                "user.email=repo-manager@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        )
+        .unwrap();
+        clone_local_repo(&seed, &fork_remote);
+        clone_local_repo(&seed, &canonical_remote);
+        let fork_url = file_url_for_path(&fork_remote);
+        let canonical_url = file_url_for_path(&canonical_remote);
+        let fork_locator = Locator::parse(&fork_url).unwrap();
+        let canonical_locator = Locator::parse(&canonical_url).unwrap();
+        let fork_path = locator_path(&config.clone_root, &fork_locator);
+        let canonical_path = locator_path(&config.clone_root, &canonical_locator);
+        clone_local_repo(&fork_remote, &fork_path);
+        clone_local_repo(&canonical_remote, &canonical_path);
+        run_git_in(
+            &fork_path,
+            ["remote", "set-url", "origin", fork_url.as_str()],
+        )
+        .unwrap();
+        run_git_in(
+            &canonical_path,
+            ["remote", "set-url", "origin", canonical_url.as_str()],
+        )
+        .unwrap();
+        let fork_id = store.upsert_repo(&fork_locator, &fork_path, None).unwrap();
+        let canonical_id = store
+            .upsert_repo(&canonical_locator, &canonical_path, None)
+            .unwrap();
+        store
+            .record_related_history(
+                fork_id,
+                canonical_id,
+                &["shared root commit abc".to_string()],
+            )
+            .unwrap();
+        let suggestion_id = store.related_suggestions(true).unwrap()[0].id;
+        store.resolve_related(suggestion_id, "fork").unwrap();
+
+        repair_repos(&config, &store, &Output { json: true }, false).unwrap();
+        assert!(!is_bare_repository(&canonical_path).unwrap());
+        assert!(!is_bare_repository(&fork_path).unwrap());
+        assert_eq!(
+            git_common_dir(&fork_path).unwrap(),
+            git_common_dir(&canonical_path).unwrap()
+        );
+
+        config.clone_as_bare = true;
+        assert!(repair_repos(&config, &store, &Output { json: true }, true).is_err());
+        repair_repos(&config, &store, &Output { json: true }, false).unwrap();
+
+        assert!(is_bare_repository(&canonical_path).unwrap());
+        assert!(is_bare_repository(&fork_path).unwrap());
+        assert_eq!(
+            git_remote_url(&fork_path, "origin").unwrap(),
+            Some(remote_url_for_locator(Some(&canonical_url), &fork_locator))
+        );
+    }
+
+    #[test]
     fn repair_prunes_stale_repo_rows_without_existing_dependents() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
@@ -8397,6 +8842,59 @@ mod tests {
                 )
                 .unwrap(),
             checkout_path.display().to_string()
+        );
+    }
+
+    #[test]
+    fn repair_converts_tracked_clone_root_checkout_to_bare_when_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.clone_as_bare = true;
+        let store = Store::open(&config.state).unwrap();
+        let seed = dir.path().join("seed");
+        let locator = Locator::parse("example.com/plain/repo").unwrap();
+        let checkout_path = locator_path(&config.clone_root, &locator);
+        fs::create_dir_all(&seed).unwrap();
+        run_git_in(&seed, ["init"]).unwrap();
+        run_git_in(&seed, ["checkout", "-b", "main"]).unwrap();
+        fs::write(seed.join("README.md"), "plain checkout\n").unwrap();
+        run_git_in(&seed, ["add", "."]).unwrap();
+        run_git_in(
+            &seed,
+            [
+                "-c",
+                "user.name=repo-manager",
+                "-c",
+                "user.email=repo-manager@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        )
+        .unwrap();
+        clone_local_repo(&seed, &checkout_path);
+        run_git_in(
+            &checkout_path,
+            [
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.com/plain/repo.git",
+            ],
+        )
+        .unwrap();
+        store.upsert_repo(&locator, &checkout_path, None).unwrap();
+
+        assert!(!is_bare_repository(&checkout_path).unwrap());
+        assert!(repair_repos(&config, &store, &Output { json: true }, true).is_err());
+
+        repair_repos(&config, &store, &Output { json: true }, false).unwrap();
+
+        assert!(is_bare_repository(&checkout_path).unwrap());
+        assert!(!checkout_path.join("README.md").exists());
+        assert_eq!(
+            git_remote_url(&checkout_path, "origin").unwrap(),
+            Some("https://example.com/plain/repo.git".to_string())
         );
     }
 
