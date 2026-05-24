@@ -490,7 +490,7 @@ struct WorktreeCommand {
     command: WorktreeSubcommand,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 struct WorktreeAddArgs {
     #[arg(
         value_name = "REPO_OR_NAME",
@@ -4967,17 +4967,18 @@ fn add_worktree(
     args: WorktreeAddArgs,
 ) -> Result<()> {
     warn_pending_related(db)?;
-    if dir.is_some() {
-        let context = repo_context(config, db, dir)?;
-        if let RepoContext::View(view) = context {
-            return add_repo_view_worktree(config, output, &view, args);
-        }
+    if let Some(context) = worktree_context(config, db, dir, &args)? {
+        return match context {
+            RepoContext::Managed(repo) => {
+                add_managed_context_worktree(config, db, output, &repo, args)
+            }
+            RepoContext::View(view) => add_repo_view_worktree(config, output, &view, args),
+        };
     }
     let canonical_url = args.repo_or_name.clone();
-    let name = args
-        .name_or_start_point
-        .as_deref()
-        .ok_or_else(|| anyhow!("worktree name is required unless --dir selects a repository"))?;
+    let name = args.name_or_start_point.as_deref().ok_or_else(|| {
+        anyhow!("worktree name is required unless cwd or --dir selects a repository")
+    })?;
     let locator = Locator::parse(&canonical_url)?;
     let plan = plan_worktree_add(
         &config.clone_root,
@@ -5007,6 +5008,76 @@ fn add_worktree(
     }
     db.upsert_repo(&plan.canonical_locator, &plan.canonical_path, None)?;
     output_worktree(output, &plan)
+}
+
+fn worktree_context(
+    config: &Config,
+    db: &Store,
+    dir: Option<&Path>,
+    args: &WorktreeAddArgs,
+) -> Result<Option<RepoContext>> {
+    if dir.is_some() {
+        return repo_context(config, db, dir).map(Some);
+    }
+    if Locator::parse(&args.repo_or_name).is_ok() {
+        return Ok(None);
+    }
+    match repo_context(config, db, None) {
+        Ok(context) => Ok(Some(context)),
+        Err(_) => Ok(None),
+    }
+}
+
+fn add_managed_context_worktree(
+    config: &Config,
+    db: &Store,
+    output: &Output,
+    repo: &ManagedRepoRecord,
+    args: WorktreeAddArgs,
+) -> Result<()> {
+    let name = args.repo_or_name;
+    let start_point = args
+        .name_or_start_point
+        .as_deref()
+        .or(args.start_point.as_deref());
+    validate_worktree_name(&name)?;
+    let worktree_path = locator_path(&config.dev_worktree_root, &repo.current).join(&name);
+    fs::create_dir_all(
+        worktree_path
+            .parent()
+            .context("worktree path has no parent")?,
+    )?;
+    let mut git_args = vec!["worktree".to_string(), "add".to_string()];
+    if args.force {
+        git_args.push("--force".to_string());
+    }
+    if let Some(branch) = args.branch.as_deref() {
+        git_args.push("-b".to_string());
+        git_args.push(branch.to_string());
+    }
+    if args.detach {
+        git_args.push("--detach".to_string());
+    }
+    git_args.push(worktree_path.display().to_string());
+    if let Some(start_point) = start_point {
+        git_args.push(start_point.to_string());
+    }
+    let arg_refs: Vec<&str> = git_args.iter().map(String::as_str).collect();
+    run_git_in(&repo.path, arg_refs)?;
+    if args.reset {
+        let start = start_point.ok_or_else(|| anyhow!("--reset requires a start point"))?;
+        run_git_in(&worktree_path, ["reset", "--hard", start])?;
+    }
+    db.upsert_repo(&repo.current, &repo.path, None)?;
+    output_worktree(
+        output,
+        &WorktreePlan {
+            canonical_locator: repo.current.clone(),
+            canonical_path: repo.path.clone(),
+            worktree_path,
+            git_args,
+        },
+    )
 }
 
 fn add_repo_view_worktree(
@@ -8316,6 +8387,7 @@ mod tests {
             fs::read_to_string(git_dir.join("HEAD")).unwrap(),
             format!("ref: {topic_ref}\n")
         );
+
         assert!(!fork_path.join("objects").exists());
     }
 
