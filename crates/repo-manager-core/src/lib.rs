@@ -408,6 +408,12 @@ struct CheckArgs {
         help = "Remove safe stale metadata rows, record repairable unmanaged checkouts, and convert repairable fork/mirror checkouts into Git worktrees"
     )]
     repair: bool,
+
+    #[arg(
+        long,
+        help = "Print a read-only JSON inventory of tracked repositories, discovered Git directories, and background fetch state"
+    )]
+    dump: bool,
 }
 
 #[derive(Debug, Args)]
@@ -650,6 +656,51 @@ struct RepairReport {
     untracked_checkouts: Vec<RepairUntrackedCheckout>,
     relationships: Vec<RepairRelationship>,
     skipped: Vec<RepairSkip>,
+}
+
+#[derive(Debug, Serialize)]
+struct CheckDump {
+    action: &'static str,
+    generated_at_epoch_seconds: i64,
+    roots: CheckDumpRoots,
+    tracked_repositories: Vec<TrackedRepositoryDump>,
+    git_directories: Vec<GitDirectoryDump>,
+    untracked_git_directories: Vec<GitDirectoryDump>,
+}
+
+#[derive(Debug, Serialize)]
+struct CheckDumpRoots {
+    clone_root: PathBuf,
+    dev_worktree_root: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+struct TrackedRepositoryDump {
+    repo_id: i64,
+    locator: Locator,
+    path: PathBuf,
+    exists: bool,
+    bare: Option<bool>,
+    background_fetch: Option<BackgroundFetchState>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BackgroundFetchState {
+    last_fetch_at: Option<i64>,
+    last_changed_at: Option<i64>,
+    learned_interval_seconds: i64,
+    last_status: Option<String>,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GitDirectoryDump {
+    root: &'static str,
+    path: PathBuf,
+    tracked_repo_id: Option<i64>,
+    locator: Option<Locator>,
+    bare: Option<bool>,
+    error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1178,7 +1229,16 @@ pub fn run() -> Result<()> {
             }
             RepositoryOperationCommands::Check(args) => {
                 let db = Store::open(&config.state)?;
-                repair_repos(&config, &db, &output, !args.repair)
+                if args.dump {
+                    if args.repair {
+                        bail!(
+                            "repo check --dump is read-only and cannot be combined with --repair"
+                        );
+                    }
+                    dump_check(&config, &db)
+                } else {
+                    repair_repos(&config, &db, &output, !args.repair)
+                }
             }
             RepositoryOperationCommands::Repair(args) => {
                 let db = Store::open(&config.state)?;
@@ -2145,6 +2205,35 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    fn background_fetch_state_by_repo_id(&self) -> Result<HashMap<i64, BackgroundFetchState>> {
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT
+              repo_id,
+              last_fetch_at,
+              last_changed_at,
+              learned_interval_seconds,
+              last_status,
+              last_error
+            FROM background_fetch
+            ",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                BackgroundFetchState {
+                    last_fetch_at: row.get(1)?,
+                    last_changed_at: row.get(2)?,
+                    learned_interval_seconds: row.get(3)?,
+                    last_status: row.get(4)?,
+                    last_error: row.get(5)?,
+                },
+            ))
+        })?;
+        rows.collect::<std::result::Result<HashMap<_, _>, _>>()
+            .map_err(Into::into)
     }
 
     fn delete_repo(&self, repo_id: i64) -> Result<()> {
@@ -3408,6 +3497,95 @@ fn fork_repo(
     )
 }
 
+fn dump_check(config: &Config, db: &Store) -> Result<()> {
+    print_json(&check_dump_report(config, db)?)
+}
+
+fn check_dump_report(config: &Config, db: &Store) -> Result<CheckDump> {
+    let background_fetch = db.background_fetch_state_by_repo_id()?;
+    let current_repos = db.current_repos()?;
+    let mut tracked_by_path = HashMap::new();
+    let mut tracked_repositories = Vec::new();
+
+    for repo in current_repos {
+        tracked_by_path.insert(comparable_path(&repo.path), repo.id);
+        let exists = repo.path.exists();
+        let bare = if exists {
+            Some(is_bare_repository(&repo.path)?)
+        } else {
+            None
+        };
+        tracked_repositories.push(TrackedRepositoryDump {
+            repo_id: repo.id,
+            locator: repo.current,
+            path: repo.path,
+            exists,
+            bare,
+            background_fetch: background_fetch.get(&repo.id).cloned(),
+        });
+    }
+
+    let mut git_directories = Vec::new();
+    git_directories.extend(discovered_git_directory_dump(
+        "clone-root",
+        &config.clone_root,
+        &tracked_by_path,
+    )?);
+    git_directories.extend(discovered_git_directory_dump(
+        "dev-worktree-root",
+        &config.dev_worktree_root,
+        &tracked_by_path,
+    )?);
+    git_directories.sort_by(|left, right| {
+        left.root
+            .cmp(right.root)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    let untracked_git_directories = git_directories
+        .iter()
+        .filter(|entry| entry.tracked_repo_id.is_none())
+        .cloned()
+        .collect();
+
+    Ok(CheckDump {
+        action: "check-dump",
+        generated_at_epoch_seconds: epoch_seconds()?,
+        roots: CheckDumpRoots {
+            clone_root: config.clone_root.clone(),
+            dev_worktree_root: config.dev_worktree_root.clone(),
+        },
+        tracked_repositories,
+        git_directories,
+        untracked_git_directories,
+    })
+}
+
+fn discovered_git_directory_dump(
+    root_name: &'static str,
+    root: &Path,
+    tracked_by_path: &HashMap<PathBuf, i64>,
+) -> Result<Vec<GitDirectoryDump>> {
+    discover_git_repositories(root)?
+        .into_iter()
+        .map(|path| {
+            let tracked_repo_id = tracked_by_path.get(&comparable_path(&path)).copied();
+            let locator = repo_locator_from_origin(&path)?;
+            let (bare, error) = match is_bare_repository(&path) {
+                Ok(bare) => (Some(bare), None),
+                Err(error) => (None, Some(error.to_string())),
+            };
+            Ok(GitDirectoryDump {
+                root: root_name,
+                path,
+                tracked_repo_id,
+                locator,
+                bare,
+                error,
+            })
+        })
+        .collect()
+}
+
 fn repair_repos(config: &Config, db: &Store, output: &Output, check: bool) -> Result<()> {
     let current_repos = db.current_repos()?;
     let mut current_by_locator = HashMap::new();
@@ -3657,17 +3835,36 @@ fn repair_repos(config: &Config, db: &Store, output: &Output, check: bool) -> Re
         }
     }
 
-    output_repair(
-        output,
-        &RepairReport {
-            action: "check",
-            check,
-            stale_paths,
-            untracked_checkouts,
-            relationships,
-            skipped,
-        },
-    )
+    let report = RepairReport {
+        action: "check",
+        check,
+        stale_paths,
+        untracked_checkouts,
+        relationships,
+        skipped,
+    };
+    output_repair(output, &report)?;
+    if check && repair_report_needs_repair(&report) {
+        bail!("repo check found repairable issues; run `repo check --repair`");
+    }
+    Ok(())
+}
+
+fn repair_report_needs_repair(report: &RepairReport) -> bool {
+    report
+        .stale_paths
+        .iter()
+        .any(|stale| matches!(stale.status, RepairStalePathStatus::NeedsPrune))
+        || report.untracked_checkouts.iter().any(|checkout| {
+            matches!(
+                checkout.status,
+                RepairUntrackedCheckoutStatus::NeedsTracking
+            )
+        })
+        || report
+            .relationships
+            .iter()
+            .any(|relationship| matches!(relationship.status, RepairStatus::NeedsRepair))
 }
 
 fn shared_git_dir_relationship_repair_reasons(
@@ -7440,6 +7637,86 @@ mod tests {
     }
 
     #[test]
+    fn check_dump_reports_tracked_untracked_bare_and_fetch_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let seed = dir.path().join("seed");
+        fs::create_dir_all(&seed).unwrap();
+        run_git_in(&seed, ["init"]).unwrap();
+        run_git_in(&seed, ["checkout", "-b", "main"]).unwrap();
+        fs::write(seed.join("README.md"), "dump\n").unwrap();
+        run_git_in(&seed, ["add", "."]).unwrap();
+        run_git_in(
+            &seed,
+            [
+                "-c",
+                "user.name=repo-manager",
+                "-c",
+                "user.email=repo-manager@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        )
+        .unwrap();
+
+        let tracked_locator = Locator::parse("example.com/tracked/repo").unwrap();
+        let tracked_path = locator_path(&config.clone_root, &tracked_locator);
+        fs::create_dir_all(tracked_path.parent().unwrap()).unwrap();
+        run_git_clone(&file_url_for_path(&seed), &tracked_path, true).unwrap();
+        let tracked_id = store
+            .upsert_repo(&tracked_locator, &tracked_path, None)
+            .unwrap();
+        store
+            .record_background_fetch(tracked_id, 1234, 60, true, None)
+            .unwrap();
+
+        let untracked_path = config.clone_root.join("example.com/untracked/repo");
+        clone_local_repo(&seed, &untracked_path);
+        run_git_in(
+            &untracked_path,
+            [
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.com/untracked/repo.git",
+            ],
+        )
+        .unwrap();
+
+        let dump = check_dump_report(&config, &store).unwrap();
+
+        let tracked = dump
+            .tracked_repositories
+            .iter()
+            .find(|repo| repo.repo_id == tracked_id)
+            .unwrap();
+        assert_eq!(tracked.locator, tracked_locator);
+        assert_eq!(tracked.bare, Some(true));
+        assert_eq!(
+            tracked
+                .background_fetch
+                .as_ref()
+                .unwrap()
+                .learned_interval_seconds,
+            60
+        );
+
+        assert!(dump.git_directories.iter().any(|entry| {
+            entry.path == tracked_path
+                && entry.tracked_repo_id == Some(tracked_id)
+                && entry.bare == Some(true)
+        }));
+        assert!(dump.untracked_git_directories.iter().any(|entry| {
+            entry.path == untracked_path
+                && entry.tracked_repo_id.is_none()
+                && entry.bare == Some(false)
+                && entry.locator == Some(Locator::parse("example.com/untracked/repo").unwrap())
+        }));
+    }
+
+    #[test]
     fn related_report_prefers_shared_root_evidence_for_legacy_rows() {
         let dir = tempfile::tempdir().unwrap();
         let seed = dir.path().join("seed");
@@ -7870,7 +8147,7 @@ mod tests {
             reason.starts_with("fork does not use canonical Git directory; fork uses ")
         }));
 
-        repair_repos(&config, &store, &Output { json: true }, true).unwrap();
+        assert!(repair_repos(&config, &store, &Output { json: true }, true).is_err());
         assert_ne!(
             git_common_dir(&fork_path).unwrap(),
             git_common_dir(&canonical_path).unwrap()
@@ -7909,7 +8186,7 @@ mod tests {
             .upsert_repo(&stale_locator, &stale_path, None)
             .unwrap();
 
-        repair_repos(&config, &store, &Output { json: true }, true).unwrap();
+        assert!(repair_repos(&config, &store, &Output { json: true }, true).is_err());
         assert_eq!(
             store
                 .conn
@@ -7985,7 +8262,7 @@ mod tests {
         )
         .unwrap();
 
-        repair_repos(&config, &store, &Output { json: true }, true).unwrap();
+        assert!(repair_repos(&config, &store, &Output { json: true }, true).is_err());
         assert!(
             store
                 .find_repo("example.com/manual/repo")
