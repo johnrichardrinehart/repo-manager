@@ -25,6 +25,8 @@ use url::Url;
 
 const DEFAULT_DETECT_RELATED: bool = true;
 const RPC_PROTOCOL_VERSION: u32 = 1;
+const BACKGROUND_FETCH_MIN_WAKE_SECONDS: u64 = 1;
+const BACKGROUND_FETCH_MAX_WAKE_SECONDS: u64 = 300;
 
 pub mod api {
     include!(concat!(env!("OUT_DIR"), "/repo_manager.v1.rs"));
@@ -4530,7 +4532,10 @@ fn run_daemon(config: &DaemonConfig, rpc_url: &str, args: DaemonArgs) -> Result<
 
 fn spawn_background_fetch(config: DaemonConfig, minimum_interval_seconds: u64) {
     thread::spawn(move || {
-        let sleep_for = Duration::from_secs(minimum_interval_seconds.clamp(1, 300));
+        let sleep_for = Duration::from_secs(minimum_interval_seconds.clamp(
+            BACKGROUND_FETCH_MIN_WAKE_SECONDS,
+            BACKGROUND_FETCH_MAX_WAKE_SECONDS,
+        ));
         loop {
             if let Err(error) = background_fetch_once(&config, minimum_interval_seconds) {
                 warn!("background fetch pass failed: {error:#}");
