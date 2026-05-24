@@ -3686,7 +3686,6 @@ fn repair_repos_interactive(config: &Config, db: &Store, output: &Output) -> Res
 struct RepairOperation {
     id: usize,
     summary: String,
-    details: Vec<String>,
     kind: RepairOperationKind,
 }
 
@@ -3709,7 +3708,6 @@ fn repair_operations_from_report(report: &RepairReport) -> Vec<RepairOperation> 
         operations.push(RepairOperation {
             id: next_id,
             summary: format!("prune stale managed path {}", stale.locator.key()),
-            details: vec![format!("path: {}", stale.path.display())],
             kind: RepairOperationKind::PruneStale(stale.clone()),
         });
         next_id += 1;
@@ -3728,17 +3726,12 @@ fn repair_operations_from_report(report: &RepairReport) -> Vec<RepairOperation> 
         }
     }
     for (path, formats) in format_groups {
-        let locators = formats
-            .iter()
-            .map(|format| format.locator.key())
-            .collect::<Vec<_>>();
         let Some(first) = formats.first() else {
             continue;
         };
         operations.push(RepairOperation {
             id: next_id,
             summary: format!("convert clone-root repository to bare {}", path.display()),
-            details: vec![format!("locator(s): {}", locators.join(", "))],
             kind: RepairOperationKind::ConvertRepositoryFormat((*first).clone()),
         });
         next_id += 1;
@@ -3757,7 +3750,6 @@ fn repair_operations_from_report(report: &RepairReport) -> Vec<RepairOperation> 
         operations.push(RepairOperation {
             id: next_id,
             summary: format!("track unmanaged clone-root checkout {}", locator.key()),
-            details: vec![format!("path: {}", checkout.path.display())],
             kind: RepairOperationKind::TrackUnmanagedCheckout(checkout.clone()),
         });
         next_id += 1;
@@ -3775,10 +3767,6 @@ fn repair_operations_from_report(report: &RepairReport) -> Vec<RepairOperation> 
                 relationship.dependent_locator.key(),
                 relationship.controlling_locator.key()
             ),
-            details: summarized_relationship_reasons(relationship)
-                .into_iter()
-                .map(|reason| format!("reason: {reason}"))
-                .collect(),
             kind: RepairOperationKind::RepairRelationship(Box::new(relationship.clone())),
         });
         next_id += 1;
@@ -3792,6 +3780,13 @@ fn write_repair_plan_file(operations: &[RepairOperation]) -> Result<PathBuf> {
         "repo-manager-repair-plan-{}.txt",
         std::process::id()
     ));
+    let text = format_repair_plan(operations);
+    fs::write(&plan_path, text)
+        .with_context(|| format!("writing repair plan {}", plan_path.display()))?;
+    Ok(plan_path)
+}
+
+fn format_repair_plan(operations: &[RepairOperation]) -> String {
     let mut text = String::new();
     writeln!(text, "# repo-manager repair plan").unwrap();
     writeln!(text, "#").unwrap();
@@ -3809,13 +3804,8 @@ fn write_repair_plan_file(operations: &[RepairOperation]) -> Result<PathBuf> {
     writeln!(text).unwrap();
     for operation in operations {
         writeln!(text, "pick {} {}", operation.id, operation.summary).unwrap();
-        for detail in &operation.details {
-            writeln!(text, "#   {detail}").unwrap();
-        }
     }
-    fs::write(&plan_path, text)
-        .with_context(|| format!("writing repair plan {}", plan_path.display()))?;
-    Ok(plan_path)
+    text
 }
 
 fn open_repair_plan_in_editor(plan_path: &Path) -> Result<()> {
@@ -7250,6 +7240,25 @@ mod tests {
     }
 
     #[test]
+    fn repair_plan_formatter_uses_one_line_per_operation() {
+        let operations = vec![
+            test_repair_operation(1, "one"),
+            test_repair_operation(2, "two"),
+        ];
+
+        let text = format_repair_plan(&operations);
+        let operation_lines = text
+            .lines()
+            .filter(|line| line.starts_with("pick "))
+            .collect::<Vec<_>>();
+
+        assert_eq!(operation_lines, vec!["pick 1 one", "pick 2 two"]);
+        assert!(!text.contains("#   path:"));
+        assert!(!text.contains("#   reason:"));
+        assert!(!text.contains("#   locator(s):"));
+    }
+
+    #[test]
     fn repair_report_output_numbers_and_groups_redundant_format_issues() {
         let shared_path = PathBuf::from("/tmp/clones/github.com/upstream/project");
         let report = RepairReport {
@@ -7353,7 +7362,6 @@ mod tests {
         RepairOperation {
             id,
             summary: summary.to_string(),
-            details: Vec::new(),
             kind: RepairOperationKind::PruneStale(RepairStalePath {
                 repo_id: id as i64,
                 locator: Locator::parse(&format!("example.com/{summary}")).unwrap(),
