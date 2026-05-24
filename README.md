@@ -82,6 +82,12 @@ loaded by default is `$XDG_CONFIG_HOME/repo-manager/config.json`.
 Runtime environment variables and top-level CLI options override persisted
 values.
 
+Config files are versioned JSON and validated against the matching JSON Schema
+before being deserialized. `repo setup` writes `config_version: 1`; existing
+unversioned config files are treated as v1. The v1 schema lives at
+`crates/repo-manager-core/schemas/config/v1/schema.json`; incompatible config
+format changes should add a new versioned schema instead of changing v1.
+
 The metadata database defaults to `$XDG_STATE_HOME/repo-manager/repos.sqlite`.
 Disposable forge metadata, such as GitHub API responses used by `repo
 reconcile`, is cached under `$XDG_CACHE_HOME/repo-manager`.

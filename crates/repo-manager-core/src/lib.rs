@@ -24,9 +24,11 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 const DEFAULT_DETECT_RELATED: bool = true;
+const CURRENT_CONFIG_VERSION: u32 = 1;
 const RPC_PROTOCOL_VERSION: u32 = 1;
 const BACKGROUND_FETCH_MIN_WAKE_SECONDS: u64 = 1;
 const BACKGROUND_FETCH_MAX_WAKE_SECONDS: u64 = 300;
+const CONFIG_SCHEMA_V1: &str = include_str!("../schemas/config/v1/schema.json");
 
 pub mod api {
     include!(concat!(env!("OUT_DIR"), "/repo_manager.v1.rs"));
@@ -611,6 +613,8 @@ struct Output {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct FileConfig {
+    #[serde(alias = "config-version")]
+    config_version: Option<u32>,
     state: Option<PathBuf>,
     cache_root: Option<PathBuf>,
     root: Option<PathBuf>,
@@ -1394,10 +1398,15 @@ impl FileConfig {
         }
         let content =
             fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        serde_json::from_str(&content).with_context(|| format!("parsing {}", path.display()))
+        let json: serde_json::Value = serde_json::from_str(&content)
+            .with_context(|| format!("parsing {}", path.display()))?;
+        validate_config_json(&json)
+            .map_err(|error| anyhow!("validating {}: {error}", path.display()))?;
+        serde_json::from_value(json).with_context(|| format!("parsing {}", path.display()))
     }
 
     fn merge(&mut self, other: Self) {
+        self.config_version = other.config_version.or(self.config_version);
         self.state = other.state.or_else(|| self.state.take());
         self.cache_root = other.cache_root.or_else(|| self.cache_root.take());
         self.root = other.root.or_else(|| self.root.take());
@@ -1427,6 +1436,36 @@ impl FileConfig {
         let content = serde_json::to_string_pretty(self)?;
         fs::write(path, format!("{content}\n"))
             .with_context(|| format!("writing {}", path.display()))
+    }
+}
+
+fn validate_config_json(config: &serde_json::Value) -> Result<()> {
+    let version = config
+        .get("config_version")
+        .or_else(|| config.get("config-version"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(u64::from(CURRENT_CONFIG_VERSION));
+    let schema = match version {
+        1 => CONFIG_SCHEMA_V1,
+        unsupported => {
+            bail!("unsupported repo-manager config version {unsupported}; supported versions: 1")
+        }
+    };
+    let schema: serde_json::Value =
+        serde_json::from_str(schema).context("parsing repo-manager config JSON Schema")?;
+    let validator =
+        jsonschema::validator_for(&schema).context("compiling repo-manager config JSON Schema")?;
+    let errors = validator
+        .iter_errors(config)
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "repo-manager config does not match schema v{version}: {}",
+            errors.join("; ")
+        )
     }
 }
 
@@ -1482,6 +1521,7 @@ impl DaemonConfig {
 fn setup_config(config: &Config, output: &Output, args: SetupArgs) -> Result<()> {
     let config_path = args.file.unwrap_or_else(|| config.config_path.clone());
     let file_config = FileConfig {
+        config_version: Some(CURRENT_CONFIG_VERSION),
         state: Some(args.state.unwrap_or_else(|| config.state.clone())),
         cache_root: Some(args.cache_root.unwrap_or_else(|| config.cache_root.clone())),
         root: Some(args.root.unwrap_or_else(|| config.root.clone())),
@@ -7131,6 +7171,7 @@ mod tests {
         fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         fs::write(&config_path, format!("{content}\n")).unwrap();
         let _expected = FileConfig {
+            config_version: None,
             state: Some(dir.path().join("state/from-file.sqlite")),
             cache_root: Some(dir.path().join("cache/from-file")),
             root: Some(dir.path().join("code/from-file")),
@@ -7197,6 +7238,76 @@ mod tests {
     }
 
     #[test]
+    fn config_schema_v1_accepts_compatibility_fixtures() {
+        let schema: serde_json::Value = serde_json::from_str(CONFIG_SCHEMA_V1).unwrap();
+        jsonschema::validator_for(&schema).unwrap();
+
+        let fixtures = [
+            serde_json::json!({}),
+            serde_json::json!({
+                "root": "/home/test/code",
+                "state": "/home/test/.local/state/repo-manager/repos.sqlite",
+                "detect_related": true
+            }),
+            serde_json::json!({
+                "config_version": 1,
+                "clone_as_bare": true,
+                "background_fetch_minimum_interval_seconds": 3600
+            }),
+            serde_json::json!({
+                "config-version": 1,
+                "clone-as-bare": true,
+                "background-fetch-minimum-interval-seconds": 3600
+            }),
+            serde_json::json!({
+                "config_version": null,
+                "clone_as_bare": null,
+                "background_fetch_minimum_interval_seconds": null
+            }),
+        ];
+
+        for fixture in fixtures {
+            validate_config_json(&fixture).unwrap();
+        }
+    }
+
+    #[test]
+    fn config_schema_rejects_breaking_or_unknown_config_shapes() {
+        assert!(validate_config_json(&serde_json::json!({ "config_version": 2 })).is_err());
+        assert!(validate_config_json(&serde_json::json!({ "unknown": true })).is_err());
+        assert!(
+            validate_config_json(
+                &serde_json::json!({ "background_fetch_minimum_interval_seconds": -1 })
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn repod_rejects_invalid_versioned_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        fs::write(&config_path, r#"{"config_version":2}"#).unwrap();
+
+        let error = DaemonConfig::from_args(&DaemonConfigArgs {
+            config: Some(config_path),
+            state: None,
+            rpc_url: None,
+            detect_related: None,
+            clone_start_ttl_minutes: None,
+            rpc_rate_limit_per_second: None,
+            background_fetch_minimum_interval_seconds: None,
+        })
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported repo-manager config version 2")
+        );
+    }
+
+    #[test]
     fn daemon_shared_history_detection_defaults_to_enabled() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("missing/config.json");
@@ -7248,6 +7359,7 @@ mod tests {
 
         assert!(!config.config_path.exists());
         let saved = FileConfig::load(&explicit_file).unwrap();
+        assert_eq!(saved.config_version, Some(CURRENT_CONFIG_VERSION));
         assert_eq!(saved.state, Some(config.state));
         assert_eq!(saved.cache_root, Some(config.cache_root));
         assert_eq!(saved.root, Some(dir.path().join("custom-root")));
@@ -7269,6 +7381,7 @@ mod tests {
     fn file_config_merge_lets_later_layers_override_earlier_ones() {
         let dir = tempfile::tempdir().unwrap();
         let mut base = FileConfig {
+            config_version: None,
             state: Some(dir.path().join("state/base.sqlite")),
             cache_root: Some(dir.path().join("cache/base")),
             root: None,
@@ -7283,6 +7396,7 @@ mod tests {
         };
 
         base.merge(FileConfig {
+            config_version: Some(CURRENT_CONFIG_VERSION),
             state: None,
             cache_root: Some(dir.path().join("cache/user")),
             root: Some(dir.path().join("code/user")),

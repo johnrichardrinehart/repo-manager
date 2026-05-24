@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/johnrichardrinehart/repo-manager/schemas/config/v1/schema.json",
+  "title": "repo-manager configuration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "config_version": {
+      "enum": [1, null]
+    },
+    "config-version": {
+      "enum": [1, null]
+    },
+    "state": {
+      "type": ["string", "null"]
+    },
+    "cache_root": {
+      "type": ["string", "null"]
+    },
+    "root": {
+      "type": ["string", "null"]
+    },
+    "rpc_url": {
+      "type": ["string", "null"]
+    },
+    "client_id": {
+      "type": ["string", "null"]
+    },
+    "assume_origin_as_canonical": {
+      "type": ["boolean", "null"]
+    },
+    "clone_as_bare": {
+      "type": ["boolean", "null"]
+    },
+    "clone-as-bare": {
+      "type": ["boolean", "null"]
+    },
+    "detect_related": {
+      "type": ["boolean", "null"]
+    },
+    "clone_start_ttl_minutes": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "rpc_rate_limit_per_second": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "background_fetch_minimum_interval_seconds": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "background-fetch-minimum-interval-seconds": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    }
+  }
+}
