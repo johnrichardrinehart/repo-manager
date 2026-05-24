@@ -7423,7 +7423,7 @@ mod tests {
             root,
             clone_root,
             dev_worktree_root,
-            rpc_url: default_rpc_url(),
+            rpc_url: test_rpc_url(dir.path()),
             client_id: generate_client_id().unwrap(),
             assume_origin_as_canonical: false,
             clone_as_bare: false,
@@ -7489,7 +7489,7 @@ mod tests {
             root,
             clone_root,
             dev_worktree_root,
-            rpc_url: default_rpc_url(),
+            rpc_url: test_rpc_url(dir.path()),
             client_id: generate_client_id().unwrap(),
             assume_origin_as_canonical: false,
             clone_as_bare: false,
@@ -7700,7 +7700,7 @@ mod tests {
             root: dir.path().join("code"),
             clone_root: dir.path().join("code/clones"),
             dev_worktree_root: dir.path().join("code/dev-worktrees"),
-            rpc_url: default_rpc_url(),
+            rpc_url: test_rpc_url(dir.path()),
             client_id: "00000000-0000-4000-8000-000000000003".to_string(),
             assume_origin_as_canonical: false,
             clone_as_bare: false,
@@ -8372,6 +8372,10 @@ mod tests {
         format!("file://localhost{}", path.display())
     }
 
+    fn test_rpc_url(root: &Path) -> String {
+        format!("unix://{}", root.join("repo-manager-test.sock").display())
+    }
+
     fn test_config(root: &Path) -> Config {
         Config {
             config_path: root.join("config.json"),
@@ -8380,7 +8384,7 @@ mod tests {
             root: root.join("code"),
             clone_root: root.join("code/clones"),
             dev_worktree_root: root.join("code/dev-worktrees"),
-            rpc_url: default_rpc_url(),
+            rpc_url: test_rpc_url(root),
             client_id: "00000000-0000-4000-8000-000000000099".to_string(),
             assume_origin_as_canonical: false,
             clone_as_bare: false,
@@ -8395,6 +8399,16 @@ mod tests {
             rpc_rate_limit_per_second: 0,
             background_fetch_minimum_interval_seconds: None,
         }
+    }
+
+    #[test]
+    fn test_config_uses_isolated_state_and_rpc_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+
+        assert_eq!(config.state, dir.path().join("repos.sqlite"));
+        assert_eq!(config.rpc_url, test_rpc_url(dir.path()));
+        assert_ne!(config.rpc_url, default_rpc_url());
     }
 
     #[test]
