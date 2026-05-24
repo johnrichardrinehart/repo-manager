@@ -227,8 +227,8 @@ enum RepositoryOperationCommands {
     #[command(about = "Create or register a fork worktree for a canonical repository")]
     Fork(ForkArgs),
     #[command(
-        about = "Find missing tracked checkouts and unmaterialized fork/mirror worktrees",
-        long_about = "Find missing checkout paths and incomplete fork/mirror worktree relationships in repo-manager metadata.\n\nrepo-manager only checks repositories and relationships already recorded in its SQLite database. It does not scan for unmanaged Git checkouts, register new repositories, or recreate missing canonical clones.\n\nBy default, this command is read-only. With --repair, it removes safe stale metadata rows and converts repairable fork/mirror checkouts into Git worktrees of their canonical checkouts."
+        about = "Find missing tracked checkouts, unmanaged clone-root repos, and unmaterialized fork/mirror worktrees",
+        long_about = "Find missing checkout paths, Git repositories under the clone root that are absent from repo-manager metadata, and incomplete fork/mirror worktree relationships.\n\nrepo-manager checks repositories and relationships recorded in its SQLite database, then scans the managed clone root for out-of-band checkouts whose origin remote can be parsed as a locator.\n\nBy default, this command is read-only. With --repair, it removes safe stale metadata rows, records repairable unmanaged clone-root checkouts, updates metadata for moved managed checkouts, and converts repairable fork/mirror checkouts into Git worktrees of their canonical checkouts."
     )]
     Check(CheckArgs),
     #[command(
@@ -395,7 +395,7 @@ struct ForkArgs {
 struct CheckArgs {
     #[arg(
         long,
-        help = "Remove safe stale metadata rows and convert repairable fork/mirror checkouts into Git worktrees"
+        help = "Remove safe stale metadata rows, record repairable unmanaged checkouts, and convert repairable fork/mirror checkouts into Git worktrees"
     )]
     repair: bool,
 }
@@ -631,6 +631,7 @@ struct RepairReport {
     action: &'static str,
     check: bool,
     stale_paths: Vec<RepairStalePath>,
+    untracked_checkouts: Vec<RepairUntrackedCheckout>,
     relationships: Vec<RepairRelationship>,
     skipped: Vec<RepairSkip>,
 }
@@ -659,6 +660,22 @@ struct RepairStaleDependent {
     relationship: String,
     locator: Locator,
     path: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+struct RepairUntrackedCheckout {
+    locator: Option<Locator>,
+    path: PathBuf,
+    status: RepairUntrackedCheckoutStatus,
+    reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum RepairUntrackedCheckoutStatus {
+    NeedsTracking,
+    Tracked,
+    Skipped,
 }
 
 #[derive(Debug, Serialize)]
@@ -1145,11 +1162,11 @@ pub fn run() -> Result<()> {
             }
             RepositoryOperationCommands::Check(args) => {
                 let db = Store::open(&config.state)?;
-                repair_repos(&db, &output, !args.repair)
+                repair_repos(&config, &db, &output, !args.repair)
             }
             RepositoryOperationCommands::Repair(args) => {
                 let db = Store::open(&config.state)?;
-                repair_repos(&db, &output, args.check)
+                repair_repos(&config, &db, &output, args.check)
             }
             RepositoryOperationCommands::Worktree(command) => match command.command {
                 WorktreeSubcommand::Add(args) => {
@@ -3192,11 +3209,102 @@ fn fork_repo(
     )
 }
 
-fn repair_repos(db: &Store, output: &Output, check: bool) -> Result<()> {
+fn repair_repos(config: &Config, db: &Store, output: &Output, check: bool) -> Result<()> {
+    let current_repos = db.current_repos()?;
+    let mut current_by_locator = HashMap::new();
+    let mut current_paths = HashSet::new();
+    for repo in &current_repos {
+        current_by_locator.insert(repo.current.key(), repo.clone());
+        current_paths.insert(comparable_path(&repo.path));
+    }
+
+    let mut untracked_checkouts = Vec::new();
+    let mut relocated_locator_keys = HashSet::new();
+    for checkout_path in discover_git_repositories(&config.clone_root)? {
+        if current_paths.contains(&comparable_path(&checkout_path)) {
+            continue;
+        }
+
+        let Some(locator) = repo_locator_from_origin(&checkout_path)? else {
+            untracked_checkouts.push(RepairUntrackedCheckout {
+                locator: None,
+                path: checkout_path,
+                status: RepairUntrackedCheckoutStatus::Skipped,
+                reasons: vec![
+                    "origin remote is missing or is not a parseable repository locator".to_string(),
+                ],
+            });
+            continue;
+        };
+
+        let locator_key = locator.key();
+        if let Some(current) = current_by_locator.get(&locator_key) {
+            if current.path.exists() {
+                untracked_checkouts.push(RepairUntrackedCheckout {
+                    locator: Some(locator),
+                    path: checkout_path,
+                    status: RepairUntrackedCheckoutStatus::Skipped,
+                    reasons: vec![format!(
+                        "locator is already tracked at existing path {}",
+                        current.path.display()
+                    )],
+                });
+                continue;
+            }
+
+            relocated_locator_keys.insert(locator_key);
+            if check {
+                untracked_checkouts.push(RepairUntrackedCheckout {
+                    locator: Some(locator),
+                    path: checkout_path,
+                    status: RepairUntrackedCheckoutStatus::NeedsTracking,
+                    reasons: vec![format!(
+                        "matches stale managed locator previously recorded at {}",
+                        current.path.display()
+                    )],
+                });
+            } else {
+                db.upsert_repo(&locator, &checkout_path, None)?;
+                untracked_checkouts.push(RepairUntrackedCheckout {
+                    locator: Some(locator),
+                    path: checkout_path,
+                    status: RepairUntrackedCheckoutStatus::Tracked,
+                    reasons: vec![format!(
+                        "updated stale managed locator previously recorded at {}",
+                        current.path.display()
+                    )],
+                });
+            }
+            continue;
+        }
+
+        if check {
+            untracked_checkouts.push(RepairUntrackedCheckout {
+                locator: Some(locator),
+                path: checkout_path,
+                status: RepairUntrackedCheckoutStatus::NeedsTracking,
+                reasons: vec![
+                    "checkout is under the managed clone root but absent from metadata".to_string(),
+                ],
+            });
+        } else {
+            db.upsert_repo(&locator, &checkout_path, None)?;
+            untracked_checkouts.push(RepairUntrackedCheckout {
+                locator: Some(locator),
+                path: checkout_path,
+                status: RepairUntrackedCheckoutStatus::Tracked,
+                reasons: vec!["recorded previously unmanaged clone-root checkout".to_string()],
+            });
+        }
+    }
+
     let relationship_snapshot = db.shared_git_dir_relationships()?;
     let mut stale_paths = Vec::new();
     let mut stale_repo_ids = HashSet::new();
-    for repo in db.current_repos()? {
+    for repo in current_repos {
+        if relocated_locator_keys.contains(&repo.current.key()) {
+            continue;
+        }
         if !repo.path.exists() {
             stale_repo_ids.insert(repo.id);
             let blocking_dependents = relationship_snapshot
@@ -3354,6 +3462,7 @@ fn repair_repos(db: &Store, output: &Output, check: bool) -> Result<()> {
             action: "check",
             check,
             stale_paths,
+            untracked_checkouts,
             relationships,
             skipped,
         },
@@ -5054,6 +5163,26 @@ fn output_repair(output: &Output, report: &RepairReport) -> Result<()> {
         .iter()
         .filter(|stale| matches!(stale.status, RepairStalePathStatus::Blocked))
         .count();
+    let untracked_needs_tracking = report
+        .untracked_checkouts
+        .iter()
+        .filter(|checkout| {
+            matches!(
+                checkout.status,
+                RepairUntrackedCheckoutStatus::NeedsTracking
+            )
+        })
+        .count();
+    let untracked_tracked = report
+        .untracked_checkouts
+        .iter()
+        .filter(|checkout| matches!(checkout.status, RepairUntrackedCheckoutStatus::Tracked))
+        .count();
+    let untracked_skipped = report
+        .untracked_checkouts
+        .iter()
+        .filter(|checkout| matches!(checkout.status, RepairUntrackedCheckoutStatus::Skipped))
+        .count();
     println!(
         "checked {} managed relationship(s)",
         report.relationships.len() + report.skipped.len()
@@ -5061,12 +5190,17 @@ fn output_repair(output: &Output, report: &RepairReport) -> Result<()> {
     if report.check {
         println!("{needs_repair} relationship(s) need repair");
         println!("{stale_needs_prune} stale path(s) need pruning");
+        println!("{untracked_needs_tracking} unmanaged checkout(s) need tracking");
     } else {
         println!("repaired {repaired} relationship(s)");
         println!("pruned {stale_pruned} stale managed path(s)");
+        println!("tracked {untracked_tracked} unmanaged checkout(s)");
     }
     if stale_blocked > 0 {
         println!("{stale_blocked} stale path(s) blocked by existing fork/mirror checkout(s)");
+    }
+    if untracked_skipped > 0 {
+        println!("{untracked_skipped} unmanaged checkout(s) skipped");
     }
     if !report.stale_paths.is_empty() {
         println!("stale managed path(s): {}", report.stale_paths.len());
@@ -5091,6 +5225,28 @@ fn output_repair(output: &Output, report: &RepairReport) -> Result<()> {
                     dependent.locator.key(),
                     dependent.path.display()
                 );
+            }
+        }
+    }
+    if !report.untracked_checkouts.is_empty() {
+        println!(
+            "unmanaged clone-root checkout(s): {}",
+            report.untracked_checkouts.len()
+        );
+        for checkout in &report.untracked_checkouts {
+            let status = match checkout.status {
+                RepairUntrackedCheckoutStatus::NeedsTracking => "needs tracking",
+                RepairUntrackedCheckoutStatus::Tracked => "tracked",
+                RepairUntrackedCheckoutStatus::Skipped => "skipped",
+            };
+            let locator = checkout
+                .locator
+                .as_ref()
+                .map(Locator::key)
+                .unwrap_or_else(|| "<unknown>".to_string());
+            println!("  {status}: {locator} {}", checkout.path.display());
+            for reason in &checkout.reasons {
+                println!("    reason: {reason}");
             }
         }
     }
@@ -7033,13 +7189,13 @@ mod tests {
             reason.starts_with("fork does not use canonical Git directory; fork uses ")
         }));
 
-        repair_repos(&store, &Output { json: true }, true).unwrap();
+        repair_repos(&config, &store, &Output { json: true }, true).unwrap();
         assert_ne!(
             git_common_dir(&fork_path).unwrap(),
             git_common_dir(&canonical_path).unwrap()
         );
 
-        repair_repos(&store, &Output { json: true }, false).unwrap();
+        repair_repos(&config, &store, &Output { json: true }, false).unwrap();
         assert_eq!(
             git_common_dir(&fork_path).unwrap(),
             git_common_dir(&canonical_path).unwrap()
@@ -7072,7 +7228,7 @@ mod tests {
             .upsert_repo(&stale_locator, &stale_path, None)
             .unwrap();
 
-        repair_repos(&store, &Output { json: true }, true).unwrap();
+        repair_repos(&config, &store, &Output { json: true }, true).unwrap();
         assert_eq!(
             store
                 .conn
@@ -7085,7 +7241,7 @@ mod tests {
             1
         );
 
-        repair_repos(&store, &Output { json: true }, false).unwrap();
+        repair_repos(&config, &store, &Output { json: true }, false).unwrap();
         assert_eq!(
             store
                 .conn
@@ -7111,6 +7267,132 @@ mod tests {
     }
 
     #[test]
+    fn repair_tracks_unmanaged_clone_root_checkout_with_parseable_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let seed = dir.path().join("seed");
+        let locator = Locator::parse("example.com/manual/repo").unwrap();
+        let checkout_path = locator_path(&config.clone_root, &locator);
+        fs::create_dir_all(&seed).unwrap();
+        run_git_in(&seed, ["init"]).unwrap();
+        run_git_in(&seed, ["checkout", "-b", "main"]).unwrap();
+        fs::write(seed.join("README.md"), "manual checkout\n").unwrap();
+        run_git_in(&seed, ["add", "."]).unwrap();
+        run_git_in(
+            &seed,
+            [
+                "-c",
+                "user.name=repo-manager",
+                "-c",
+                "user.email=repo-manager@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        )
+        .unwrap();
+        clone_local_repo(&seed, &checkout_path);
+        run_git_in(
+            &checkout_path,
+            [
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.com/manual/repo.git",
+            ],
+        )
+        .unwrap();
+
+        repair_repos(&config, &store, &Output { json: true }, true).unwrap();
+        assert!(
+            store
+                .find_repo("example.com/manual/repo")
+                .unwrap()
+                .is_none()
+        );
+
+        repair_repos(&config, &store, &Output { json: true }, false).unwrap();
+        let record = store.find_repo("example.com/manual/repo").unwrap().unwrap();
+        assert_eq!(record.current, locator);
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT current_path FROM repos WHERE id = ?1",
+                    params![record.id],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            checkout_path.display().to_string()
+        );
+    }
+
+    #[test]
+    fn repair_updates_metadata_for_out_of_band_moved_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let seed = dir.path().join("seed");
+        let locator = Locator::parse("example.com/moved/repo").unwrap();
+        let old_path = locator_path(&config.clone_root, &locator);
+        let moved_path = config.clone_root.join("example.com/moved-out-of-band/repo");
+        fs::create_dir_all(&seed).unwrap();
+        run_git_in(&seed, ["init"]).unwrap();
+        run_git_in(&seed, ["checkout", "-b", "main"]).unwrap();
+        fs::write(seed.join("README.md"), "moved checkout\n").unwrap();
+        run_git_in(&seed, ["add", "."]).unwrap();
+        run_git_in(
+            &seed,
+            [
+                "-c",
+                "user.name=repo-manager",
+                "-c",
+                "user.email=repo-manager@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        )
+        .unwrap();
+        clone_local_repo(&seed, &old_path);
+        run_git_in(
+            &old_path,
+            [
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.com/moved/repo.git",
+            ],
+        )
+        .unwrap();
+        let repo_id = store.upsert_repo(&locator, &old_path, None).unwrap();
+        fs::create_dir_all(moved_path.parent().unwrap()).unwrap();
+        fs::rename(&old_path, &moved_path).unwrap();
+
+        repair_repos(&config, &store, &Output { json: true }, false).unwrap();
+
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT current_path FROM repos WHERE id = ?1",
+                    params![repo_id],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            moved_path.display().to_string()
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM repos", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
     fn repair_blocks_pruning_stale_controlling_repo_with_existing_dependent() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
@@ -7126,7 +7408,7 @@ mod tests {
             .unwrap();
         store.record_fork(fork_id, canonical_id).unwrap();
 
-        repair_repos(&store, &Output { json: true }, false).unwrap();
+        repair_repos(&config, &store, &Output { json: true }, false).unwrap();
 
         assert_eq!(
             store
