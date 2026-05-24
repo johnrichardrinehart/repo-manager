@@ -200,6 +200,8 @@ enum Commands {
     OrganizationalChanges(OrganizationalChangeCommands),
     #[command(flatten, next_help_heading = "Organizational Analysis")]
     OrganizationalAnalysis(OrganizationalAnalysisCommands),
+    #[command(flatten, next_help_heading = "Daemon")]
+    Daemon(DaemonCommands),
 }
 
 #[derive(Debug, Subcommand, HelpGroup)]
@@ -275,6 +277,13 @@ enum OrganizationalAnalysisCommands {
         long_about = "List and resolve shared-history candidates.\n\nThese are suggestions only: shared Git objects can mean mirrors, forks, moved repositories, vendor trees, or unrelated repositories with common ancestry."
     )]
     Related(RelatedCommand),
+}
+
+#[derive(Debug, Subcommand, HelpGroup)]
+#[help_group(title = "Daemon")]
+enum DaemonCommands {
+    #[command(about = "Interact with the repo-manager daemon")]
+    Daemon(DaemonCommand),
 }
 
 #[derive(Debug, Args)]
@@ -509,6 +518,18 @@ enum RelatedSubcommand {
 struct RelatedCommand {
     #[command(subcommand)]
     command: RelatedSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum DaemonSubcommand {
+    #[command(about = "Check whether repod is reachable")]
+    Ping,
+}
+
+#[derive(Debug, Args)]
+struct DaemonCommand {
+    #[command(subcommand)]
+    command: DaemonSubcommand,
 }
 
 #[derive(Debug, Args)]
@@ -884,6 +905,13 @@ struct SetupResult {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct DaemonPingResult {
+    action: &'static str,
+    rpc_url: String,
+    reachable: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct SuccessorResult {
     action: &'static str,
     old_ref: String,
@@ -1147,6 +1175,11 @@ pub fn run() -> Result<()> {
                     }
                 }
             }
+        },
+        Commands::Daemon(command) => match command {
+            DaemonCommands::Daemon(command) => match command.command {
+                DaemonSubcommand::Ping => daemon_ping(&config, &output),
+            },
         },
     }
 }
@@ -4004,6 +4037,33 @@ fn parse_rpc_endpoint(input: &str) -> Result<PathBuf> {
     }
 }
 
+fn check_daemon_reachable(endpoint: &str) -> Result<()> {
+    let path = parse_rpc_endpoint(endpoint)?;
+    #[cfg(unix)]
+    {
+        UnixStream::connect(&path)
+            .with_context(|| format!("connecting to repo-manager daemon at {endpoint}"))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        bail!("unix RPC endpoints are not supported on this platform")
+    }
+}
+
+fn daemon_ping(config: &Config, output: &Output) -> Result<()> {
+    check_daemon_reachable(&config.rpc_url)?;
+    output_daemon_ping(
+        output,
+        &DaemonPingResult {
+            action: "daemon-ping",
+            rpc_url: config.rpc_url.clone(),
+            reachable: true,
+        },
+    )
+}
+
 fn send_rpc_event(endpoint: &str, event: &RpcEvent) -> Result<()> {
     let mut message = Vec::new();
     event
@@ -4819,6 +4879,14 @@ fn output_setup(output: &Output, result: &SetupResult) -> Result<()> {
     Ok(())
 }
 
+fn output_daemon_ping(output: &Output, result: &DaemonPingResult) -> Result<()> {
+    if output.json {
+        return print_json(result);
+    }
+    println!("repod reachable: {}", result.rpc_url);
+    Ok(())
+}
+
 fn output_clone(output: &Output, result: &CloneResult) -> Result<()> {
     if output.json {
         return print_json(result);
@@ -5189,6 +5257,7 @@ mod tests {
         assert!(help.contains("Repository operations:"));
         assert!(help.contains("Organizational Changes:"));
         assert!(help.contains("Organizational Analysis:"));
+        assert!(help.contains("Daemon:"));
         assert!(help.contains("Options:"));
         assert!(!help.contains("\nCommands:\n"));
         assert!(!help.contains("\n    audit"));
@@ -5196,17 +5265,30 @@ mod tests {
     }
 
     #[test]
-    fn repo_top_level_help_does_not_advertise_daemon_controls() {
+    fn repo_top_level_help_advertises_daemon_ping_without_repod_controls() {
         let mut command = Cli::command().help_template(<Commands as HelpTemplate>::help_template());
         let help = command.render_help().to_string();
 
-        assert!(!help.to_lowercase().contains("daemon"));
+        assert!(help.contains("Daemon:"));
+        assert!(help.contains("daemon"));
         assert!(!help.contains("--detect-related"));
         assert!(!help.contains("--clone-start-ttl-minutes"));
         assert!(!help.contains("--rpc-rate-limit-per-second"));
         assert!(help.contains("--root"));
         assert!(!help.contains("--clone-root"));
         assert!(!help.contains("--worktree-root"));
+    }
+
+    #[test]
+    fn repo_daemon_help_exposes_ping_without_repod_controls() {
+        let mut command = Cli::command();
+        let daemon = command.find_subcommand_mut("daemon").unwrap();
+        let help = daemon.render_long_help().to_string();
+
+        assert!(help.contains("ping"));
+        assert!(!help.contains("--detect-related"));
+        assert!(!help.contains("--clone-start-ttl-minutes"));
+        assert!(!help.contains("--rpc-rate-limit-per-second"));
     }
 
     #[test]
@@ -5296,6 +5378,16 @@ mod tests {
         assert!(help.contains("--detect-related"));
         assert!(help.contains("--clone-start-ttl-minutes"));
         assert!(help.contains("--rpc-rate-limit-per-second"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_ping_accepts_listening_unix_socket() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("repo-manager.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+
+        check_daemon_reachable(&format!("unix://{}", socket.display())).unwrap();
     }
 
     #[test]
