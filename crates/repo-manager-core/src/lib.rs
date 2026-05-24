@@ -1,5 +1,6 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read, Write};
 #[cfg(unix)]
@@ -407,7 +408,7 @@ struct ForkArgs {
 struct CheckArgs {
     #[arg(
         long,
-        help = "Remove safe stale metadata rows, record repairable unmanaged checkouts, and convert repairable fork/mirror checkouts into Git worktrees"
+        help = "Open an editor-backed repair plan for stale metadata, unmanaged checkouts, repository formats, and fork/mirror structure"
     )]
     repair: bool,
 
@@ -708,7 +709,7 @@ struct GitDirectoryDump {
     error: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct RepairStalePath {
     repo_id: i64,
     locator: Locator,
@@ -727,14 +728,14 @@ enum RepairStalePathStatus {
     Blocked,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct RepairStaleDependent {
     relationship: String,
     locator: Locator,
     path: PathBuf,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct RepairUntrackedCheckout {
     locator: Option<Locator>,
     path: PathBuf,
@@ -742,7 +743,7 @@ struct RepairUntrackedCheckout {
     reasons: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct RepairRepositoryFormat {
     repo_id: i64,
     locator: Locator,
@@ -751,7 +752,7 @@ struct RepairRepositoryFormat {
     reasons: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum RepairRepositoryFormatStatus {
     NeedsBareConversion,
@@ -759,7 +760,7 @@ enum RepairRepositoryFormatStatus {
     Skipped,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum RepairUntrackedCheckoutStatus {
     NeedsTracking,
@@ -767,7 +768,7 @@ enum RepairUntrackedCheckoutStatus {
     Skipped,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct RepairRelationship {
     relationship: String,
     #[serde(rename = "checkout_locator")]
@@ -784,7 +785,7 @@ struct RepairRelationship {
     shared_git_dir: Option<SharedGitDirResolution>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum RepairStatus {
     Ok,
@@ -792,7 +793,7 @@ enum RepairStatus {
     Repaired,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct RepairSkip {
     relationship: String,
     #[serde(rename = "checkout_locator")]
@@ -1258,6 +1259,8 @@ pub fn run() -> Result<()> {
                         );
                     }
                     dump_check(&config, &db)
+                } else if args.repair && !output.json {
+                    repair_repos_interactive(&config, &db, &output)
                 } else {
                     repair_repos(&config, &db, &output, !args.repair)
                 }
@@ -3645,6 +3648,357 @@ fn discovered_git_directory_dump(
 }
 
 fn repair_repos(config: &Config, db: &Store, output: &Output, check: bool) -> Result<()> {
+    let report = build_repair_report(config, db, check)?;
+    output_repair(output, &report)?;
+    if check && repair_report_needs_repair(&report) {
+        bail!("repo check found repairable issues; run `repo check --repair`");
+    }
+    Ok(())
+}
+
+fn repair_repos_interactive(config: &Config, db: &Store, output: &Output) -> Result<()> {
+    let check_report = build_repair_report(config, db, true)?;
+    if !repair_report_needs_repair(&check_report) {
+        output_repair(output, &check_report)?;
+        return Ok(());
+    }
+
+    let operations = repair_operations_from_report(&check_report);
+    let plan_path = write_repair_plan_file(&operations)?;
+    open_repair_plan_in_editor(&plan_path)?;
+    let selected = parse_repair_plan_file(&plan_path, &operations)?;
+    let _ = fs::remove_file(&plan_path);
+
+    println!(
+        "selected {} repair operation(s), skipped {}",
+        selected.len(),
+        operations.len().saturating_sub(selected.len())
+    );
+    if selected.is_empty() {
+        return Ok(());
+    }
+
+    let report = apply_repair_operations(config, db, &operations, &selected)?;
+    output_repair(output, &report)
+}
+
+#[derive(Debug, Clone)]
+struct RepairOperation {
+    id: usize,
+    summary: String,
+    details: Vec<String>,
+    kind: RepairOperationKind,
+}
+
+#[derive(Debug, Clone)]
+enum RepairOperationKind {
+    PruneStale(RepairStalePath),
+    ConvertRepositoryFormat(RepairRepositoryFormat),
+    TrackUnmanagedCheckout(RepairUntrackedCheckout),
+    RepairRelationship(Box<RepairRelationship>),
+}
+
+fn repair_operations_from_report(report: &RepairReport) -> Vec<RepairOperation> {
+    let mut operations = Vec::new();
+    let mut next_id = 1;
+
+    for stale in &report.stale_paths {
+        if !matches!(stale.status, RepairStalePathStatus::NeedsPrune) {
+            continue;
+        }
+        operations.push(RepairOperation {
+            id: next_id,
+            summary: format!("prune stale managed path {}", stale.locator.key()),
+            details: vec![format!("path: {}", stale.path.display())],
+            kind: RepairOperationKind::PruneStale(stale.clone()),
+        });
+        next_id += 1;
+    }
+
+    let mut format_groups: BTreeMap<PathBuf, Vec<&RepairRepositoryFormat>> = BTreeMap::new();
+    for format in &report.repository_formats {
+        if matches!(
+            format.status,
+            RepairRepositoryFormatStatus::NeedsBareConversion
+        ) {
+            format_groups
+                .entry(format.path.clone())
+                .or_default()
+                .push(format);
+        }
+    }
+    for (path, formats) in format_groups {
+        let locators = formats
+            .iter()
+            .map(|format| format.locator.key())
+            .collect::<Vec<_>>();
+        let Some(first) = formats.first() else {
+            continue;
+        };
+        operations.push(RepairOperation {
+            id: next_id,
+            summary: format!("convert clone-root repository to bare {}", path.display()),
+            details: vec![format!("locator(s): {}", locators.join(", "))],
+            kind: RepairOperationKind::ConvertRepositoryFormat((*first).clone()),
+        });
+        next_id += 1;
+    }
+
+    for checkout in &report.untracked_checkouts {
+        if !matches!(
+            checkout.status,
+            RepairUntrackedCheckoutStatus::NeedsTracking
+        ) {
+            continue;
+        }
+        let Some(locator) = &checkout.locator else {
+            continue;
+        };
+        operations.push(RepairOperation {
+            id: next_id,
+            summary: format!("track unmanaged clone-root checkout {}", locator.key()),
+            details: vec![format!("path: {}", checkout.path.display())],
+            kind: RepairOperationKind::TrackUnmanagedCheckout(checkout.clone()),
+        });
+        next_id += 1;
+    }
+
+    for relationship in &report.relationships {
+        if !matches!(relationship.status, RepairStatus::NeedsRepair) {
+            continue;
+        }
+        operations.push(RepairOperation {
+            id: next_id,
+            summary: format!(
+                "repair {} {} -> {}",
+                relationship.relationship,
+                relationship.dependent_locator.key(),
+                relationship.controlling_locator.key()
+            ),
+            details: summarized_relationship_reasons(relationship)
+                .into_iter()
+                .map(|reason| format!("reason: {reason}"))
+                .collect(),
+            kind: RepairOperationKind::RepairRelationship(Box::new(relationship.clone())),
+        });
+        next_id += 1;
+    }
+
+    operations
+}
+
+fn write_repair_plan_file(operations: &[RepairOperation]) -> Result<PathBuf> {
+    let plan_path = env::temp_dir().join(format!(
+        "repo-manager-repair-plan-{}.txt",
+        std::process::id()
+    ));
+    let mut text = String::new();
+    writeln!(text, "# repo-manager repair plan").unwrap();
+    writeln!(text, "#").unwrap();
+    writeln!(
+        text,
+        "# Leave `pick` to apply an operation. Change `pick` to `drop`,"
+    )
+    .unwrap();
+    writeln!(
+        text,
+        "# or delete an operation line, to skip that operation."
+    )
+    .unwrap();
+    writeln!(text, "# Lines beginning with `#` are ignored.").unwrap();
+    writeln!(text).unwrap();
+    for operation in operations {
+        writeln!(text, "pick {} {}", operation.id, operation.summary).unwrap();
+        for detail in &operation.details {
+            writeln!(text, "#   {detail}").unwrap();
+        }
+    }
+    fs::write(&plan_path, text)
+        .with_context(|| format!("writing repair plan {}", plan_path.display()))?;
+    Ok(plan_path)
+}
+
+fn open_repair_plan_in_editor(plan_path: &Path) -> Result<()> {
+    let editor = env::var("VISUAL")
+        .or_else(|_| env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".to_string());
+    let mut parts = editor.split_whitespace();
+    let program = parts.next().filter(|part| !part.is_empty()).unwrap_or("vi");
+    let mut command = Command::new(program);
+    command.args(parts);
+    command.arg(plan_path);
+    let status = command
+        .status()
+        .with_context(|| format!("opening repair plan with editor `{editor}`"))?;
+    if !status.success() {
+        bail!("repair plan editor exited with status {status}");
+    }
+    Ok(())
+}
+
+fn parse_repair_plan_file(
+    plan_path: &Path,
+    operations: &[RepairOperation],
+) -> Result<HashSet<usize>> {
+    let contents = fs::read_to_string(plan_path)
+        .with_context(|| format!("reading edited repair plan {}", plan_path.display()))?;
+    parse_repair_plan(&contents, operations)
+}
+
+fn parse_repair_plan(contents: &str, operations: &[RepairOperation]) -> Result<HashSet<usize>> {
+    let valid_ids = operations
+        .iter()
+        .map(|operation| operation.id)
+        .collect::<HashSet<_>>();
+    let mut selected = HashSet::new();
+    let mut seen = HashSet::new();
+    for (line_idx, line) in contents.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let command = parts
+            .next()
+            .ok_or_else(|| anyhow!("empty repair plan line {}", line_idx + 1))?;
+        let id_text = parts.next().ok_or_else(|| {
+            anyhow!(
+                "repair plan line {} is missing an operation id",
+                line_idx + 1
+            )
+        })?;
+        let id = id_text.parse::<usize>().with_context(|| {
+            format!(
+                "repair plan line {} has invalid operation id `{id_text}`",
+                line_idx + 1
+            )
+        })?;
+        if !valid_ids.contains(&id) {
+            bail!(
+                "repair plan line {} references unknown operation id {id}",
+                line_idx + 1
+            );
+        }
+        if !seen.insert(id) {
+            bail!(
+                "repair plan line {} repeats operation id {id}",
+                line_idx + 1
+            );
+        }
+        match command {
+            "pick" | "p" | "apply" => {
+                selected.insert(id);
+            }
+            "drop" | "d" | "skip" | "s" => {}
+            _ => bail!(
+                "repair plan line {} has unknown command `{command}`; use `pick` or `drop`",
+                line_idx + 1
+            ),
+        }
+    }
+    Ok(selected)
+}
+
+fn apply_repair_operations(
+    config: &Config,
+    db: &Store,
+    operations: &[RepairOperation],
+    selected: &HashSet<usize>,
+) -> Result<RepairReport> {
+    let mut report = RepairReport {
+        action: "check",
+        check: false,
+        repository_formats: Vec::new(),
+        stale_paths: Vec::new(),
+        untracked_checkouts: Vec::new(),
+        relationships: Vec::new(),
+        skipped: Vec::new(),
+    };
+
+    for operation in operations {
+        if !selected.contains(&operation.id) {
+            continue;
+        }
+        match &operation.kind {
+            RepairOperationKind::PruneStale(stale) => {
+                db.delete_repo(stale.repo_id)?;
+                report.stale_paths.push(RepairStalePath {
+                    repo_id: stale.repo_id,
+                    locator: stale.locator.clone(),
+                    path: stale.path.clone(),
+                    status: RepairStalePathStatus::Pruned,
+                    reasons: vec!["removed stale managed checkout metadata".to_string()],
+                    blocking_dependents: Vec::new(),
+                });
+            }
+            RepairOperationKind::ConvertRepositoryFormat(format) => {
+                let repo = ManagedRepoRecord {
+                    id: format.repo_id,
+                    current: format.locator.clone(),
+                    path: format.path.clone(),
+                };
+                report
+                    .repository_formats
+                    .push(convert_repo_format_to_bare(&repo));
+            }
+            RepairOperationKind::TrackUnmanagedCheckout(checkout) => {
+                if let Some(locator) = &checkout.locator {
+                    db.upsert_repo(locator, &checkout.path, None)?;
+                    report.untracked_checkouts.push(RepairUntrackedCheckout {
+                        locator: Some(locator.clone()),
+                        path: checkout.path.clone(),
+                        status: RepairUntrackedCheckoutStatus::Tracked,
+                        reasons: vec![
+                            "recorded previously unmanaged clone-root checkout".to_string(),
+                        ],
+                    });
+                } else {
+                    report.untracked_checkouts.push(RepairUntrackedCheckout {
+                        locator: None,
+                        path: checkout.path.clone(),
+                        status: RepairUntrackedCheckoutStatus::Skipped,
+                        reasons: vec![
+                            "origin remote is missing or is not a parseable repository locator"
+                                .to_string(),
+                        ],
+                    });
+                }
+            }
+            RepairOperationKind::RepairRelationship(relationship) => {
+                match materialize_related_shared_git_dir(
+                    db,
+                    &relationship.dependent_locator,
+                    &relationship.dependent_path,
+                    &relationship.controlling_locator,
+                    &relationship.controlling_path,
+                    &relationship.relationship,
+                    config.clone_as_bare,
+                ) {
+                    Ok(shared_git_dir) => report.relationships.push(RepairRelationship {
+                        relationship: relationship.relationship.clone(),
+                        dependent_locator: relationship.dependent_locator.clone(),
+                        controlling_locator: relationship.controlling_locator.clone(),
+                        dependent_path: relationship.dependent_path.clone(),
+                        controlling_path: relationship.controlling_path.clone(),
+                        status: RepairStatus::Repaired,
+                        reasons: relationship.reasons.clone(),
+                        shared_git_dir: Some(shared_git_dir),
+                    }),
+                    Err(error) => report.skipped.push(RepairSkip {
+                        relationship: relationship.relationship.clone(),
+                        dependent_locator: relationship.dependent_locator.clone(),
+                        controlling_locator: relationship.controlling_locator.clone(),
+                        reason: error.to_string(),
+                    }),
+                }
+            }
+        }
+    }
+
+    Ok(report)
+}
+
+fn build_repair_report(config: &Config, db: &Store, check: bool) -> Result<RepairReport> {
     let current_repos = db.current_repos()?;
     let mut current_by_locator = HashMap::new();
     let mut current_paths = HashSet::new();
@@ -3928,7 +4282,7 @@ fn repair_repos(config: &Config, db: &Store, output: &Output, check: bool) -> Re
         }
     }
 
-    let report = RepairReport {
+    Ok(RepairReport {
         action: "check",
         check,
         repository_formats,
@@ -3936,12 +4290,7 @@ fn repair_repos(config: &Config, db: &Store, output: &Output, check: bool) -> Re
         untracked_checkouts,
         relationships,
         skipped,
-    };
-    output_repair(output, &report)?;
-    if check && repair_report_needs_repair(&report) {
-        bail!("repo check found repairable issues; run `repo check --repair`");
-    }
-    Ok(())
+    })
 }
 
 fn repair_report_needs_repair(report: &RepairReport) -> bool {
@@ -6151,6 +6500,12 @@ fn output_repair(output: &Output, report: &RepairReport) -> Result<()> {
     if output.json {
         return print_json(report);
     }
+    print!("{}", format_repair_report(report));
+    Ok(())
+}
+
+fn format_repair_report(report: &RepairReport) -> String {
+    let mut text = String::new();
     let needs_repair = report
         .relationships
         .iter()
@@ -6216,82 +6571,119 @@ fn output_repair(output: &Output, report: &RepairReport) -> Result<()> {
         .iter()
         .filter(|checkout| matches!(checkout.status, RepairUntrackedCheckoutStatus::Skipped))
         .count();
-    println!(
+    writeln!(
+        text,
         "checked {} managed relationship(s)",
         report.relationships.len() + report.skipped.len()
-    );
+    )
+    .unwrap();
     if report.check {
-        println!("{needs_repair} relationship(s) need repair");
-        println!("{format_needs_conversion} repository format(s) need conversion");
-        println!("{stale_needs_prune} stale path(s) need pruning");
-        println!("{untracked_needs_tracking} unmanaged checkout(s) need tracking");
+        writeln!(text, "{needs_repair} relationship(s) need repair").unwrap();
+        writeln!(
+            text,
+            "{format_needs_conversion} repository format(s) need conversion"
+        )
+        .unwrap();
+        writeln!(text, "{stale_needs_prune} stale path(s) need pruning").unwrap();
+        writeln!(
+            text,
+            "{untracked_needs_tracking} unmanaged checkout(s) need tracking"
+        )
+        .unwrap();
     } else {
-        println!("repaired {repaired} relationship(s)");
-        println!("converted {format_converted} repository format(s)");
-        println!("pruned {stale_pruned} stale managed path(s)");
-        println!("tracked {untracked_tracked} unmanaged checkout(s)");
+        writeln!(text, "repaired {repaired} relationship(s)").unwrap();
+        writeln!(text, "converted {format_converted} repository format(s)").unwrap();
+        writeln!(text, "pruned {stale_pruned} stale managed path(s)").unwrap();
+        writeln!(text, "tracked {untracked_tracked} unmanaged checkout(s)").unwrap();
     }
     if format_skipped > 0 {
-        println!("{format_skipped} repository format conversion(s) skipped");
+        writeln!(
+            text,
+            "{format_skipped} repository format conversion(s) skipped"
+        )
+        .unwrap();
     }
     if stale_blocked > 0 {
-        println!("{stale_blocked} stale path(s) blocked by existing fork/mirror checkout(s)");
+        writeln!(
+            text,
+            "{stale_blocked} stale path(s) blocked by existing fork/mirror checkout(s)"
+        )
+        .unwrap();
     }
     if untracked_skipped > 0 {
-        println!("{untracked_skipped} unmanaged checkout(s) skipped");
+        writeln!(text, "{untracked_skipped} unmanaged checkout(s) skipped").unwrap();
     }
+
+    let mut issue_number = 1;
     if !report.stale_paths.is_empty() {
-        println!("stale managed path(s): {}", report.stale_paths.len());
+        writeln!(
+            text,
+            "\nstale managed path(s): {}",
+            report.stale_paths.len()
+        )
+        .unwrap();
         for stale in &report.stale_paths {
             let status = match stale.status {
                 RepairStalePathStatus::NeedsPrune => "needs prune",
                 RepairStalePathStatus::Pruned => "pruned",
                 RepairStalePathStatus::Blocked => "blocked",
             };
-            println!(
-                "  {status}: {} {}",
-                stale.locator.key(),
-                stale.path.display()
+            writeln!(text, "  [{issue_number}] {status}: {}", stale.locator.key(),).unwrap();
+            writeln!(text, "      path: {}", stale.path.display()).unwrap();
+            write_reasons(
+                &mut text,
+                &stale.reasons,
+                &["recorded checkout path does not exist"],
             );
-            for reason in &stale.reasons {
-                println!("    reason: {reason}");
-            }
             for dependent in &stale.blocking_dependents {
-                println!(
-                    "    {}: {} {}",
+                writeln!(
+                    text,
+                    "      blocks {}: {} {}",
                     dependent.relationship,
                     dependent.locator.key(),
                     dependent.path.display()
-                );
+                )
+                .unwrap();
             }
+            issue_number += 1;
         }
     }
     if !report.repository_formats.is_empty() {
-        println!(
-            "managed repository format issue(s): {}",
-            report.repository_formats.len()
-        );
-        for format in &report.repository_formats {
+        let grouped_formats = grouped_repository_formats(&report.repository_formats);
+        writeln!(
+            text,
+            "\nmanaged repository format issue(s): {}",
+            grouped_formats.len()
+        )
+        .unwrap();
+        for format in grouped_formats {
             let status = match format.status {
                 RepairRepositoryFormatStatus::NeedsBareConversion => "needs bare conversion",
                 RepairRepositoryFormatStatus::ConvertedToBare => "converted to bare",
                 RepairRepositoryFormatStatus::Skipped => "skipped",
             };
-            println!(
-                "  {status}: {} {}",
-                format.locator.key(),
+            writeln!(
+                text,
+                "  [{issue_number}] {status}: {}",
                 format.path.display()
+            )
+            .unwrap();
+            writeln!(text, "      locator(s): {}", format.locators.join(", ")).unwrap();
+            write_reasons(
+                &mut text,
+                &format.reasons,
+                &["clone-as-bare is enabled but this managed clone-root repository is non-bare"],
             );
-            for reason in &format.reasons {
-                println!("    reason: {reason}");
-            }
+            issue_number += 1;
         }
     }
     if !report.untracked_checkouts.is_empty() {
-        println!(
-            "unmanaged clone-root checkout(s): {}",
+        writeln!(
+            text,
+            "\nunmanaged clone-root checkout(s): {}",
             report.untracked_checkouts.len()
-        );
+        )
+        .unwrap();
         for checkout in &report.untracked_checkouts {
             let status = match checkout.status {
                 RepairUntrackedCheckoutStatus::NeedsTracking => "needs tracking",
@@ -6303,45 +6695,135 @@ fn output_repair(output: &Output, report: &RepairReport) -> Result<()> {
                 .as_ref()
                 .map(Locator::key)
                 .unwrap_or_else(|| "<unknown>".to_string());
-            println!("  {status}: {locator} {}", checkout.path.display());
-            for reason in &checkout.reasons {
-                println!("    reason: {reason}");
-            }
+            writeln!(text, "  [{issue_number}] {status}: {locator}").unwrap();
+            writeln!(text, "      path: {}", checkout.path.display()).unwrap();
+            write_reasons(&mut text, &checkout.reasons, &[]);
+            issue_number += 1;
         }
     }
-    for relationship in &report.relationships {
-        match relationship.status {
-            RepairStatus::Ok => {}
-            RepairStatus::NeedsRepair => println!(
-                "needs repair: {} {} -> {}",
+    let relationship_issues = report
+        .relationships
+        .iter()
+        .filter(|relationship| !matches!(relationship.status, RepairStatus::Ok))
+        .collect::<Vec<_>>();
+    if !relationship_issues.is_empty() {
+        writeln!(
+            text,
+            "\nrelationship issue(s): {}",
+            relationship_issues.len()
+        )
+        .unwrap();
+        for relationship in relationship_issues {
+            let status = match relationship.status {
+                RepairStatus::Ok => "ok",
+                RepairStatus::NeedsRepair => "needs repair",
+                RepairStatus::Repaired => "repaired",
+            };
+            writeln!(
+                text,
+                "  [{issue_number}] {status}: {} {} -> {}",
                 relationship.relationship,
                 relationship.dependent_locator.key(),
                 relationship.controlling_locator.key()
-            ),
-            RepairStatus::Repaired => println!(
-                "repaired: {} {} -> {}",
-                relationship.relationship,
-                relationship.dependent_locator.key(),
-                relationship.controlling_locator.key()
-            ),
-        }
-        for reason in &relationship.reasons {
-            println!("  reason: {reason}");
+            )
+            .unwrap();
+            write_reasons(
+                &mut text,
+                &summarized_relationship_reasons(relationship),
+                &[],
+            );
+            issue_number += 1;
         }
     }
     if !report.skipped.is_empty() {
-        println!("skipped {} relationship(s)", report.skipped.len());
+        writeln!(text, "\nskipped relationship(s): {}", report.skipped.len()).unwrap();
         for skipped in &report.skipped {
-            println!(
-                "  {} {} -> {}: {}",
+            writeln!(
+                text,
+                "  [{issue_number}] {} {} -> {}",
                 skipped.relationship,
                 skipped.dependent_locator.key(),
-                skipped.controlling_locator.key(),
-                skipped.reason
-            );
+                skipped.controlling_locator.key()
+            )
+            .unwrap();
+            writeln!(text, "      reason: {}", skipped.reason).unwrap();
+            issue_number += 1;
         }
     }
-    Ok(())
+
+    text
+}
+
+#[derive(Debug)]
+struct GroupedRepositoryFormat {
+    path: PathBuf,
+    status: RepairRepositoryFormatStatus,
+    locators: Vec<String>,
+    reasons: Vec<String>,
+}
+
+fn grouped_repository_formats(formats: &[RepairRepositoryFormat]) -> Vec<GroupedRepositoryFormat> {
+    let mut grouped: BTreeMap<(PathBuf, RepairRepositoryFormatStatus), GroupedRepositoryFormat> =
+        BTreeMap::new();
+    for format in formats {
+        let key = (format.path.clone(), format.status);
+        let entry = grouped
+            .entry(key)
+            .or_insert_with(|| GroupedRepositoryFormat {
+                path: format.path.clone(),
+                status: format.status,
+                locators: Vec::new(),
+                reasons: Vec::new(),
+            });
+        entry.locators.push(format.locator.key());
+        for reason in &format.reasons {
+            if !entry.reasons.contains(reason) {
+                entry.reasons.push(reason.clone());
+            }
+        }
+    }
+    grouped.into_values().collect()
+}
+
+fn write_reasons(text: &mut String, reasons: &[String], omitted: &[&str]) {
+    for reason in reasons {
+        if omitted.iter().any(|omitted| *omitted == reason) {
+            continue;
+        }
+        writeln!(text, "      reason: {reason}").unwrap();
+    }
+}
+
+fn summarized_relationship_reasons(relationship: &RepairRelationship) -> Vec<String> {
+    let mut summarized = Vec::new();
+    let mut canonical_non_bare = false;
+    let mut dependent_non_bare = false;
+
+    for reason in &relationship.reasons {
+        if reason.starts_with("canonical checkout is non-bare but clone-as-bare is enabled:") {
+            canonical_non_bare = true;
+        } else if reason.contains(" checkout is non-bare but clone-as-bare is enabled:") {
+            dependent_non_bare = true;
+        } else if !summarized.contains(reason) {
+            summarized.push(reason.clone());
+        }
+    }
+
+    match (canonical_non_bare, dependent_non_bare) {
+        (true, true) => summarized.push(format!(
+            "canonical and {} repositories are non-bare while clone-as-bare is enabled",
+            relationship.relationship
+        )),
+        (true, false) => summarized
+            .push("canonical repository is non-bare while clone-as-bare is enabled".to_string()),
+        (false, true) => summarized.push(format!(
+            "{} repository is non-bare while clone-as-bare is enabled",
+            relationship.relationship
+        )),
+        (false, false) => {}
+    }
+
+    summarized
 }
 
 fn output_related(output: &Output, suggestions: &[RelatedSuggestion]) -> Result<()> {
@@ -6746,6 +7228,105 @@ mod tests {
     }
 
     #[test]
+    fn repair_plan_parser_accepts_pick_drop_and_deleted_lines() {
+        let operations = vec![
+            test_repair_operation(1, "one"),
+            test_repair_operation(2, "two"),
+            test_repair_operation(3, "three"),
+        ];
+
+        let selected = parse_repair_plan(
+            "# comment\npick 1 one\ndrop 2 two\np 3 three\n",
+            &operations,
+        )
+        .unwrap();
+
+        assert!(selected.contains(&1));
+        assert!(!selected.contains(&2));
+        assert!(selected.contains(&3));
+        assert_eq!(selected.len(), 2);
+        assert!(parse_repair_plan("pick 4 unknown\n", &operations).is_err());
+        assert!(parse_repair_plan("pick 1 one\npick 1 duplicate\n", &operations).is_err());
+    }
+
+    #[test]
+    fn repair_report_output_numbers_and_groups_redundant_format_issues() {
+        let shared_path = PathBuf::from("/tmp/clones/github.com/upstream/project");
+        let report = RepairReport {
+            action: "check",
+            check: true,
+            stale_paths: vec![RepairStalePath {
+                repo_id: 1,
+                locator: Locator::parse("example.com/missing").unwrap(),
+                path: PathBuf::from("/tmp/clones/example.com/missing"),
+                status: RepairStalePathStatus::NeedsPrune,
+                reasons: vec!["recorded checkout path does not exist".to_string()],
+                blocking_dependents: Vec::new(),
+            }],
+            repository_formats: vec![
+                RepairRepositoryFormat {
+                    repo_id: 2,
+                    locator: Locator::parse("github.com/upstream/project").unwrap(),
+                    path: shared_path.clone(),
+                    status: RepairRepositoryFormatStatus::NeedsBareConversion,
+                    reasons: vec![
+                        "clone-as-bare is enabled but this managed clone-root repository is non-bare"
+                            .to_string(),
+                    ],
+                },
+                RepairRepositoryFormat {
+                    repo_id: 3,
+                    locator: Locator::parse("github.com/fork/project").unwrap(),
+                    path: shared_path,
+                    status: RepairRepositoryFormatStatus::NeedsBareConversion,
+                    reasons: vec![
+                        "clone-as-bare is enabled but this managed clone-root repository is non-bare"
+                            .to_string(),
+                    ],
+                },
+            ],
+            untracked_checkouts: Vec::new(),
+            relationships: vec![RepairRelationship {
+                relationship: "fork".to_string(),
+                dependent_locator: Locator::parse("github.com/fork/project").unwrap(),
+                controlling_locator: Locator::parse("github.com/upstream/project").unwrap(),
+                dependent_path: PathBuf::from("/tmp/clones/github.com/fork/project"),
+                controlling_path: PathBuf::from("/tmp/clones/github.com/upstream/project"),
+                status: RepairStatus::NeedsRepair,
+                reasons: vec![
+                    "canonical checkout is non-bare but clone-as-bare is enabled: /tmp/clones/github.com/upstream/project"
+                        .to_string(),
+                    "fork checkout is non-bare but clone-as-bare is enabled: /tmp/clones/github.com/fork/project"
+                        .to_string(),
+                    "fork branch has no upstream, expected `fork-github.com-fork-project/main`"
+                        .to_string(),
+                ],
+                shared_git_dir: None,
+            }],
+            skipped: Vec::new(),
+        };
+
+        let text = format_repair_report(&report);
+
+        assert!(text.contains("[1] needs prune: example.com/missing"));
+        assert!(
+            text.contains("[2] needs bare conversion: /tmp/clones/github.com/upstream/project")
+        );
+        assert!(text.contains("locator(s): github.com/upstream/project, github.com/fork/project"));
+        assert!(text.contains(
+            "[3] needs repair: fork github.com/fork/project -> github.com/upstream/project"
+        ));
+        assert!(text.contains(
+            "canonical and fork repositories are non-bare while clone-as-bare is enabled"
+        ));
+        assert_eq!(
+            text.matches("managed clone-root repository is non-bare")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
     fn ghq_root_is_configured_with_environment() {
         let command = ghq_get_command(Path::new("/tmp/clones"), "https://github.com/owner/repo");
         let args = command
@@ -6766,6 +7347,22 @@ mod tests {
             envs.iter()
                 .any(|(key, value)| key == "GHQ_ROOT" && value.as_deref() == Some("/tmp/clones"))
         );
+    }
+
+    fn test_repair_operation(id: usize, summary: &str) -> RepairOperation {
+        RepairOperation {
+            id,
+            summary: summary.to_string(),
+            details: Vec::new(),
+            kind: RepairOperationKind::PruneStale(RepairStalePath {
+                repo_id: id as i64,
+                locator: Locator::parse(&format!("example.com/{summary}")).unwrap(),
+                path: PathBuf::from(format!("/tmp/{summary}")),
+                status: RepairStalePathStatus::NeedsPrune,
+                reasons: Vec::new(),
+                blocking_dependents: Vec::new(),
+            }),
+        }
     }
 
     #[test]
