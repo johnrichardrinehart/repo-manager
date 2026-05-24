@@ -28,6 +28,9 @@ fn expand_help_group(input: DeriveInput) -> Result<proc_macro2::TokenStream> {
     let mut command_exprs = Vec::new();
 
     for variant in variants {
+        if command_hidden(&variant.attrs)? {
+            continue;
+        }
         let name = command_name(&variant.attrs)?
             .unwrap_or_else(|| to_kebab_case(&variant.ident.to_string()));
         let about = command_about(&variant.attrs)?.ok_or_else(|| {
@@ -141,6 +144,25 @@ fn command_about(attrs: &[Attribute]) -> Result<Option<String>> {
     command_lit_string(attrs, "about")
 }
 
+fn command_hidden(attrs: &[Attribute]) -> Result<bool> {
+    for attr in attrs.iter().filter(|attr| attr.path().is_ident("command")) {
+        if let Meta::List(list) = &attr.meta {
+            let entries = list.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)?;
+            for entry in entries {
+                match entry {
+                    Meta::Path(path) if path.is_ident("hide") => return Ok(true),
+                    Meta::NameValue(name_value) if name_value.path.is_ident("hide") => {
+                        return bool_expr(&name_value.value);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    Ok(false)
+}
+
 fn command_lit_string(attrs: &[Attribute], key: &str) -> Result<Option<String>> {
     for attr in attrs.iter().filter(|attr| attr.path().is_ident("command")) {
         if let Meta::List(list) = &attr.meta {
@@ -157,6 +179,19 @@ fn command_lit_string(attrs: &[Attribute], key: &str) -> Result<Option<String>> 
     }
 
     Ok(None)
+}
+
+fn bool_expr(expr: &Expr) -> Result<bool> {
+    match expr {
+        Expr::Lit(ExprLit {
+            lit: Lit::Bool(value),
+            ..
+        }) => Ok(value.value),
+        _ => Err(Error::new_spanned(
+            expr,
+            "grouped help hide attributes must use bool literals",
+        )),
+    }
 }
 
 fn string_expr(expr: &Expr) -> Result<String> {

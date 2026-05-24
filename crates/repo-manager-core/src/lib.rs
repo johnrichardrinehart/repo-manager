@@ -227,10 +227,16 @@ enum RepositoryOperationCommands {
     #[command(about = "Create or register a fork worktree for a canonical repository")]
     Fork(ForkArgs),
     #[command(
-        about = "Repair managed repository filesystem structure",
-        long_about = "Repair managed repository filesystem structure from repo-manager metadata.\n\nThis verifies managed paths and rematerializes fork/mirror relationships so fork and mirror checkouts reuse the canonical repository's Git directory as worktrees. Use --check to report drift without changing repositories or metadata."
+        about = "Find missing tracked checkouts and unmaterialized fork/mirror worktrees",
+        long_about = "Find missing checkout paths and incomplete fork/mirror worktree relationships in repo-manager metadata.\n\nrepo-manager only checks repositories and relationships already recorded in its SQLite database. It does not scan for unmanaged Git checkouts, register new repositories, or recreate missing canonical clones.\n\nBy default, this command is read-only. With --repair, it removes safe stale metadata rows and converts repairable fork/mirror checkouts into Git worktrees of their canonical checkouts."
     )]
-    Repair(RepairArgs),
+    Check(CheckArgs),
+    #[command(
+        hide = true,
+        about = "Deprecated alias for `repo check --repair`",
+        long_about = "Deprecated alias for `repo check --repair`."
+    )]
+    Repair(DeprecatedRepairArgs),
     #[command(about = "Manage development worktrees under the managed dev-worktree root")]
     Worktree(WorktreeCommand),
 }
@@ -386,11 +392,17 @@ struct ForkArgs {
 }
 
 #[derive(Debug, Args)]
-struct RepairArgs {
+struct CheckArgs {
     #[arg(
         long,
-        help = "Only report drift; do not change repositories or metadata"
+        help = "Remove safe stale metadata rows and convert repairable fork/mirror checkouts into Git worktrees"
     )]
+    repair: bool,
+}
+
+#[derive(Debug, Args)]
+struct DeprecatedRepairArgs {
+    #[arg(long, help = "Deprecated; `repo check` is read-only by default")]
     check: bool,
 }
 
@@ -1130,6 +1142,10 @@ pub fn run() -> Result<()> {
             RepositoryOperationCommands::Fork(args) => {
                 let db = Store::open(&config.state)?;
                 fork_repo(&config, &db, &output, &args.fork_url, &args.canonical)
+            }
+            RepositoryOperationCommands::Check(args) => {
+                let db = Store::open(&config.state)?;
+                repair_repos(&db, &output, !args.repair)
             }
             RepositoryOperationCommands::Repair(args) => {
                 let db = Store::open(&config.state)?;
@@ -3335,7 +3351,7 @@ fn repair_repos(db: &Store, output: &Output, check: bool) -> Result<()> {
     output_repair(
         output,
         &RepairReport {
-            action: "repair",
+            action: "check",
             check,
             stale_paths,
             relationships,
@@ -5255,6 +5271,8 @@ mod tests {
 
         assert!(help.contains("Command groups:"));
         assert!(help.contains("Repository operations:"));
+        assert!(help.contains("check"));
+        assert!(!help.contains("repair"));
         assert!(help.contains("Organizational Changes:"));
         assert!(help.contains("Organizational Analysis:"));
         assert!(help.contains("Daemon:"));
