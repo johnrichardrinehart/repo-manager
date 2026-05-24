@@ -39,10 +39,17 @@ root for shared Git history.
 same for detected moves, preserving the existing remote URL style when
 possible.
 
-Forks are Git worktrees under the clone root, not development worktrees under
-the dev-worktree root. Each fork gets a stable remote name derived from its
-locator, so the canonical checkout and every fork worktree share the same
-`git remote -v` view: `origin` plus all fork remotes.
+By default, forks and mirrors are Git worktrees under the clone root, not
+development worktrees under the dev-worktree root. Each fork or mirror gets a
+stable remote name derived from its locator, so the canonical checkout and
+every dependent checkout share the same `git remote -v` view: `origin` plus all
+dependent remotes.
+
+Set `clone-as-bare` to `true` in the config file to keep clone-root repositories
+bare. In that mode, `repo clone` creates bare repositories, `repo fork` records
+bare fork repositories instead of fork worktrees, and fork/mirror repair avoids
+creating checked-out dependent trees. Checked-out working trees should be
+created under the dev-worktree root with `repo worktree add`.
 
 ## Daemon API
 
@@ -53,6 +60,10 @@ event root when comparing repositories for shared Git history. `repod` is
 intended to run as the same user as the `repo` client, using the same config and
 state database. Shared-history review is enabled by default and can be disabled
 with `--detect-related=false` or `REPO_MANAGER_DETECT_RELATED=false`.
+Set `background-fetch-minimum-interval-seconds` to make `repod` periodically
+fetch tracked repositories. The daemon records fetch activity in SQLite, backs
+off quiet repositories, and resets active repositories to the configured
+minimum interval when a fetch observes ref changes.
 
 RPC clients and daemons include an envelope protocol version. The current
 protocol is v1; breaking protobuf changes require a v2 protocol and are

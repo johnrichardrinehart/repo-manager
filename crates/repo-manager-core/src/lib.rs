@@ -11,7 +11,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -188,6 +188,14 @@ struct DaemonConfigArgs {
         help = "RPC receive rate limit per client (default: 1; 0 disables)"
     )]
     rpc_rate_limit_per_second: Option<u32>,
+
+    #[arg(
+        long,
+        env = "REPO_MANAGER_BACKGROUND_FETCH_MINIMUM_INTERVAL_SECONDS",
+        value_name = "SECONDS",
+        help = "Minimum interval between background fetches per tracked clone; disabled when unset"
+    )]
+    background_fetch_minimum_interval_seconds: Option<u64>,
 }
 
 #[derive(Debug, Subcommand, HelpTemplate)]
@@ -576,6 +584,7 @@ struct Config {
     rpc_url: String,
     client_id: String,
     assume_origin_as_canonical: bool,
+    clone_as_bare: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -584,6 +593,7 @@ struct DaemonConfig {
     detect_related: bool,
     clone_start_ttl_minutes: u64,
     rpc_rate_limit_per_second: u32,
+    background_fetch_minimum_interval_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -599,9 +609,13 @@ struct FileConfig {
     rpc_url: Option<String>,
     client_id: Option<String>,
     assume_origin_as_canonical: Option<bool>,
+    #[serde(alias = "clone-as-bare")]
+    clone_as_bare: Option<bool>,
     detect_related: Option<bool>,
     clone_start_ttl_minutes: Option<u64>,
     rpc_rate_limit_per_second: Option<u32>,
+    #[serde(alias = "background-fetch-minimum-interval-seconds")]
+    background_fetch_minimum_interval_seconds: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1204,7 +1218,7 @@ pub fn run() -> Result<()> {
                 match command.command {
                     RelatedSubcommand::List => related_list(&db, &output),
                     RelatedSubcommand::Resolve(args) => {
-                        related_resolve(&db, &output, args.id, &args.kind)
+                        related_resolve(&config, &db, &output, args.id, &args.kind)
                     }
                 }
             }
@@ -1286,6 +1300,7 @@ impl Config {
             .assume_origin_as_canonical
             .or(file_config.assume_origin_as_canonical)
             .unwrap_or(false);
+        let clone_as_bare = file_config.clone_as_bare.unwrap_or(false);
         Ok(Self {
             config_path,
             state,
@@ -1296,6 +1311,7 @@ impl Config {
             rpc_url,
             client_id,
             assume_origin_as_canonical,
+            clone_as_bare,
         })
     }
 }
@@ -1328,6 +1344,7 @@ impl FileConfig {
         self.assume_origin_as_canonical = other
             .assume_origin_as_canonical
             .or(self.assume_origin_as_canonical);
+        self.clone_as_bare = other.clone_as_bare.or(self.clone_as_bare);
         self.detect_related = other.detect_related.or(self.detect_related);
         self.clone_start_ttl_minutes = other
             .clone_start_ttl_minutes
@@ -1335,6 +1352,9 @@ impl FileConfig {
         self.rpc_rate_limit_per_second = other
             .rpc_rate_limit_per_second
             .or(self.rpc_rate_limit_per_second);
+        self.background_fetch_minimum_interval_seconds = other
+            .background_fetch_minimum_interval_seconds
+            .or(self.background_fetch_minimum_interval_seconds);
     }
 
     fn save(&self, path: &Path) -> Result<()> {
@@ -1380,6 +1400,9 @@ impl DaemonConfig {
             .rpc_rate_limit_per_second
             .or(file_config.rpc_rate_limit_per_second)
             .unwrap_or(1);
+        let background_fetch_minimum_interval_seconds = args
+            .background_fetch_minimum_interval_seconds
+            .or(file_config.background_fetch_minimum_interval_seconds);
 
         Ok((
             Self {
@@ -1387,6 +1410,7 @@ impl DaemonConfig {
                 detect_related,
                 clone_start_ttl_minutes,
                 rpc_rate_limit_per_second,
+                background_fetch_minimum_interval_seconds,
             },
             rpc_url,
         ))
@@ -1404,9 +1428,11 @@ fn setup_config(config: &Config, output: &Output, args: SetupArgs) -> Result<()>
         assume_origin_as_canonical: args
             .assume_origin_as_canonical
             .or(Some(config.assume_origin_as_canonical)),
+        clone_as_bare: Some(config.clone_as_bare),
         detect_related: None,
         clone_start_ttl_minutes: None,
         rpc_rate_limit_per_second: None,
+        background_fetch_minimum_interval_seconds: None,
     };
     file_config.save(&config_path)?;
     let result = SetupResult {
@@ -1561,6 +1587,7 @@ impl Locator {
         let url = Url::parse(input).with_context(|| format!("invalid Git URL: {input}"))?;
         let host = url
             .host_str()
+            .or_else(|| (url.scheme() == "file").then_some("localhost"))
             .ok_or_else(|| anyhow!("URL does not include an authority: {input}"))?;
         let authority = match url.port() {
             Some(port) => format!("{}:{port}", host.to_ascii_lowercase()),
@@ -1740,6 +1767,13 @@ struct ManagedRepoRecord {
     path: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+struct BackgroundFetchCandidate {
+    repo_id: i64,
+    locator: Locator,
+    path: PathBuf,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GitRemote {
     name: String,
@@ -1872,6 +1906,15 @@ impl Store {
               resolved_at TEXT,
               UNIQUE(repo_id, related_repo_id)
             );
+
+            CREATE TABLE IF NOT EXISTS background_fetch (
+              repo_id INTEGER PRIMARY KEY REFERENCES repos(id) ON DELETE CASCADE,
+              last_fetch_at INTEGER,
+              last_changed_at INTEGER,
+              learned_interval_seconds INTEGER NOT NULL,
+              last_status TEXT,
+              last_error TEXT
+            );
             ",
         )?;
         Ok(())
@@ -1991,6 +2034,115 @@ impl Store {
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    fn background_fetch_candidates(
+        &self,
+        now_epoch_seconds: i64,
+        minimum_interval_seconds: u64,
+    ) -> Result<Vec<BackgroundFetchCandidate>> {
+        let minimum_interval_seconds = minimum_interval_seconds.max(1) as i64;
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT
+              repos.id,
+              repos.current_authority,
+              repos.current_remote_path,
+              repos.current_path
+            FROM repos
+            LEFT JOIN background_fetch ON background_fetch.repo_id = repos.id
+            WHERE background_fetch.last_fetch_at IS NULL
+               OR ?1 - background_fetch.last_fetch_at >=
+                  MAX(background_fetch.learned_interval_seconds, ?2)
+            ORDER BY repos.current_authority, repos.current_remote_path
+            ",
+        )?;
+        let rows = stmt.query_map(
+            params![now_epoch_seconds, minimum_interval_seconds],
+            |row| {
+                Ok(BackgroundFetchCandidate {
+                    repo_id: row.get(0)?,
+                    locator: Locator {
+                        authority: row.get(1)?,
+                        remote_path: row.get(2)?,
+                    },
+                    path: PathBuf::from(row.get::<_, String>(3)?),
+                })
+            },
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    fn record_background_fetch(
+        &self,
+        repo_id: i64,
+        now_epoch_seconds: i64,
+        minimum_interval_seconds: u64,
+        changed: bool,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let minimum_interval_seconds = minimum_interval_seconds.max(1) as i64;
+        let existing: Option<(Option<i64>, i64)> = self
+            .conn
+            .query_row(
+                "SELECT last_changed_at, learned_interval_seconds FROM background_fetch WHERE repo_id = ?1",
+                params![repo_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let previous_interval = existing
+            .as_ref()
+            .map(|(_, interval)| (*interval).max(minimum_interval_seconds))
+            .unwrap_or(minimum_interval_seconds);
+        let learned_interval = if changed {
+            minimum_interval_seconds
+        } else {
+            previous_interval
+                .saturating_mul(2)
+                .min(minimum_interval_seconds.saturating_mul(24))
+                .max(minimum_interval_seconds)
+        };
+        let last_changed_at = if changed {
+            Some(now_epoch_seconds)
+        } else {
+            existing.and_then(|(last_changed_at, _)| last_changed_at)
+        };
+        let status = if error.is_some() {
+            "error"
+        } else if changed {
+            "changed"
+        } else {
+            "unchanged"
+        };
+        self.conn.execute(
+            "
+            INSERT INTO background_fetch (
+              repo_id,
+              last_fetch_at,
+              last_changed_at,
+              learned_interval_seconds,
+              last_status,
+              last_error
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(repo_id) DO UPDATE SET
+              last_fetch_at = excluded.last_fetch_at,
+              last_changed_at = COALESCE(excluded.last_changed_at, background_fetch.last_changed_at),
+              learned_interval_seconds = excluded.learned_interval_seconds,
+              last_status = excluded.last_status,
+              last_error = excluded.last_error
+            ",
+            params![
+                repo_id,
+                now_epoch_seconds,
+                last_changed_at,
+                learned_interval,
+                status,
+                error,
+            ],
+        )?;
+        Ok(())
     }
 
     fn delete_repo(&self, repo_id: i64) -> Result<()> {
@@ -2330,7 +2482,7 @@ fn clone_repo(config: &Config, db: &Store, output: &Output, url: &str) -> Result
         path: path.clone(),
         scan_root: config.clone_root.clone(),
     };
-    let clone_result = if which::which("ghq").is_ok() {
+    let clone_result = if !config.clone_as_bare && which::which("ghq").is_ok() {
         match run_clone_command_with_cancellation(
             ghq_get_command(&config.clone_root, url),
             "ghq get",
@@ -2338,15 +2490,19 @@ fn clone_repo(config: &Config, db: &Store, output: &Output, url: &str) -> Result
         )? {
             CloneCommandOutcome::Success => Ok(()),
             CloneCommandOutcome::Failed => run_clone_command_with_cancellation(
-                git_clone_command(url, &path),
+                git_clone_command(url, &path, config.clone_as_bare),
                 "git clone",
                 &lifecycle,
             )
             .and_then(CloneCommandOutcome::into_result),
         }
     } else {
-        run_clone_command_with_cancellation(git_clone_command(url, &path), "git clone", &lifecycle)
-            .and_then(CloneCommandOutcome::into_result)
+        run_clone_command_with_cancellation(
+            git_clone_command(url, &path, config.clone_as_bare),
+            "git clone",
+            &lifecycle,
+        )
+        .and_then(CloneCommandOutcome::into_result)
     };
     if let Err(error) = clone_result {
         send_rpc_event_best_effort(
@@ -2665,6 +2821,7 @@ fn record_manage_remote_relationships(
                 plan.canonical_locator,
                 &canonical_path,
                 plan.relationship.as_str(),
+                config.clone_as_bare,
             )?;
             return Ok(());
         }
@@ -3053,17 +3210,29 @@ fn ghq_get_command(root: &Path, url: &str) -> Command {
     command
 }
 
-fn git_clone_command(url: &str, path: &Path) -> Command {
+fn git_clone_command(url: &str, path: &Path, bare: bool) -> Command {
     let mut command = Command::new("git");
     command
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
         .env_remove("GIT_PREFIX")
-        .arg("clone")
-        .arg(url)
-        .arg(path);
+        .arg("clone");
+    if bare {
+        command.arg("--bare");
+    }
+    command.arg(url).arg(path);
     command
+}
+
+fn run_git_clone(url: &str, path: &Path, bare: bool) -> Result<()> {
+    let status = git_clone_command(url, path, bare)
+        .status()
+        .with_context(|| format!("cloning {url} to {}", path.display()))?;
+    if !status.success() {
+        bail!("git clone failed with status {status}");
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -3173,6 +3342,34 @@ fn fork_repo(
     let canonical_path = locator_path(&config.clone_root, &canonical_locator);
     let fork_remote = fork_remote_name(&fork_locator);
     fs::create_dir_all(fork_path.parent().context("fork path has no parent")?)?;
+    if config.clone_as_bare {
+        if fork_path.exists() {
+            ensure_bare_repository(&fork_path)?;
+            ensure_remote(&fork_path, "origin", fork_url)?;
+        } else {
+            run_git_clone(fork_url, &fork_path, true)?;
+        }
+        if canonical_path.exists() {
+            ensure_bare_repository(&canonical_path)?;
+            ensure_remote(&canonical_path, "origin", canonical_url)?;
+            ensure_remote(&canonical_path, &fork_remote, fork_url)?;
+            run_git_in(&canonical_path, ["fetch", &fork_remote])?;
+        }
+        let canonical_id = db.upsert_repo(&canonical_locator, &canonical_path, None)?;
+        let fork_id = db.upsert_repo(&fork_locator, &fork_path, Some(&canonical_locator.key()))?;
+        db.record_fork(fork_id, canonical_id)?;
+        return output_fork(
+            output,
+            &ForkResult {
+                action: "fork",
+                fork_locator,
+                canonical_locator,
+                fork_path,
+                canonical_path,
+                fork_remote,
+            },
+        );
+    }
     ensure_remote(&canonical_path, "origin", canonical_url)?;
     ensure_remote(&canonical_path, &fork_remote, fork_url)?;
     run_git_in(&canonical_path, ["fetch", &fork_remote])?;
@@ -3388,18 +3585,19 @@ fn repair_repos(config: &Config, db: &Store, output: &Output, check: bool) -> Re
             continue;
         }
 
-        let repair_reasons = match shared_git_dir_relationship_repair_reasons(&relationship) {
-            Ok(repair_reasons) => repair_reasons,
-            Err(error) => {
-                skipped.push(RepairSkip {
-                    relationship: relationship.relationship,
-                    dependent_locator: relationship.dependent_locator,
-                    controlling_locator: relationship.controlling_locator,
-                    reason: error.to_string(),
-                });
-                continue;
-            }
-        };
+        let repair_reasons =
+            match shared_git_dir_relationship_repair_reasons(&relationship, config.clone_as_bare) {
+                Ok(repair_reasons) => repair_reasons,
+                Err(error) => {
+                    skipped.push(RepairSkip {
+                        relationship: relationship.relationship,
+                        dependent_locator: relationship.dependent_locator,
+                        controlling_locator: relationship.controlling_locator,
+                        reason: error.to_string(),
+                    });
+                    continue;
+                }
+            };
 
         if repair_reasons.is_empty() {
             relationships.push(RepairRelationship {
@@ -3436,6 +3634,7 @@ fn repair_repos(config: &Config, db: &Store, output: &Output, check: bool) -> Re
             &relationship.controlling_locator,
             &relationship.controlling_path,
             &relationship.relationship,
+            config.clone_as_bare,
         ) {
             Ok(shared_git_dir) => relationships.push(RepairRelationship {
                 relationship: relationship.relationship,
@@ -3471,6 +3670,7 @@ fn repair_repos(config: &Config, db: &Store, output: &Output, check: bool) -> Re
 
 fn shared_git_dir_relationship_repair_reasons(
     relationship: &SharedGitDirRelationship,
+    clone_as_bare: bool,
 ) -> Result<Vec<String>> {
     let mut reasons = Vec::new();
     let controlling_origin = git_origin_url(&relationship.controlling_path)?;
@@ -3493,6 +3693,12 @@ fn shared_git_dir_relationship_repair_reasons(
                 relationship.relationship
             ),
         });
+    }
+    if clone_as_bare
+        && is_bare_repository(&relationship.dependent_path)?
+        && is_bare_repository(&relationship.controlling_path)?
+    {
+        return Ok(reasons);
     }
     let dependent_common_dir = git_common_dir(&relationship.dependent_path)?;
     let controlling_common_dir = git_common_dir(&relationship.controlling_path)?;
@@ -3741,10 +3947,16 @@ fn related_list(db: &Store, output: &Output) -> Result<()> {
     output_related(output, &db.related_suggestions(true)?)
 }
 
-fn related_resolve(db: &Store, output: &Output, id: i64, kind: &str) -> Result<()> {
+fn related_resolve(
+    config: &Config,
+    db: &Store,
+    output: &Output,
+    id: i64,
+    kind: &str,
+) -> Result<()> {
     validate_relationship_kind(kind)?;
     let shared_git_dir = matches!(kind, "fork" | "mirror")
-        .then(|| resolve_related_shared_git_dir(db, id, kind))
+        .then(|| resolve_related_shared_git_dir(config, db, id, kind))
         .transpose()?;
     db.resolve_related(id, kind)?;
     output_related_resolution(
@@ -3759,6 +3971,7 @@ fn related_resolve(db: &Store, output: &Output, id: i64, kind: &str) -> Result<(
 }
 
 fn resolve_related_shared_git_dir(
+    config: &Config,
     db: &Store,
     id: i64,
     relationship: &str,
@@ -3774,6 +3987,7 @@ fn resolve_related_shared_git_dir(
         &suggestion.related_locator,
         &suggestion.related_path,
         relationship,
+        config.clone_as_bare,
     )
 }
 
@@ -3784,6 +3998,7 @@ fn materialize_related_shared_git_dir(
     controlling_locator: &Locator,
     controlling_path: &Path,
     relationship: &str,
+    clone_as_bare: bool,
 ) -> Result<SharedGitDirResolution> {
     if !dependent_path.exists() {
         bail!(
@@ -3795,6 +4010,17 @@ fn materialize_related_shared_git_dir(
         bail!(
             "canonical checkout does not exist: {}",
             controlling_path.display()
+        );
+    }
+
+    if clone_as_bare {
+        return materialize_related_bare_repo(
+            db,
+            dependent_locator,
+            dependent_path,
+            controlling_locator,
+            controlling_path,
+            relationship,
         );
     }
 
@@ -3850,6 +4076,73 @@ fn materialize_related_shared_git_dir(
         local_branch,
         remote_branch,
         converted_to_worktree,
+    })
+}
+
+fn materialize_related_bare_repo(
+    db: &Store,
+    dependent_locator: &Locator,
+    dependent_path: &Path,
+    controlling_locator: &Locator,
+    controlling_path: &Path,
+    relationship: &str,
+) -> Result<SharedGitDirResolution> {
+    if !controlling_path.exists() {
+        bail!(
+            "canonical bare repository does not exist: {}",
+            controlling_path.display()
+        );
+    }
+    ensure_bare_repository(controlling_path)?;
+
+    let controlling_origin = git_origin_url(controlling_path)?;
+    let controlling_url =
+        remote_url_for_locator(controlling_origin.as_deref(), controlling_locator);
+    ensure_remote(controlling_path, "origin", &controlling_url)?;
+    let dependent_url = remote_url_for_locator(controlling_origin.as_deref(), dependent_locator);
+    if dependent_path.exists() {
+        ensure_bare_repository(dependent_path)?;
+        ensure_remote(dependent_path, "origin", &dependent_url)?;
+    } else {
+        fs::create_dir_all(
+            dependent_path
+                .parent()
+                .context("dependent bare repository path has no parent")?,
+        )?;
+        run_git_clone(&dependent_url, dependent_path, true)?;
+    }
+
+    let dependent_remote = related_remote_name(relationship, dependent_locator);
+    ensure_remote(controlling_path, &dependent_remote, &dependent_url)?;
+    fetch_remote_refs(controlling_path, &dependent_remote)?;
+    run_git_in(dependent_path, ["fetch", "--all", "--prune"])?;
+    let default_branch = remote_default_branch(controlling_path, &dependent_remote)?
+        .unwrap_or_else(|| "HEAD".into());
+    let local_branch = dependent_local_branch(relationship, dependent_locator, &default_branch);
+    let remote_branch = format!("{dependent_remote}/{default_branch}");
+
+    let controlling_id = db.upsert_repo(controlling_locator, controlling_path, None)?;
+    let dependent_id = db.upsert_repo(
+        dependent_locator,
+        dependent_path,
+        Some(&controlling_locator.key()),
+    )?;
+    if relationship == "fork" {
+        db.record_fork(dependent_id, controlling_id)?;
+    } else {
+        db.record_resolved_related(dependent_id, controlling_id, relationship)?;
+    }
+
+    Ok(SharedGitDirResolution {
+        dependent_locator: dependent_locator.clone(),
+        controlling_locator: controlling_locator.clone(),
+        dependent_path: dependent_path.to_path_buf(),
+        controlling_path: controlling_path.to_path_buf(),
+        dependent_remote,
+        dependent_url,
+        local_branch,
+        remote_branch,
+        converted_to_worktree: false,
     })
 }
 
@@ -4229,7 +4522,139 @@ fn run_daemon(config: &DaemonConfig, rpc_url: &str, args: DaemonArgs) -> Result<
         config.clone_start_ttl_minutes,
     ));
     spawn_clone_ttl_cleanup(Arc::clone(&daemon_state));
+    if let Some(minimum_interval_seconds) = config.background_fetch_minimum_interval_seconds {
+        spawn_background_fetch(config.clone(), minimum_interval_seconds);
+    }
     run_unix_daemon(config, &path, daemon_state)
+}
+
+fn spawn_background_fetch(config: DaemonConfig, minimum_interval_seconds: u64) {
+    thread::spawn(move || {
+        let sleep_for = Duration::from_secs(minimum_interval_seconds.clamp(1, 300));
+        loop {
+            if let Err(error) = background_fetch_once(&config, minimum_interval_seconds) {
+                warn!("background fetch pass failed: {error:#}");
+            }
+            thread::sleep(sleep_for);
+        }
+    });
+}
+
+fn background_fetch_once(config: &DaemonConfig, minimum_interval_seconds: u64) -> Result<usize> {
+    let store = Store::open(&config.state)?;
+    let now = epoch_seconds()?;
+    let candidates = store.background_fetch_candidates(now, minimum_interval_seconds)?;
+    let mut fetched = 0;
+    for candidate in candidates {
+        if !candidate.path.exists() {
+            store.record_background_fetch(
+                candidate.repo_id,
+                now,
+                minimum_interval_seconds,
+                false,
+                Some("tracked repository path does not exist"),
+            )?;
+            continue;
+        }
+        match background_fetch_repo(&candidate.path) {
+            Ok(changed) => {
+                store.record_background_fetch(
+                    candidate.repo_id,
+                    epoch_seconds()?,
+                    minimum_interval_seconds,
+                    changed,
+                    None,
+                )?;
+                fetched += 1;
+                debug!(
+                    "background fetched {} changed={changed}",
+                    candidate.locator.key()
+                );
+            }
+            Err(error) => {
+                warn!(
+                    "background fetch failed for {} at {}: {error:#}",
+                    candidate.locator.key(),
+                    candidate.path.display()
+                );
+                store.record_background_fetch(
+                    candidate.repo_id,
+                    epoch_seconds()?,
+                    minimum_interval_seconds,
+                    false,
+                    Some(&error.to_string()),
+                )?;
+            }
+        }
+    }
+    Ok(fetched)
+}
+
+fn background_fetch_repo(path: &Path) -> Result<bool> {
+    let before = git_ref_fingerprint(path)?;
+    if is_bare_repository(path)? {
+        background_fetch_bare_repo(path)?;
+    } else {
+        run_git_in(path, ["fetch", "--all", "--prune"])?;
+    }
+    let after = git_ref_fingerprint(path)?;
+    Ok(before != after)
+}
+
+fn background_fetch_bare_repo(path: &Path) -> Result<()> {
+    let remotes = git_remotes(path)?;
+    for remote in remotes {
+        if remote.name == "origin" {
+            run_git_in(
+                path,
+                [
+                    "fetch",
+                    "--prune",
+                    "origin",
+                    "+refs/heads/*:refs/heads/*",
+                    "+refs/tags/*:refs/tags/*",
+                ],
+            )?;
+        } else {
+            let heads_refspec = format!("+refs/heads/*:refs/remotes/{}/*", remote.name);
+            let tags_refspec = format!(
+                "+refs/tags/*:refs/repo-manager/remotes/{}/tags/*",
+                remote.name
+            );
+            run_git_in(
+                path,
+                [
+                    "fetch",
+                    "--prune",
+                    &remote.name,
+                    &heads_refspec,
+                    &tags_refspec,
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn git_ref_fingerprint(path: &Path) -> Result<String> {
+    git_output(
+        path,
+        [
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/heads",
+            "refs/remotes",
+            "refs/tags",
+        ],
+        "reading Git refs",
+    )
+}
+
+fn epoch_seconds() -> Result<i64> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?;
+    Ok(duration.as_secs().min(i64::MAX as u64) as i64)
 }
 
 fn spawn_clone_ttl_cleanup(daemon_state: Arc<DaemonState>) {
@@ -4543,7 +4968,7 @@ fn discover_git_repositories(root: &Path) -> Result<Vec<PathBuf>> {
     let mut repos = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(path) = stack.pop() {
-        if path.join(".git").exists() {
+        if is_git_repository_path(&path) {
             repos.push(path);
             continue;
         }
@@ -4576,6 +5001,13 @@ fn discover_git_repositories(root: &Path) -> Result<Vec<PathBuf>> {
     }
     repos.sort();
     Ok(repos)
+}
+
+fn is_git_repository_path(path: &Path) -> bool {
+    path.join(".git").exists()
+        || (path.join("HEAD").is_file()
+            && path.join("objects").is_dir()
+            && path.join("refs").is_dir())
 }
 
 fn should_prune_scan_dir(name: &std::ffi::OsStr) -> bool {
@@ -4865,6 +5297,26 @@ fn git_common_dir(cwd: &Path) -> Result<PathBuf> {
         Ok(common_dir)
     } else {
         Ok(cwd.join(common_dir))
+    }
+}
+
+fn is_bare_repository(path: &Path) -> Result<bool> {
+    let output = git_command(path)
+        .args(["rev-parse", "--is-bare-repository"])
+        .output()
+        .with_context(|| format!("checking whether {} is bare", path.display()))?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    let value = String::from_utf8(output.stdout).context("Git bare status is not UTF-8")?;
+    Ok(value.trim() == "true")
+}
+
+fn ensure_bare_repository(path: &Path) -> Result<()> {
+    if is_bare_repository(path)? {
+        Ok(())
+    } else {
+        bail!("repository is not bare: {}", path.display())
     }
 }
 
@@ -5743,6 +6195,116 @@ mod tests {
     }
 
     #[test]
+    fn clone_repo_honors_bare_clone_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.clone_as_bare = true;
+        let store = Store::open(&config.state).unwrap();
+        let seed = dir.path().join("seed");
+        fs::create_dir_all(&seed).unwrap();
+        run_git_in(&seed, ["init"]).unwrap();
+        run_git_in(&seed, ["checkout", "-b", "main"]).unwrap();
+        fs::write(seed.join("README.md"), "bare clone\n").unwrap();
+        run_git_in(&seed, ["add", "."]).unwrap();
+        run_git_in(
+            &seed,
+            [
+                "-c",
+                "user.name=repo-manager",
+                "-c",
+                "user.email=repo-manager@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        )
+        .unwrap();
+        let url = file_url_for_path(&seed);
+        let locator = Locator::parse(&url).unwrap();
+        let clone_path = locator_path(&config.clone_root, &locator);
+
+        clone_repo(&config, &store, &Output { json: true }, &url).unwrap();
+
+        assert!(is_bare_repository(&clone_path).unwrap());
+        assert!(!clone_path.join(".git").exists());
+        assert!(store.find_repo(&locator.key()).unwrap().is_some());
+    }
+
+    #[test]
+    fn fork_repo_honors_bare_clone_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.clone_as_bare = true;
+        let store = Store::open(&config.state).unwrap();
+        let canonical_seed = dir.path().join("canonical-seed");
+        let fork_seed = dir.path().join("fork-seed");
+        fs::create_dir_all(&canonical_seed).unwrap();
+        run_git_in(&canonical_seed, ["init"]).unwrap();
+        run_git_in(&canonical_seed, ["checkout", "-b", "main"]).unwrap();
+        fs::write(canonical_seed.join("README.md"), "canonical\n").unwrap();
+        run_git_in(&canonical_seed, ["add", "."]).unwrap();
+        run_git_in(
+            &canonical_seed,
+            [
+                "-c",
+                "user.name=repo-manager",
+                "-c",
+                "user.email=repo-manager@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        )
+        .unwrap();
+        clone_local_repo(&canonical_seed, &fork_seed);
+        fs::write(fork_seed.join("fork.txt"), "fork\n").unwrap();
+        run_git_in(&fork_seed, ["add", "."]).unwrap();
+        run_git_in(
+            &fork_seed,
+            [
+                "-c",
+                "user.name=repo-manager",
+                "-c",
+                "user.email=repo-manager@example.com",
+                "commit",
+                "-m",
+                "fork",
+            ],
+        )
+        .unwrap();
+        let canonical_url = file_url_for_path(&canonical_seed);
+        let fork_url = file_url_for_path(&fork_seed);
+        let canonical_locator = Locator::parse(&canonical_url).unwrap();
+        let fork_locator = Locator::parse(&fork_url).unwrap();
+        let canonical_path = locator_path(&config.clone_root, &canonical_locator);
+        let fork_path = locator_path(&config.clone_root, &fork_locator);
+        fs::create_dir_all(canonical_path.parent().unwrap()).unwrap();
+        run_git_clone(&canonical_url, &canonical_path, true).unwrap();
+        store
+            .upsert_repo(&canonical_locator, &canonical_path, None)
+            .unwrap();
+
+        fork_repo(
+            &config,
+            &store,
+            &Output { json: true },
+            &fork_url,
+            &canonical_url,
+        )
+        .unwrap();
+
+        assert!(is_bare_repository(&fork_path).unwrap());
+        assert!(!fork_path.join(".git").exists());
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM forks", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
     fn manage_moves_existing_repo_from_subdirectory_and_registers_it() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
@@ -6164,6 +6726,7 @@ mod tests {
             &canonical_locator,
             &canonical_path,
             "fork",
+            false,
         )
         .unwrap();
 
@@ -6256,6 +6819,7 @@ mod tests {
             rpc_url: default_rpc_url(),
             client_id: generate_client_id().unwrap(),
             assume_origin_as_canonical: false,
+            clone_as_bare: false,
         };
 
         let report = reconcile_repos(&config, &store).unwrap();
@@ -6321,6 +6885,7 @@ mod tests {
             rpc_url: default_rpc_url(),
             client_id: generate_client_id().unwrap(),
             assume_origin_as_canonical: false,
+            clone_as_bare: false,
         };
 
         let report = reconcile_repos(&config, &store).unwrap();
@@ -6348,19 +6913,34 @@ mod tests {
     fn file_config_loads_and_cli_values_override_it() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config/config.json");
-        FileConfig {
+        let content = serde_json::json!({
+            "state": dir.path().join("state/from-file.sqlite"),
+            "cache_root": dir.path().join("cache/from-file"),
+            "root": dir.path().join("code/from-file"),
+            "rpc_url": "unix:///tmp/repo-manager-from-file.sock",
+            "client_id": "00000000-0000-4000-8000-000000000001",
+            "assume_origin_as_canonical": false,
+            "clone-as-bare": true,
+            "detect_related": true,
+            "clone_start_ttl_minutes": 45,
+            "rpc_rate_limit_per_second": 7,
+            "background-fetch-minimum-interval-seconds": 3600
+        });
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(&config_path, format!("{content}\n")).unwrap();
+        let _expected = FileConfig {
             state: Some(dir.path().join("state/from-file.sqlite")),
             cache_root: Some(dir.path().join("cache/from-file")),
             root: Some(dir.path().join("code/from-file")),
             rpc_url: Some("unix:///tmp/repo-manager-from-file.sock".to_string()),
             client_id: Some("00000000-0000-4000-8000-000000000001".to_string()),
             assume_origin_as_canonical: Some(false),
+            clone_as_bare: None,
             detect_related: Some(true),
             clone_start_ttl_minutes: Some(45),
             rpc_rate_limit_per_second: Some(7),
-        }
-        .save(&config_path)
-        .unwrap();
+            background_fetch_minimum_interval_seconds: None,
+        };
 
         let cli = Cli {
             config: ConfigArgs {
@@ -6397,6 +6977,21 @@ mod tests {
         assert_eq!(config.rpc_url, "unix:///tmp/repo-manager-from-cli.sock");
         assert_eq!(config.client_id, "00000000-0000-4000-8000-000000000002");
         assert!(config.assume_origin_as_canonical);
+        assert!(config.clone_as_bare);
+        let (_daemon_config, _rpc_url) = DaemonConfig::from_args(&DaemonConfigArgs {
+            config: Some(config_path),
+            state: None,
+            rpc_url: None,
+            detect_related: None,
+            clone_start_ttl_minutes: None,
+            rpc_rate_limit_per_second: None,
+            background_fetch_minimum_interval_seconds: None,
+        })
+        .unwrap();
+        assert_eq!(
+            _daemon_config.background_fetch_minimum_interval_seconds,
+            Some(3600)
+        );
     }
 
     #[test]
@@ -6410,6 +7005,7 @@ mod tests {
             detect_related: None,
             clone_start_ttl_minutes: None,
             rpc_rate_limit_per_second: None,
+            background_fetch_minimum_interval_seconds: None,
         })
         .unwrap();
 
@@ -6429,6 +7025,7 @@ mod tests {
             rpc_url: default_rpc_url(),
             client_id: "00000000-0000-4000-8000-000000000003".to_string(),
             assume_origin_as_canonical: false,
+            clone_as_bare: false,
         };
         let explicit_file = dir.path().join("custom/repo-config.json");
 
@@ -6476,9 +7073,11 @@ mod tests {
             rpc_url: Some("unix:///run/base.sock".to_string()),
             client_id: None,
             assume_origin_as_canonical: Some(false),
+            clone_as_bare: None,
             detect_related: Some(false),
             clone_start_ttl_minutes: Some(60),
             rpc_rate_limit_per_second: Some(1),
+            background_fetch_minimum_interval_seconds: None,
         };
 
         base.merge(FileConfig {
@@ -6488,9 +7087,11 @@ mod tests {
             rpc_url: None,
             client_id: Some("00000000-0000-4000-8000-000000000005".to_string()),
             assume_origin_as_canonical: Some(true),
+            clone_as_bare: None,
             detect_related: Some(true),
             clone_start_ttl_minutes: Some(10),
             rpc_rate_limit_per_second: Some(9),
+            background_fetch_minimum_interval_seconds: None,
         });
 
         assert_eq!(base.state, Some(dir.path().join("state/base.sqlite")));
@@ -6654,6 +7255,7 @@ mod tests {
             detect_related: true,
             clone_start_ttl_minutes: 60,
             rpc_rate_limit_per_second: 0,
+            background_fetch_minimum_interval_seconds: None,
         };
         let daemon_state = DaemonState::new(0, 60);
         let locator = Locator::parse("example.com/current").unwrap();
@@ -6751,6 +7353,7 @@ mod tests {
             detect_related: true,
             clone_start_ttl_minutes: 60,
             rpc_rate_limit_per_second: 0,
+            background_fetch_minimum_interval_seconds: None,
         };
         let daemon_state = DaemonState::new(0, 60);
         handle_rpc_event(
@@ -6769,6 +7372,66 @@ mod tests {
         let store = Store::open(&state_path).unwrap();
         let suggestions = store.related_suggestions(true).unwrap();
         assert_eq!(suggestions.len(), 1);
+    }
+
+    #[test]
+    fn background_fetch_records_changes_and_respects_learned_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_daemon_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let seed = dir.path().join("seed");
+        let locator = Locator::parse("example.com/background/repo").unwrap();
+        let clone_path = dir.path().join("clones/example.com/background/repo");
+        fs::create_dir_all(&seed).unwrap();
+        run_git_in(&seed, ["init"]).unwrap();
+        run_git_in(&seed, ["checkout", "-b", "main"]).unwrap();
+        fs::write(seed.join("README.md"), "initial\n").unwrap();
+        run_git_in(&seed, ["add", "."]).unwrap();
+        run_git_in(
+            &seed,
+            [
+                "-c",
+                "user.name=repo-manager",
+                "-c",
+                "user.email=repo-manager@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        )
+        .unwrap();
+        fs::create_dir_all(clone_path.parent().unwrap()).unwrap();
+        run_git_clone(&file_url_for_path(&seed), &clone_path, true).unwrap();
+        let repo_id = store.upsert_repo(&locator, &clone_path, None).unwrap();
+
+        fs::write(seed.join("README.md"), "updated\n").unwrap();
+        run_git_in(&seed, ["add", "."]).unwrap();
+        run_git_in(
+            &seed,
+            [
+                "-c",
+                "user.name=repo-manager",
+                "-c",
+                "user.email=repo-manager@example.com",
+                "commit",
+                "-m",
+                "update",
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(background_fetch_once(&config, 60).unwrap(), 1);
+        let (status, interval): (String, i64) = store
+            .conn
+            .query_row(
+                "SELECT last_status, learned_interval_seconds FROM background_fetch WHERE repo_id = ?1",
+                params![repo_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "changed");
+        assert_eq!(interval, 60);
+        assert_eq!(background_fetch_once(&config, 60).unwrap(), 0);
     }
 
     #[test]
@@ -6944,6 +7607,10 @@ mod tests {
         );
     }
 
+    fn file_url_for_path(path: &Path) -> String {
+        format!("file://localhost{}", path.display())
+    }
+
     fn test_config(root: &Path) -> Config {
         Config {
             config_path: root.join("config.json"),
@@ -6955,6 +7622,7 @@ mod tests {
             rpc_url: default_rpc_url(),
             client_id: "00000000-0000-4000-8000-000000000099".to_string(),
             assume_origin_as_canonical: false,
+            clone_as_bare: false,
         }
     }
 
@@ -6964,6 +7632,7 @@ mod tests {
             detect_related: true,
             clone_start_ttl_minutes: 60,
             rpc_rate_limit_per_second: 0,
+            background_fetch_minimum_interval_seconds: None,
         }
     }
 
@@ -7065,7 +7734,14 @@ mod tests {
         assert_eq!(suggestion.repo_locator, fork_locator);
         assert_eq!(suggestion.related_locator, canonical_locator);
 
-        related_resolve(&store, &Output { json: true }, suggestion.id, "fork").unwrap();
+        related_resolve(
+            &config,
+            &store,
+            &Output { json: true },
+            suggestion.id,
+            "fork",
+        )
+        .unwrap();
 
         assert_eq!(store.pending_related_count().unwrap(), 0);
         assert_eq!(
@@ -7184,7 +7860,7 @@ mod tests {
             git_common_dir(&canonical_path).unwrap()
         );
         let relationship = store.shared_git_dir_relationships().unwrap().remove(0);
-        let reasons = shared_git_dir_relationship_repair_reasons(&relationship).unwrap();
+        let reasons = shared_git_dir_relationship_repair_reasons(&relationship, false).unwrap();
         assert!(reasons.iter().any(|reason| {
             reason.starts_with("fork does not use canonical Git directory; fork uses ")
         }));
@@ -7495,7 +8171,14 @@ mod tests {
             .unwrap();
         let suggestion = store.related_suggestions(true).unwrap().remove(0);
 
-        related_resolve(&store, &Output { json: true }, suggestion.id, "mirror").unwrap();
+        related_resolve(
+            &config,
+            &store,
+            &Output { json: true },
+            suggestion.id,
+            "mirror",
+        )
+        .unwrap();
 
         assert_eq!(store.pending_related_count().unwrap(), 0);
         assert_eq!(
