@@ -537,12 +537,10 @@ struct WorktreeAddArgs {
 
 #[derive(Debug, Subcommand)]
 enum ReposSubcommand {
-    #[command(about = "Dump managed repositories with their relationship type")]
-    Dump,
     #[command(
         name = "set-type",
         about = "Change a managed repository relationship type",
-        long_about = "Change a managed repository relationship type.\n\nREPO_PATH is the root-relative path shown by `repo repos dump`, such as clones/github.com/example/repo. Absolute managed paths are also accepted.\n\nChanging to fork or mirror requires --canonical. The canonical value may be another dumped repo path, a managed locator, or a Git URL/locator to materialize as the canonical bare repository."
+        long_about = "Change a managed repository relationship type.\n\nREPO_PATH is the root-relative path shown as `id` in `repo check --dump`, such as clones/github.com/example/repo. Absolute managed paths are also accepted.\n\nChanging to fork or mirror requires --canonical. The canonical value may be another dumped repo path, a managed locator, or a Git URL/locator to materialize as the canonical bare repository."
     )]
     SetType(RepoSetTypeArgs),
 }
@@ -765,16 +763,10 @@ struct CheckDumpRoots {
     dev_worktree_root: PathBuf,
 }
 
-#[derive(Debug, Serialize)]
-struct ReposDump {
-    action: &'static str,
-    root: PathBuf,
-    repositories: Vec<ManagedRepositoryDump>,
-}
-
 #[derive(Debug, Clone, Serialize)]
 struct ManagedRepositoryDump {
     id: String,
+    repo_id: i64,
     #[serde(rename = "type")]
     repo_type: String,
     locator: Locator,
@@ -803,11 +795,16 @@ struct RepoTypeChangeResult {
 
 #[derive(Debug, Serialize)]
 struct TrackedRepositoryDump {
+    id: String,
     repo_id: i64,
+    #[serde(rename = "type")]
+    repo_type: String,
     locator: Locator,
     path: PathBuf,
     exists: bool,
     bare: Option<bool>,
+    canonical: Option<RepositoryRelationEndpoint>,
+    dependents: Vec<RepositoryRelationEndpoint>,
     background_fetch: Option<BackgroundFetchState>,
 }
 
@@ -1446,7 +1443,6 @@ pub fn run() -> Result<()> {
             RepositoryOperationCommands::Repos(command) => {
                 let db = Store::open(&config.state)?;
                 match command.command {
-                    ReposSubcommand::Dump => repos_dump(&config, &db, &output),
                     ReposSubcommand::SetType(args) => repos_set_type(&config, &db, &output, args),
                 }
             }
@@ -4202,12 +4198,12 @@ fn dump_check(config: &Config, db: &Store) -> Result<()> {
 
 fn check_dump_report(config: &Config, db: &Store) -> Result<CheckDump> {
     let background_fetch = db.background_fetch_state_by_repo_id()?;
-    let current_repos = db.current_repos()?;
+    let current_repos = managed_repository_dumps(config, db)?;
     let mut tracked_by_path = HashMap::new();
     let mut tracked_repositories = Vec::new();
 
     for repo in current_repos {
-        tracked_by_path.insert(comparable_path(&repo.path), repo.id);
+        tracked_by_path.insert(comparable_path(&repo.path), repo.repo_id);
         let exists = repo.path.exists();
         let bare = if exists && read_repo_view_metadata(&repo.path)?.is_some() {
             Some(true)
@@ -4217,12 +4213,16 @@ fn check_dump_report(config: &Config, db: &Store) -> Result<CheckDump> {
             None
         };
         tracked_repositories.push(TrackedRepositoryDump {
-            repo_id: repo.id,
-            locator: repo.current,
+            id: repo.id,
+            repo_id: repo.repo_id,
+            repo_type: repo.repo_type,
+            locator: repo.locator,
             path: repo.path,
             exists,
             bare,
-            background_fetch: background_fetch.get(&repo.id).cloned(),
+            canonical: repo.canonical,
+            dependents: repo.dependents,
+            background_fetch: background_fetch.get(&repo.repo_id).cloned(),
         });
     }
 
@@ -4261,31 +4261,7 @@ fn check_dump_report(config: &Config, db: &Store) -> Result<CheckDump> {
     })
 }
 
-fn repos_dump(config: &Config, db: &Store, output: &Output) -> Result<()> {
-    let dump = repos_dump_report(config, db)?;
-    if output.json {
-        return print_json(&dump);
-    }
-    if dump.repositories.is_empty() {
-        println!("no managed repositories");
-        return Ok(());
-    }
-    for repo in &dump.repositories {
-        match &repo.canonical {
-            Some(canonical) => println!(
-                "{}\t{}\t{}\tcanonical={}",
-                repo.id,
-                repo.repo_type,
-                repo.locator.key(),
-                canonical.id
-            ),
-            None => println!("{}\t{}\t{}", repo.id, repo.repo_type, repo.locator.key()),
-        }
-    }
-    Ok(())
-}
-
-fn repos_dump_report(config: &Config, db: &Store) -> Result<ReposDump> {
+fn managed_repository_dumps(config: &Config, db: &Store) -> Result<Vec<ManagedRepositoryDump>> {
     let repos = db.current_repos()?;
     let relationships = db.shared_git_dir_relationships()?;
     let mut dependent_by_id = HashMap::new();
@@ -4298,7 +4274,7 @@ fn repos_dump_report(config: &Config, db: &Store) -> Result<ReposDump> {
             .push(relationship);
     }
 
-    let repositories = repos
+    Ok(repos
         .into_iter()
         .map(|repo| {
             let canonical =
@@ -4327,6 +4303,7 @@ fn repos_dump_report(config: &Config, db: &Store) -> Result<ReposDump> {
                 .collect();
             ManagedRepositoryDump {
                 id: repository_path_id(config, &repo.path),
+                repo_id: repo.id,
                 repo_type,
                 locator: repo.current,
                 path: repo.path,
@@ -4334,13 +4311,7 @@ fn repos_dump_report(config: &Config, db: &Store) -> Result<ReposDump> {
                 dependents,
             }
         })
-        .collect();
-
-    Ok(ReposDump {
-        action: "repos-dump",
-        root: config.root.clone(),
-        repositories,
-    })
+        .collect())
 }
 
 fn repository_path_id(config: &Config, path: &Path) -> String {
@@ -4380,8 +4351,7 @@ fn repos_set_type(
         );
     }
     let repo = managed_repo_by_path_id(config, db, &args.repo_path)?;
-    let before = repos_dump_report(config, db)?
-        .repositories
+    let before = managed_repository_dumps(config, db)?
         .into_iter()
         .find(|entry| comparable_path(&entry.path) == comparable_path(&repo.path))
         .ok_or_else(|| anyhow!("managed repository disappeared while changing type"))?;
@@ -4427,8 +4397,7 @@ fn repos_set_type(
         db.repo_by_id(repo.id)?
             .ok_or_else(|| anyhow!("repository disappeared"))
     })?;
-    let after = repos_dump_report(config, db)?
-        .repositories
+    let after = managed_repository_dumps(config, db)?
         .into_iter()
         .find(|entry| comparable_path(&entry.path) == comparable_path(&after_repo.path))
         .ok_or_else(|| anyhow!("managed repository disappeared after changing type"))?;
@@ -11007,7 +10976,7 @@ mod tests {
     }
 
     #[test]
-    fn repos_dump_reports_root_relative_ids_and_relationship_types() {
+    fn check_dump_reports_root_relative_ids_and_relationship_types() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
         let store = Store::open(&config.state).unwrap();
@@ -11029,19 +10998,19 @@ mod tests {
             .record_resolved_related(mirror_id, canonical_id, "mirror")
             .unwrap();
 
-        let dump = repos_dump_report(&config, &store).unwrap();
+        let dump = check_dump_report(&config, &store).unwrap();
         let canonical_entry = dump
-            .repositories
+            .tracked_repositories
             .iter()
             .find(|repo| repo.locator == canonical_locator)
             .unwrap();
         let fork_entry = dump
-            .repositories
+            .tracked_repositories
             .iter()
             .find(|repo| repo.locator == fork_locator)
             .unwrap();
         let mirror_entry = dump
-            .repositories
+            .tracked_repositories
             .iter()
             .find(|repo| repo.locator == mirror_locator)
             .unwrap();
@@ -11144,9 +11113,9 @@ mod tests {
             comparable_path(&canonical_path)
         );
 
-        let dump = repos_dump_report(&config, &store).unwrap();
+        let dump = check_dump_report(&config, &store).unwrap();
         let mirror_entry = dump
-            .repositories
+            .tracked_repositories
             .iter()
             .find(|repo| repo.locator == mirror_locator)
             .unwrap();
