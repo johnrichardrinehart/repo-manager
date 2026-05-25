@@ -251,7 +251,7 @@ enum RepositoryOperationCommands {
         long_about = "Register an existing Git checkout under the managed clone root without cloning it.\n\nUse this for a repository that already exists on disk. The command resolves the Git worktree root, chooses a canonical URL from its remotes or an interactive prompt, moves the checkout into its managed locator path when needed, records it in repo-manager metadata, and asks repod to review repositories under the clone root for shared Git history."
     )]
     Manage(ManageArgs),
-    #[command(about = "Create or register a fork worktree for a canonical repository")]
+    #[command(about = "Create or register a fork view for a canonical repository or fork parent")]
     Fork(ForkArgs),
     #[command(
         about = "Find missing tracked checkouts, unmanaged clone-root repos, and unmaterialized fork/mirror worktrees",
@@ -444,7 +444,7 @@ struct ForkArgs {
     #[arg(
         long,
         value_name = "CANONICAL_URL",
-        help = "Canonical upstream Git URL or locator for this fork"
+        help = "Immediate parent or canonical upstream Git URL or locator for this fork"
     )]
     canonical: String,
 }
@@ -540,7 +540,7 @@ enum ReposSubcommand {
     #[command(
         name = "set-type",
         about = "Change a managed repository relationship type",
-        long_about = "Change a managed repository relationship type.\n\nREPO_PATH is the root-relative path shown as `id` in `repo check --dump`, such as clones/github.com/example/repo. Absolute managed paths are also accepted.\n\nChanging to fork or mirror requires --canonical. The canonical value may be another dumped repo path, a managed locator, or a Git URL/locator to materialize as the canonical bare repository."
+        long_about = "Change a managed repository relationship type.\n\nREPO_PATH is the root-relative path shown as `id` in `repo check --dump`, such as clones/github.com/example/repo. Absolute managed paths are also accepted.\n\nChanging to fork or mirror requires --canonical. The value may be the immediate fork/mirror parent or the ultimate canonical repository: another dumped repo path, a managed locator, or a Git URL/locator. If the parent is itself a fork/mirror, repo-manager records that immediate parent while materializing the new repository against the ultimate canonical bare repository."
     )]
     SetType(RepoSetTypeArgs),
 }
@@ -568,7 +568,7 @@ struct RepoSetTypeArgs {
     #[arg(
         long,
         value_name = "CANONICAL",
-        help = "Canonical repository path, URL, or locator required for fork/mirror"
+        help = "Immediate parent or canonical repository path, URL, or locator required for fork/mirror"
     )]
     canonical: Option<String>,
 }
@@ -769,9 +769,11 @@ struct ManagedRepositoryDump {
     db_id: i64,
     #[serde(rename = "type")]
     repo_type: String,
+    fork_depth: usize,
     locator: Locator,
     path: PathBuf,
     checkout_kind: String,
+    parent: Option<RepositoryRelationEndpoint>,
     canonical: Option<RepositoryRelationEndpoint>,
     dependents: Vec<RepositoryRelationEndpoint>,
 }
@@ -799,10 +801,12 @@ struct TrackedRepositoryDump {
     id: String,
     #[serde(rename = "type")]
     repo_type: String,
+    fork_depth: usize,
     locator: Locator,
     path: PathBuf,
     exists: bool,
     checkout_kind: String,
+    parent: Option<RepositoryRelationEndpoint>,
     canonical: Option<RepositoryRelationEndpoint>,
     dependents: Vec<RepositoryRelationEndpoint>,
     background_fetch: Option<BackgroundFetchState>,
@@ -1159,6 +1163,8 @@ struct ManageResult {
 struct ForkResult {
     action: &'static str,
     fork_locator: Locator,
+    parent_locator: Locator,
+    parent_path: PathBuf,
     canonical_locator: Locator,
     fork_path: PathBuf,
     canonical_path: PathBuf,
@@ -1249,6 +1255,17 @@ struct SharedGitDirRelationship {
     controlling_repo_id: i64,
     controlling_locator: Locator,
     controlling_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct RepositoryRelationshipSummary {
+    relationship: String,
+    parent_locator: Locator,
+    parent_path: PathBuf,
+    canonical_repo_id: i64,
+    canonical_locator: Locator,
+    canonical_path: PathBuf,
+    depth: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2094,6 +2111,12 @@ struct ManagedRepoRecord {
 }
 
 #[derive(Debug, Clone)]
+struct RelationshipParent {
+    parent: ManagedRepoRecord,
+    storage: ManagedRepoRecord,
+}
+
+#[derive(Debug, Clone)]
 struct BackgroundFetchCandidate {
     repo_id: i64,
     locator: Locator,
@@ -2684,6 +2707,19 @@ impl Store {
             params![fork_repo_id, canonical_repo_id],
         )?;
         Ok(())
+    }
+
+    fn record_dependent_relationship(
+        &self,
+        dependent_repo_id: i64,
+        parent_repo_id: i64,
+        relationship: &str,
+    ) -> Result<()> {
+        match relationship {
+            "fork" => self.record_fork(dependent_repo_id, parent_repo_id),
+            "mirror" => self.record_resolved_related(dependent_repo_id, parent_repo_id, "mirror"),
+            _ => bail!("invalid dependent relationship: {relationship}"),
+        }
     }
 
     fn clear_dependent_relationships(&self, repo_id: i64) -> Result<()> {
@@ -3870,13 +3906,22 @@ fn fork_repo(
 ) -> Result<()> {
     warn_pending_related(db)?;
     let fork_locator = Locator::parse(fork_url)?;
-    let canonical_locator = Locator::parse(canonical_url)?;
+    let parent = ensure_type_change_parent(config, db, canonical_url)?;
+    if parent.parent.current == fork_locator {
+        bail!("repository cannot be its own parent repository");
+    }
+    if parent.storage.current == fork_locator {
+        bail!("repository cannot depend on one of its own descendants");
+    }
+    let parent_locator = parent.parent.current.clone();
+    let parent_path = parent.parent.path.clone();
+    let canonical_locator = parent.storage.current.clone();
     let fork_path = locator_path(&config.clone_root, &fork_locator);
-    let canonical_path = locator_path(&config.clone_root, &canonical_locator);
+    let canonical_path = parent.storage.path.clone();
     let fork_remote = fork_remote_name(&fork_locator);
     fs::create_dir_all(fork_path.parent().context("fork path has no parent")?)?;
     if config.clone_as_bare {
-        ensure_canonical_bare_repo(&canonical_path, canonical_url)?;
+        ensure_managed_canonical_is_bare(&parent.storage)?;
         let view = materialize_namespace_view(
             &fork_locator,
             &fork_path,
@@ -3885,14 +3930,16 @@ fn fork_repo(
             "fork",
             fork_url,
         )?;
-        let canonical_id = db.upsert_repo(&canonical_locator, &canonical_path, None)?;
+        db.upsert_repo(&canonical_locator, &canonical_path, None)?;
         let fork_id = db.upsert_repo(&fork_locator, &fork_path, Some(&canonical_locator.key()))?;
-        db.record_fork(fork_id, canonical_id)?;
+        db.record_dependent_relationship(fork_id, parent.parent.id, "fork")?;
         return output_fork(
             output,
             &ForkResult {
                 action: "fork",
                 fork_locator,
+                parent_locator,
+                parent_path,
                 canonical_locator,
                 fork_path,
                 canonical_path,
@@ -3921,14 +3968,16 @@ fn fork_repo(
             &fork_head,
         ],
     )?;
-    let canonical_id = db.upsert_repo(&canonical_locator, &canonical_path, None)?;
+    db.upsert_repo(&canonical_locator, &canonical_path, None)?;
     let fork_id = db.upsert_repo(&fork_locator, &fork_path, Some(&canonical_locator.key()))?;
-    db.record_fork(fork_id, canonical_id)?;
+    db.record_dependent_relationship(fork_id, parent.parent.id, "fork")?;
     output_fork(
         output,
         &ForkResult {
             action: "fork",
             fork_locator,
+            parent_locator,
+            parent_path,
             canonical_locator,
             fork_path,
             canonical_path,
@@ -4354,10 +4403,12 @@ fn check_dump_report(config: &Config, db: &Store) -> Result<CheckDump> {
         tracked_repositories.push(TrackedRepositoryDump {
             id: repo.id,
             repo_type: repo.repo_type,
+            fork_depth: repo.fork_depth,
             locator: repo.locator,
             path: repo.path,
             exists,
             checkout_kind,
+            parent: repo.parent,
             canonical: repo.canonical,
             dependents: repo.dependents,
             background_fetch: background_fetch.get(&repo.db_id).cloned(),
@@ -4504,11 +4555,10 @@ fn is_git_worktree(path: &Path) -> Result<bool> {
 fn managed_repository_dumps(config: &Config, db: &Store) -> Result<Vec<ManagedRepositoryDump>> {
     let repos = db.current_repos()?;
     let relationships = db.shared_git_dir_relationships()?;
-    let mut dependent_by_id = HashMap::new();
-    let mut dependents_by_canonical: HashMap<i64, Vec<&SharedGitDirRelationship>> = HashMap::new();
+    let summaries = relationship_summaries(&relationships)?;
+    let mut dependents_by_parent: HashMap<i64, Vec<&SharedGitDirRelationship>> = HashMap::new();
     for relationship in &relationships {
-        dependent_by_id.insert(relationship.dependent_repo_id, relationship);
-        dependents_by_canonical
+        dependents_by_parent
             .entry(relationship.controlling_repo_id)
             .or_default()
             .push(relationship);
@@ -4517,34 +4567,44 @@ fn managed_repository_dumps(config: &Config, db: &Store) -> Result<Vec<ManagedRe
     Ok(repos
         .into_iter()
         .map(|repo| {
-            let canonical =
-                dependent_by_id
-                    .get(&repo.id)
-                    .map(|relationship| RepositoryRelationEndpoint {
-                        id: repository_path_id(config, &relationship.controlling_path),
-                        locator: relationship.controlling_locator.clone(),
-                        path: relationship.controlling_path.clone(),
-                        relationship: relationship.relationship.clone(),
-                    });
-            let repo_type = dependent_by_id
-                .get(&repo.id)
-                .map(|relationship| relationship.relationship.clone())
+            let summary = summaries.get(&repo.id);
+            let parent = summary.map(|summary| {
+                relationship_endpoint(
+                    config,
+                    summary.parent_locator.clone(),
+                    summary.parent_path.clone(),
+                    summary.relationship.clone(),
+                )
+            });
+            let canonical = summary.map(|summary| {
+                relationship_endpoint(
+                    config,
+                    summary.canonical_locator.clone(),
+                    summary.canonical_path.clone(),
+                    summary.relationship.clone(),
+                )
+            });
+            let repo_type = summary
+                .map(|summary| summary.relationship.clone())
                 .unwrap_or_else(|| "canonical".to_string());
-            let dependents = dependents_by_canonical
+            let dependents = dependents_by_parent
                 .get(&repo.id)
                 .into_iter()
                 .flat_map(|relationships| relationships.iter())
-                .map(|relationship| RepositoryRelationEndpoint {
-                    id: repository_path_id(config, &relationship.dependent_path),
-                    locator: relationship.dependent_locator.clone(),
-                    path: relationship.dependent_path.clone(),
-                    relationship: relationship.relationship.clone(),
+                .map(|relationship| {
+                    relationship_endpoint(
+                        config,
+                        relationship.dependent_locator.clone(),
+                        relationship.dependent_path.clone(),
+                        relationship.relationship.clone(),
+                    )
                 })
                 .collect();
             ManagedRepositoryDump {
                 id: repository_path_id(config, &repo.path),
                 db_id: repo.id,
                 repo_type,
+                fork_depth: summary.map(|summary| summary.depth).unwrap_or(0),
                 locator: repo.current,
                 checkout_kind: if repo.path.exists() {
                     git_directory_kind(&repo.path).unwrap_or_else(|_| "unknown".to_string())
@@ -4552,11 +4612,80 @@ fn managed_repository_dumps(config: &Config, db: &Store) -> Result<Vec<ManagedRe
                     "missing".to_string()
                 },
                 path: repo.path,
+                parent,
                 canonical,
                 dependents,
             }
         })
         .collect())
+}
+
+fn relationship_summaries(
+    relationships: &[SharedGitDirRelationship],
+) -> Result<HashMap<i64, RepositoryRelationshipSummary>> {
+    let mut direct_by_dependent = HashMap::new();
+    for relationship in relationships {
+        if direct_by_dependent
+            .insert(relationship.dependent_repo_id, relationship)
+            .is_some()
+        {
+            bail!(
+                "repository has multiple fork/mirror parents: {}",
+                relationship.dependent_locator.key()
+            );
+        }
+    }
+
+    let mut summaries = HashMap::new();
+    for relationship in relationships {
+        let mut seen = HashSet::new();
+        seen.insert(relationship.dependent_repo_id);
+        let mut depth = 1;
+        let mut canonical_repo_id = relationship.controlling_repo_id;
+        let mut canonical_locator = relationship.controlling_locator.clone();
+        let mut canonical_path = relationship.controlling_path.clone();
+
+        while let Some(parent_relationship) = direct_by_dependent.get(&canonical_repo_id) {
+            if !seen.insert(canonical_repo_id) {
+                bail!(
+                    "fork/mirror relationship cycle involving {}",
+                    parent_relationship.dependent_locator.key()
+                );
+            }
+            depth += 1;
+            canonical_repo_id = parent_relationship.controlling_repo_id;
+            canonical_locator = parent_relationship.controlling_locator.clone();
+            canonical_path = parent_relationship.controlling_path.clone();
+        }
+
+        summaries.insert(
+            relationship.dependent_repo_id,
+            RepositoryRelationshipSummary {
+                relationship: relationship.relationship.clone(),
+                parent_locator: relationship.controlling_locator.clone(),
+                parent_path: relationship.controlling_path.clone(),
+                canonical_repo_id,
+                canonical_locator,
+                canonical_path,
+                depth,
+            },
+        );
+    }
+    Ok(summaries)
+}
+
+fn relationship_endpoint(
+    config: &Config,
+    locator: Locator,
+    path: PathBuf,
+    relationship: String,
+) -> RepositoryRelationEndpoint {
+    RepositoryRelationEndpoint {
+        id: repository_path_id(config, &path),
+        locator,
+        path,
+        relationship,
+    }
 }
 
 fn repository_path_id(config: &Config, path: &Path) -> String {
@@ -4620,20 +4749,33 @@ fn repos_set_type(
             let canonical_ref = args.canonical.as_deref().ok_or_else(|| {
                 anyhow!("--canonical is required when setting type to {repo_type}")
             })?;
-            let canonical = ensure_type_change_canonical(config, db, canonical_ref)?;
-            if canonical.id == repo.id {
-                bail!("repository cannot be its own canonical repository");
+            let parent = ensure_type_change_parent(config, db, canonical_ref)?;
+            if parent.parent.id == repo.id {
+                bail!("repository cannot be its own parent repository");
+            }
+            if parent.storage.id == repo.id {
+                bail!("repository cannot depend on one of its own descendants");
             }
             db.clear_dependent_relationships(repo.id)?;
-            Some(materialize_related_shared_git_dir(
+            let resolution = materialize_related_shared_git_dir(
                 db,
                 &repo.current,
                 &repo.path,
-                &canonical.current,
-                &canonical.path,
+                &parent.storage.current,
+                &parent.storage.path,
                 &repo_type,
                 true,
-            )?)
+            )?;
+            if parent.parent.id != parent.storage.id {
+                let repo_id = db.upsert_repo(
+                    &repo.current,
+                    &repo.path,
+                    Some(&parent.storage.current.key()),
+                )?;
+                db.clear_dependent_relationships(repo_id)?;
+                db.record_dependent_relationship(repo_id, parent.parent.id, &repo_type)?;
+            }
+            Some(resolution)
         }
         _ => unreachable!(),
     };
@@ -4657,28 +4799,46 @@ fn repos_set_type(
     output_repo_type_change(output, &result)
 }
 
-fn ensure_type_change_canonical(
+fn ensure_type_change_parent(
     config: &Config,
     db: &Store,
-    canonical_ref: &str,
-) -> Result<ManagedRepoRecord> {
-    if let Ok(repo) = managed_repo_by_path_id(config, db, Path::new(canonical_ref)) {
-        ensure_managed_canonical_is_bare(&repo)?;
-        return Ok(repo);
+    parent_ref: &str,
+) -> Result<RelationshipParent> {
+    if let Ok(repo) = managed_repo_by_path_id(config, db, Path::new(parent_ref)) {
+        return resolve_relationship_parent_storage(db, repo);
     }
-    if let Ok(Some(record)) = db.find_repo(canonical_ref)
+    if let Ok(Some(record)) = db.find_repo(parent_ref)
         && let Some(repo) = db.repo_by_id(record.id)?
     {
-        ensure_managed_canonical_is_bare(&repo)?;
-        return Ok(repo);
+        return resolve_relationship_parent_storage(db, repo);
     }
-    if let Some(path) = existing_path_reference(config, canonical_ref) {
+    if let Some(path) = existing_path_reference(config, parent_ref) {
+        if let Some(view) = read_repo_view_metadata(&path)? {
+            let repo_id = db.upsert_repo(
+                &view.locator,
+                &view.path,
+                Some(&view.canonical_locator.key()),
+            )?;
+            let parent = ManagedRepoRecord {
+                id: repo_id,
+                current: view.locator,
+                path: view.path,
+            };
+            let storage_id = db.upsert_repo(&view.canonical_locator, &view.canonical_path, None)?;
+            let storage = ManagedRepoRecord {
+                id: storage_id,
+                current: view.canonical_locator,
+                path: view.canonical_path,
+            };
+            ensure_managed_canonical_is_bare(&storage)?;
+            return Ok(RelationshipParent { parent, storage });
+        }
         if !is_git_repository_path(&path) {
-            bail!("canonical path is not a Git repository: {}", path.display());
+            bail!("parent path is not a Git repository: {}", path.display());
         }
         let locator = repo_locator_from_origin(&path)?.ok_or_else(|| {
             anyhow!(
-                "canonical path has no locator-compatible origin remote: {}",
+                "parent path has no locator-compatible origin remote: {}",
                 path.display()
             )
         })?;
@@ -4688,23 +4848,62 @@ fn ensure_type_change_canonical(
             current: locator,
             path,
         };
-        ensure_managed_canonical_is_bare(&repo)?;
-        return Ok(repo);
+        return resolve_relationship_parent_storage(db, repo);
     }
 
-    let locator = Locator::parse(canonical_ref)?;
+    let locator = Locator::parse(parent_ref)?;
     let path = locator_path(&config.clone_root, &locator);
-    let url = if canonical_ref.contains("://") || parse_scp_like(canonical_ref).is_some() {
-        canonical_ref.to_string()
+    let url = if parent_ref.contains("://") || parse_scp_like(parent_ref).is_some() {
+        parent_ref.to_string()
     } else {
         remote_url_for_locator(None, &locator)
     };
     ensure_canonical_bare_repo(&path, &url)?;
     let repo_id = db.upsert_repo(&locator, &path, None)?;
-    Ok(ManagedRepoRecord {
+    let parent = ManagedRepoRecord {
         id: repo_id,
         current: locator,
         path,
+    };
+    Ok(RelationshipParent {
+        parent: parent.clone(),
+        storage: parent,
+    })
+}
+
+fn resolve_relationship_parent_storage(
+    db: &Store,
+    parent: ManagedRepoRecord,
+) -> Result<RelationshipParent> {
+    if let Some(view) = read_repo_view_metadata(&parent.path)? {
+        let storage_id = db.upsert_repo(&view.canonical_locator, &view.canonical_path, None)?;
+        let storage = ManagedRepoRecord {
+            id: storage_id,
+            current: view.canonical_locator,
+            path: view.canonical_path,
+        };
+        ensure_managed_canonical_is_bare(&storage)?;
+        return Ok(RelationshipParent { parent, storage });
+    }
+
+    let summaries = relationship_summaries(&db.shared_git_dir_relationships()?)?;
+    if let Some(summary) = summaries.get(&parent.id) {
+        let storage = ManagedRepoRecord {
+            id: db
+                .find_repo(&summary.canonical_locator.key())?
+                .map(|record| record.id)
+                .unwrap_or(summary.canonical_repo_id),
+            current: summary.canonical_locator.clone(),
+            path: summary.canonical_path.clone(),
+        };
+        ensure_managed_canonical_is_bare(&storage)?;
+        return Ok(RelationshipParent { parent, storage });
+    }
+
+    ensure_managed_canonical_is_bare(&parent)?;
+    Ok(RelationshipParent {
+        parent: parent.clone(),
+        storage: parent,
     })
 }
 
@@ -7699,6 +7898,10 @@ fn output_fork(output: &Output, result: &ForkResult) -> Result<()> {
         result.fork_remote,
         result.canonical_path.display()
     );
+    if result.parent_locator != result.canonical_locator {
+        println!("parent: {}", result.parent_locator.key());
+        println!("canonical storage: {}", result.canonical_locator.key());
+    }
     Ok(())
 }
 
@@ -8263,6 +8466,11 @@ fn output_repo_type_change(output: &Output, result: &RepoTypeChangeResult) -> Re
         result.id, result.previous_type, result.new_type
     );
     if let Some(canonical) = &result.repository.canonical {
+        if let Some(parent) = &result.repository.parent
+            && parent.id != canonical.id
+        {
+            println!("parent: {}", parent.id);
+        }
         println!("canonical: {}", canonical.id);
     }
     if let Some(shared_git_dir) = &result.shared_git_dir {
@@ -11412,14 +11620,19 @@ mod tests {
 
         assert_eq!(canonical_entry.id, "clones/example.com/project/canonical");
         assert_eq!(canonical_entry.repo_type, "canonical");
+        assert_eq!(canonical_entry.fork_depth, 0);
         assert_eq!(fork_entry.id, "clones/example.com/project/fork");
         assert_eq!(fork_entry.repo_type, "fork");
+        assert_eq!(fork_entry.fork_depth, 1);
+        assert_eq!(fork_entry.parent.as_ref().unwrap().id, canonical_entry.id);
         assert_eq!(
             fork_entry.canonical.as_ref().unwrap().id,
             canonical_entry.id
         );
         assert_eq!(mirror_entry.id, "clones/example.com/project/mirror");
         assert_eq!(mirror_entry.repo_type, "mirror");
+        assert_eq!(mirror_entry.fork_depth, 1);
+        assert_eq!(mirror_entry.parent.as_ref().unwrap().id, canonical_entry.id);
         assert_eq!(
             mirror_entry.canonical.as_ref().unwrap().id,
             canonical_entry.id
@@ -11438,6 +11651,75 @@ mod tests {
                 .any(|dependent| dependent.id == mirror_entry.id
                     && dependent.relationship == "mirror")
         );
+    }
+
+    #[test]
+    fn check_dump_resolves_transitive_fork_parent_and_canonical() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let upstream_locator = Locator::parse("example.com/project/upstream").unwrap();
+        let fork_locator = Locator::parse("example.com/project/fork").unwrap();
+        let fork_of_fork_locator = Locator::parse("example.com/project/fork-of-fork").unwrap();
+        let upstream_path = locator_path(&config.clone_root, &upstream_locator);
+        let fork_path = locator_path(&config.clone_root, &fork_locator);
+        let fork_of_fork_path = locator_path(&config.clone_root, &fork_of_fork_locator);
+        let upstream_id = store
+            .upsert_repo(&upstream_locator, &upstream_path, None)
+            .unwrap();
+        let fork_id = store
+            .upsert_repo(&fork_locator, &fork_path, Some(&upstream_locator.key()))
+            .unwrap();
+        let fork_of_fork_id = store
+            .upsert_repo(
+                &fork_of_fork_locator,
+                &fork_of_fork_path,
+                Some(&upstream_locator.key()),
+            )
+            .unwrap();
+        store.record_fork(fork_id, upstream_id).unwrap();
+        store.record_fork(fork_of_fork_id, fork_id).unwrap();
+
+        let dump = check_dump_report(&config, &store).unwrap();
+        let upstream_entry = dump
+            .tracked_repositories
+            .iter()
+            .find(|repo| repo.locator == upstream_locator)
+            .unwrap();
+        let fork_entry = dump
+            .tracked_repositories
+            .iter()
+            .find(|repo| repo.locator == fork_locator)
+            .unwrap();
+        let fork_of_fork_entry = dump
+            .tracked_repositories
+            .iter()
+            .find(|repo| repo.locator == fork_of_fork_locator)
+            .unwrap();
+
+        assert_eq!(upstream_entry.repo_type, "canonical");
+        assert_eq!(upstream_entry.fork_depth, 0);
+        assert_eq!(upstream_entry.dependents.len(), 1);
+        assert_eq!(upstream_entry.dependents[0].id, fork_entry.id);
+
+        assert_eq!(fork_entry.repo_type, "fork");
+        assert_eq!(fork_entry.fork_depth, 1);
+        assert_eq!(fork_entry.parent.as_ref().unwrap().id, upstream_entry.id);
+        assert_eq!(fork_entry.canonical.as_ref().unwrap().id, upstream_entry.id);
+        assert_eq!(fork_entry.dependents.len(), 1);
+        assert_eq!(fork_entry.dependents[0].id, fork_of_fork_entry.id);
+
+        assert_eq!(fork_of_fork_entry.repo_type, "fork");
+        assert_eq!(fork_of_fork_entry.fork_depth, 2);
+        assert_eq!(
+            fork_of_fork_entry.parent.as_ref().unwrap().id,
+            fork_entry.id
+        );
+        assert_eq!(
+            fork_of_fork_entry.canonical.as_ref().unwrap().id,
+            upstream_entry.id
+        );
+        assert!(fork_of_fork_entry.dependents.is_empty());
     }
 
     #[test]
@@ -11521,6 +11803,121 @@ mod tests {
         );
         assert!(!mirror_path.join("objects").exists());
         assert!(!mirror_path.join(".git").exists());
+    }
+
+    #[test]
+    fn repos_set_type_accepts_fork_parent_and_flattens_storage_to_canonical() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let seed = dir.path().join("seed");
+        let canonical_remote = dir.path().join("canonical-remote");
+        let fork_remote = dir.path().join("fork-remote");
+        let child_remote = dir.path().join("child-remote");
+        fs::create_dir_all(&seed).unwrap();
+        run_git_in(&seed, ["init"]).unwrap();
+        run_git_in(&seed, ["checkout", "-b", "main"]).unwrap();
+        fs::write(seed.join("README.md"), "shared history\n").unwrap();
+        run_git_in(&seed, ["add", "."]).unwrap();
+        run_git_in(
+            &seed,
+            [
+                "-c",
+                "user.name=repo-manager",
+                "-c",
+                "user.email=repo-manager@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        )
+        .unwrap();
+        clone_local_repo(&seed, &canonical_remote);
+        clone_local_repo(&seed, &fork_remote);
+        clone_local_repo(&seed, &child_remote);
+        let canonical_url = file_url_for_path(&canonical_remote);
+        let fork_url = file_url_for_path(&fork_remote);
+        let child_url = file_url_for_path(&child_remote);
+        let canonical_locator = Locator::parse(&canonical_url).unwrap();
+        let fork_locator = Locator::parse(&fork_url).unwrap();
+        let child_locator = Locator::parse(&child_url).unwrap();
+        let canonical_path = locator_path(&config.clone_root, &canonical_locator);
+        let fork_path = locator_path(&config.clone_root, &fork_locator);
+        let child_path = locator_path(&config.clone_root, &child_locator);
+        clone_local_repo(&canonical_remote, &canonical_path);
+        clone_local_repo(&fork_remote, &fork_path);
+        clone_local_repo(&child_remote, &child_path);
+        run_git_in(
+            &canonical_path,
+            ["remote", "set-url", "origin", &canonical_url],
+        )
+        .unwrap();
+        run_git_in(&fork_path, ["remote", "set-url", "origin", &fork_url]).unwrap();
+        run_git_in(&child_path, ["remote", "set-url", "origin", &child_url]).unwrap();
+        store.upsert_repo(&fork_locator, &fork_path, None).unwrap();
+        store
+            .upsert_repo(&child_locator, &child_path, None)
+            .unwrap();
+
+        repos_set_type(
+            &config,
+            &store,
+            &Output { json: true },
+            RepoSetTypeArgs {
+                repo_path: PathBuf::from(repository_path_id(&config, &fork_path)),
+                repo_type: "fork".to_string(),
+                canonical: Some(repository_path_id(&config, &canonical_path)),
+            },
+        )
+        .unwrap();
+        repos_set_type(
+            &config,
+            &store,
+            &Output { json: true },
+            RepoSetTypeArgs {
+                repo_path: PathBuf::from(repository_path_id(&config, &child_path)),
+                repo_type: "fork".to_string(),
+                canonical: Some(repository_path_id(&config, &fork_path)),
+            },
+        )
+        .unwrap();
+
+        let fork_view = read_repo_view_metadata(&fork_path).unwrap().unwrap();
+        let child_view = read_repo_view_metadata(&child_path).unwrap().unwrap();
+        assert_eq!(fork_view.canonical_locator, canonical_locator);
+        assert_eq!(child_view.canonical_locator, canonical_locator);
+        assert_eq!(
+            comparable_path(&child_view.canonical_path),
+            comparable_path(&canonical_path)
+        );
+
+        let dump = check_dump_report(&config, &store).unwrap();
+        let canonical_entry = dump
+            .tracked_repositories
+            .iter()
+            .find(|repo| repo.locator == canonical_locator)
+            .unwrap();
+        let fork_entry = dump
+            .tracked_repositories
+            .iter()
+            .find(|repo| repo.locator == fork_locator)
+            .unwrap();
+        let child_entry = dump
+            .tracked_repositories
+            .iter()
+            .find(|repo| repo.locator == child_locator)
+            .unwrap();
+        assert_eq!(fork_entry.parent.as_ref().unwrap().id, canonical_entry.id);
+        assert_eq!(
+            fork_entry.canonical.as_ref().unwrap().id,
+            canonical_entry.id
+        );
+        assert_eq!(child_entry.parent.as_ref().unwrap().id, fork_entry.id);
+        assert_eq!(
+            child_entry.canonical.as_ref().unwrap().id,
+            canonical_entry.id
+        );
+        assert_eq!(child_entry.fork_depth, 2);
     }
 
     #[test]
