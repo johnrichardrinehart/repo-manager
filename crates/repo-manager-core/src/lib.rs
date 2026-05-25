@@ -766,7 +766,8 @@ struct CheckDumpRoots {
 #[derive(Debug, Clone, Serialize)]
 struct ManagedRepositoryDump {
     id: String,
-    repo_id: i64,
+    #[serde(skip)]
+    db_id: i64,
     #[serde(rename = "type")]
     repo_type: String,
     locator: Locator,
@@ -796,7 +797,6 @@ struct RepoTypeChangeResult {
 #[derive(Debug, Serialize)]
 struct TrackedRepositoryDump {
     id: String,
-    repo_id: i64,
     #[serde(rename = "type")]
     repo_type: String,
     locator: Locator,
@@ -821,10 +821,17 @@ struct BackgroundFetchState {
 struct GitDirectoryDump {
     root: &'static str,
     path: PathBuf,
-    tracked_repo_id: Option<i64>,
+    tracked_repository_id: Option<String>,
+    tracked_repository_type: Option<String>,
     locator: Option<Locator>,
     bare: Option<bool>,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct GitDirectoryTrackedRepository {
+    id: String,
+    repo_type: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4203,7 +4210,13 @@ fn check_dump_report(config: &Config, db: &Store) -> Result<CheckDump> {
     let mut tracked_repositories = Vec::new();
 
     for repo in current_repos {
-        tracked_by_path.insert(comparable_path(&repo.path), repo.repo_id);
+        tracked_by_path.insert(
+            comparable_path(&repo.path),
+            GitDirectoryTrackedRepository {
+                id: repo.id.clone(),
+                repo_type: repo.repo_type.clone(),
+            },
+        );
         let exists = repo.path.exists();
         let bare = if exists && read_repo_view_metadata(&repo.path)?.is_some() {
             Some(true)
@@ -4214,7 +4227,6 @@ fn check_dump_report(config: &Config, db: &Store) -> Result<CheckDump> {
         };
         tracked_repositories.push(TrackedRepositoryDump {
             id: repo.id,
-            repo_id: repo.repo_id,
             repo_type: repo.repo_type,
             locator: repo.locator,
             path: repo.path,
@@ -4222,7 +4234,7 @@ fn check_dump_report(config: &Config, db: &Store) -> Result<CheckDump> {
             bare,
             canonical: repo.canonical,
             dependents: repo.dependents,
-            background_fetch: background_fetch.get(&repo.repo_id).cloned(),
+            background_fetch: background_fetch.get(&repo.db_id).cloned(),
         });
     }
 
@@ -4244,7 +4256,7 @@ fn check_dump_report(config: &Config, db: &Store) -> Result<CheckDump> {
     });
     let untracked_git_directories = git_directories
         .iter()
-        .filter(|entry| entry.tracked_repo_id.is_none())
+        .filter(|entry| entry.tracked_repository_id.is_none())
         .cloned()
         .collect();
 
@@ -4303,7 +4315,7 @@ fn managed_repository_dumps(config: &Config, db: &Store) -> Result<Vec<ManagedRe
                 .collect();
             ManagedRepositoryDump {
                 id: repository_path_id(config, &repo.path),
-                repo_id: repo.id,
+                db_id: repo.id,
                 repo_type,
                 locator: repo.current,
                 path: repo.path,
@@ -4488,12 +4500,12 @@ fn ensure_managed_canonical_is_bare(repo: &ManagedRepoRecord) -> Result<()> {
 fn discovered_git_directory_dump(
     root_name: &'static str,
     root: &Path,
-    tracked_by_path: &HashMap<PathBuf, i64>,
+    tracked_by_path: &HashMap<PathBuf, GitDirectoryTrackedRepository>,
 ) -> Result<Vec<GitDirectoryDump>> {
     discover_git_repositories(root)?
         .into_iter()
         .map(|path| {
-            let tracked_repo_id = tracked_by_path.get(&comparable_path(&path)).copied();
+            let tracked_repository = tracked_by_path.get(&comparable_path(&path));
             let view = read_repo_view_metadata(&path)?;
             let locator = match &view {
                 Some(view) => Some(view.locator.clone()),
@@ -4510,7 +4522,8 @@ fn discovered_git_directory_dump(
             Ok(GitDirectoryDump {
                 root: root_name,
                 path,
-                tracked_repo_id,
+                tracked_repository_id: tracked_repository.map(|repo| repo.id.clone()),
+                tracked_repository_type: tracked_repository.map(|repo| repo.repo_type.clone()),
                 locator,
                 bare,
                 error,
@@ -10115,9 +10128,10 @@ mod tests {
         let tracked = dump
             .tracked_repositories
             .iter()
-            .find(|repo| repo.repo_id == tracked_id)
+            .find(|repo| repo.id == "clones/example.com/tracked/repo")
             .unwrap();
         assert_eq!(tracked.locator, tracked_locator);
+        assert_eq!(tracked.repo_type, "canonical");
         assert_eq!(tracked.bare, Some(true));
         assert_eq!(
             tracked
@@ -10130,12 +10144,14 @@ mod tests {
 
         assert!(dump.git_directories.iter().any(|entry| {
             entry.path == tracked_path
-                && entry.tracked_repo_id == Some(tracked_id)
+                && entry.tracked_repository_id.as_deref() == Some("clones/example.com/tracked/repo")
+                && entry.tracked_repository_type.as_deref() == Some("canonical")
                 && entry.bare == Some(true)
         }));
         assert!(dump.untracked_git_directories.iter().any(|entry| {
             entry.path == untracked_path
-                && entry.tracked_repo_id.is_none()
+                && entry.tracked_repository_id.is_none()
+                && entry.tracked_repository_type.is_none()
                 && entry.bare == Some(false)
                 && entry.locator == Some(Locator::parse("example.com/untracked/repo").unwrap())
         }));
