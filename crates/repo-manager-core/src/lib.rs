@@ -3434,7 +3434,38 @@ fn move_repo_into_managed_path(
             expected_path.display()
         )
     })?;
+    if let Some(parent) = repo_root.parent() {
+        prune_empty_parent_dirs(parent, &config.root)?;
+    }
     Ok((expected_path, Some(repo_root.to_path_buf())))
+}
+
+fn prune_empty_parent_dirs(start: &Path, stop_at: &Path) -> Result<()> {
+    let stop_at = comparable_path(stop_at);
+    let mut current = start.to_path_buf();
+    while path_is_under(&current, &stop_at) && comparable_path(&current) != stop_at {
+        match fs::remove_dir(&current) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+                ) =>
+            {
+                break;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("removing empty parent directory {}", current.display())
+                });
+            }
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        current = parent.to_path_buf();
+    }
+    Ok(())
 }
 
 fn request_daemon_history_review(
@@ -8504,6 +8535,49 @@ mod tests {
 
         assert!(managed_path.exists());
         assert!(store.find_repo("example.com/right").unwrap().is_some());
+    }
+
+    #[test]
+    fn manage_prunes_empty_source_parent_directories_under_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let source_path = config.root.join("repos/codeberg.org/dnkl/fuzzel");
+        let managed_path = config.clone_root.join("codeberg.org/dnkl/fuzzel");
+        fs::create_dir_all(&source_path).unwrap();
+        run_git_in(&source_path, ["init"]).unwrap();
+        run_git_in(
+            &source_path,
+            [
+                "remote",
+                "add",
+                "origin",
+                "https://codeberg.org/dnkl/fuzzel.git",
+            ],
+        )
+        .unwrap();
+        let store = Store::open(&config.state).unwrap();
+
+        manage_repo(
+            &config,
+            &store,
+            &Output { json: true },
+            ManageArgs {
+                path: source_path.clone(),
+                assume_origin_as_canonical: true,
+            },
+        )
+        .unwrap();
+
+        assert!(managed_path.exists());
+        assert!(!source_path.exists());
+        assert!(!config.root.join("repos/codeberg.org").exists());
+        assert!(config.root.exists());
+        assert!(
+            store
+                .find_repo("codeberg.org/dnkl/fuzzel")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
