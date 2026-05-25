@@ -266,6 +266,12 @@ enum RepositoryOperationCommands {
     Repair(DeprecatedRepairArgs),
     #[command(about = "Manage development worktrees under the managed dev-worktree root")]
     Worktree(WorktreeCommand),
+    #[command(
+        name = "repos",
+        visible_alias = "repositories",
+        about = "Inspect or change managed repository relationship metadata"
+    )]
+    Repos(ReposCommand),
 }
 
 #[derive(Debug, Subcommand, HelpGroup)]
@@ -530,6 +536,46 @@ struct WorktreeAddArgs {
 }
 
 #[derive(Debug, Subcommand)]
+enum ReposSubcommand {
+    #[command(about = "Dump managed repositories with their relationship type")]
+    Dump,
+    #[command(
+        name = "set-type",
+        about = "Change a managed repository relationship type",
+        long_about = "Change a managed repository relationship type.\n\nREPO_PATH is the root-relative path shown by `repo repos dump`, such as clones/github.com/example/repo. Absolute managed paths are also accepted.\n\nChanging to fork or mirror requires --canonical. The canonical value may be another dumped repo path, a managed locator, or a Git URL/locator to materialize as the canonical bare repository."
+    )]
+    SetType(RepoSetTypeArgs),
+}
+
+#[derive(Debug, Args)]
+struct ReposCommand {
+    #[command(subcommand)]
+    command: ReposSubcommand,
+}
+
+#[derive(Debug, Args)]
+struct RepoSetTypeArgs {
+    #[arg(
+        value_name = "REPO_PATH",
+        help = "Root-relative or absolute managed repository path"
+    )]
+    repo_path: PathBuf,
+
+    #[arg(
+        value_name = "TYPE",
+        help = "Repository type: canonical, fork, or mirror"
+    )]
+    repo_type: String,
+
+    #[arg(
+        long,
+        value_name = "CANONICAL",
+        help = "Canonical repository path, URL, or locator required for fork/mirror"
+    )]
+    canonical: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
 enum SuccessorSubcommand {
     #[command(
         about = "Record canonical source continuation without treating it as a move",
@@ -717,6 +763,42 @@ struct CheckDump {
 struct CheckDumpRoots {
     clone_root: PathBuf,
     dev_worktree_root: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+struct ReposDump {
+    action: &'static str,
+    root: PathBuf,
+    repositories: Vec<ManagedRepositoryDump>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ManagedRepositoryDump {
+    id: String,
+    #[serde(rename = "type")]
+    repo_type: String,
+    locator: Locator,
+    path: PathBuf,
+    canonical: Option<RepositoryRelationEndpoint>,
+    dependents: Vec<RepositoryRelationEndpoint>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RepositoryRelationEndpoint {
+    id: String,
+    locator: Locator,
+    path: PathBuf,
+    relationship: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RepoTypeChangeResult {
+    action: &'static str,
+    id: String,
+    previous_type: String,
+    new_type: String,
+    repository: ManagedRepositoryDump,
+    shared_git_dir: Option<SharedGitDirResolution>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1361,6 +1443,13 @@ pub fn run() -> Result<()> {
                     add_worktree(&config, &db, &output, cli.dir.as_deref(), args)
                 }
             },
+            RepositoryOperationCommands::Repos(command) => {
+                let db = Store::open(&config.state)?;
+                match command.command {
+                    ReposSubcommand::Dump => repos_dump(&config, &db, &output),
+                    ReposSubcommand::SetType(args) => repos_set_type(&config, &db, &output, args),
+                }
+            }
         },
         Commands::OrganizationalChanges(command) => match command {
             OrganizationalChangeCommands::Move(args) => {
@@ -2270,6 +2359,31 @@ impl Store {
             .map_err(Into::into)
     }
 
+    fn repo_by_id(&self, repo_id: i64) -> Result<Option<ManagedRepoRecord>> {
+        self.conn
+            .query_row(
+                "
+                SELECT id, current_authority, current_remote_path, current_path
+                FROM repos
+                WHERE id = ?1
+                LIMIT 1
+                ",
+                params![repo_id],
+                |row| {
+                    Ok(ManagedRepoRecord {
+                        id: row.get(0)?,
+                        current: Locator {
+                            authority: row.get(1)?,
+                            remote_path: row.get(2)?,
+                        },
+                        path: PathBuf::from(row.get::<_, String>(3)?),
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     fn background_fetch_candidates(
         &self,
         now_epoch_seconds: i64,
@@ -2477,6 +2591,39 @@ impl Store {
             "INSERT OR IGNORE INTO forks (fork_repo_id, canonical_repo_id) VALUES (?1, ?2)",
             params![fork_repo_id, canonical_repo_id],
         )?;
+        Ok(())
+    }
+
+    fn clear_dependent_relationships(&self, repo_id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM forks WHERE fork_repo_id = ?1",
+            params![repo_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM related_history WHERE repo_id = ?1 AND resolution IN ('fork', 'mirror')",
+            params![repo_id],
+        )?;
+        self.conn.execute(
+            "UPDATE repos SET canonical_identity = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            params![repo_id],
+        )?;
+        Ok(())
+    }
+
+    fn ensure_no_dependents(&self, repo_id: i64) -> Result<()> {
+        let fork_dependents: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM forks WHERE canonical_repo_id = ?1",
+            params![repo_id],
+            |row| row.get(0),
+        )?;
+        let mirror_dependents: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM related_history WHERE related_repo_id = ?1 AND resolution IN ('fork', 'mirror')",
+            params![repo_id],
+            |row| row.get(0),
+        )?;
+        if fork_dependents + mirror_dependents > 0 {
+            bail!("repository is canonical for existing fork/mirror checkout(s)");
+        }
         Ok(())
     }
 
@@ -4112,6 +4259,261 @@ fn check_dump_report(config: &Config, db: &Store) -> Result<CheckDump> {
         git_directories,
         untracked_git_directories,
     })
+}
+
+fn repos_dump(config: &Config, db: &Store, output: &Output) -> Result<()> {
+    let dump = repos_dump_report(config, db)?;
+    if output.json {
+        return print_json(&dump);
+    }
+    if dump.repositories.is_empty() {
+        println!("no managed repositories");
+        return Ok(());
+    }
+    for repo in &dump.repositories {
+        match &repo.canonical {
+            Some(canonical) => println!(
+                "{}\t{}\t{}\tcanonical={}",
+                repo.id,
+                repo.repo_type,
+                repo.locator.key(),
+                canonical.id
+            ),
+            None => println!("{}\t{}\t{}", repo.id, repo.repo_type, repo.locator.key()),
+        }
+    }
+    Ok(())
+}
+
+fn repos_dump_report(config: &Config, db: &Store) -> Result<ReposDump> {
+    let repos = db.current_repos()?;
+    let relationships = db.shared_git_dir_relationships()?;
+    let mut dependent_by_id = HashMap::new();
+    let mut dependents_by_canonical: HashMap<i64, Vec<&SharedGitDirRelationship>> = HashMap::new();
+    for relationship in &relationships {
+        dependent_by_id.insert(relationship.dependent_repo_id, relationship);
+        dependents_by_canonical
+            .entry(relationship.controlling_repo_id)
+            .or_default()
+            .push(relationship);
+    }
+
+    let repositories = repos
+        .into_iter()
+        .map(|repo| {
+            let canonical =
+                dependent_by_id
+                    .get(&repo.id)
+                    .map(|relationship| RepositoryRelationEndpoint {
+                        id: repository_path_id(config, &relationship.controlling_path),
+                        locator: relationship.controlling_locator.clone(),
+                        path: relationship.controlling_path.clone(),
+                        relationship: relationship.relationship.clone(),
+                    });
+            let repo_type = dependent_by_id
+                .get(&repo.id)
+                .map(|relationship| relationship.relationship.clone())
+                .unwrap_or_else(|| "canonical".to_string());
+            let dependents = dependents_by_canonical
+                .get(&repo.id)
+                .into_iter()
+                .flat_map(|relationships| relationships.iter())
+                .map(|relationship| RepositoryRelationEndpoint {
+                    id: repository_path_id(config, &relationship.dependent_path),
+                    locator: relationship.dependent_locator.clone(),
+                    path: relationship.dependent_path.clone(),
+                    relationship: relationship.relationship.clone(),
+                })
+                .collect();
+            ManagedRepositoryDump {
+                id: repository_path_id(config, &repo.path),
+                repo_type,
+                locator: repo.current,
+                path: repo.path,
+                canonical,
+                dependents,
+            }
+        })
+        .collect();
+
+    Ok(ReposDump {
+        action: "repos-dump",
+        root: config.root.clone(),
+        repositories,
+    })
+}
+
+fn repository_path_id(config: &Config, path: &Path) -> String {
+    path.strip_prefix(&config.root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+fn managed_repo_by_path_id(
+    config: &Config,
+    db: &Store,
+    repo_path: &Path,
+) -> Result<ManagedRepoRecord> {
+    let expected_path = if repo_path.is_absolute() {
+        repo_path.to_path_buf()
+    } else {
+        config.root.join(repo_path)
+    };
+    db.current_repos()?
+        .into_iter()
+        .find(|repo| comparable_path(&repo.path) == comparable_path(&expected_path))
+        .ok_or_else(|| anyhow!("unknown managed repository path: {}", repo_path.display()))
+}
+
+fn repos_set_type(
+    config: &Config,
+    db: &Store,
+    output: &Output,
+    args: RepoSetTypeArgs,
+) -> Result<()> {
+    let repo_type = args.repo_type.trim().to_ascii_lowercase();
+    if !matches!(repo_type.as_str(), "canonical" | "fork" | "mirror") {
+        bail!(
+            "invalid repository type: {}; expected canonical, fork, or mirror",
+            args.repo_type
+        );
+    }
+    let repo = managed_repo_by_path_id(config, db, &args.repo_path)?;
+    let before = repos_dump_report(config, db)?
+        .repositories
+        .into_iter()
+        .find(|entry| comparable_path(&entry.path) == comparable_path(&repo.path))
+        .ok_or_else(|| anyhow!("managed repository disappeared while changing type"))?;
+    db.ensure_no_dependents(repo.id)?;
+
+    let shared_git_dir = match repo_type.as_str() {
+        "canonical" => {
+            if read_repo_view_metadata(&repo.path)?.is_some() {
+                bail!(
+                    "cannot mark repo-manager namespace view as canonical without a canonical checkout: {}",
+                    repo.path.display()
+                );
+            }
+            if args.canonical.is_some() {
+                bail!("--canonical is only valid when setting type to fork or mirror");
+            }
+            db.clear_dependent_relationships(repo.id)?;
+            None
+        }
+        "fork" | "mirror" => {
+            let canonical_ref = args.canonical.as_deref().ok_or_else(|| {
+                anyhow!("--canonical is required when setting type to {repo_type}")
+            })?;
+            let canonical = ensure_type_change_canonical(config, db, canonical_ref)?;
+            if canonical.id == repo.id {
+                bail!("repository cannot be its own canonical repository");
+            }
+            db.clear_dependent_relationships(repo.id)?;
+            Some(materialize_related_shared_git_dir(
+                db,
+                &repo.current,
+                &repo.path,
+                &canonical.current,
+                &canonical.path,
+                &repo_type,
+                true,
+            )?)
+        }
+        _ => unreachable!(),
+    };
+
+    let after_repo = managed_repo_by_path_id(config, db, &args.repo_path).or_else(|_| {
+        db.repo_by_id(repo.id)?
+            .ok_or_else(|| anyhow!("repository disappeared"))
+    })?;
+    let after = repos_dump_report(config, db)?
+        .repositories
+        .into_iter()
+        .find(|entry| comparable_path(&entry.path) == comparable_path(&after_repo.path))
+        .ok_or_else(|| anyhow!("managed repository disappeared after changing type"))?;
+    let result = RepoTypeChangeResult {
+        action: "repo-set-type",
+        id: after.id.clone(),
+        previous_type: before.repo_type,
+        new_type: after.repo_type.clone(),
+        repository: after,
+        shared_git_dir,
+    };
+    output_repo_type_change(output, &result)
+}
+
+fn ensure_type_change_canonical(
+    config: &Config,
+    db: &Store,
+    canonical_ref: &str,
+) -> Result<ManagedRepoRecord> {
+    if let Ok(repo) = managed_repo_by_path_id(config, db, Path::new(canonical_ref)) {
+        ensure_managed_canonical_is_bare(&repo)?;
+        return Ok(repo);
+    }
+    if let Ok(Some(record)) = db.find_repo(canonical_ref)
+        && let Some(repo) = db.repo_by_id(record.id)?
+    {
+        ensure_managed_canonical_is_bare(&repo)?;
+        return Ok(repo);
+    }
+    if let Some(path) = existing_path_reference(config, canonical_ref) {
+        if !is_git_repository_path(&path) {
+            bail!("canonical path is not a Git repository: {}", path.display());
+        }
+        let locator = repo_locator_from_origin(&path)?.ok_or_else(|| {
+            anyhow!(
+                "canonical path has no locator-compatible origin remote: {}",
+                path.display()
+            )
+        })?;
+        let repo_id = db.upsert_repo(&locator, &path, None)?;
+        let repo = ManagedRepoRecord {
+            id: repo_id,
+            current: locator,
+            path,
+        };
+        ensure_managed_canonical_is_bare(&repo)?;
+        return Ok(repo);
+    }
+
+    let locator = Locator::parse(canonical_ref)?;
+    let path = locator_path(&config.clone_root, &locator);
+    let url = if canonical_ref.contains("://") || parse_scp_like(canonical_ref).is_some() {
+        canonical_ref.to_string()
+    } else {
+        remote_url_for_locator(None, &locator)
+    };
+    ensure_canonical_bare_repo(&path, &url)?;
+    let repo_id = db.upsert_repo(&locator, &path, None)?;
+    Ok(ManagedRepoRecord {
+        id: repo_id,
+        current: locator,
+        path,
+    })
+}
+
+fn existing_path_reference(config: &Config, value: &str) -> Option<PathBuf> {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        return path.exists().then(|| path.to_path_buf());
+    }
+    let path = config.root.join(path);
+    path.exists().then_some(path)
+}
+
+fn ensure_managed_canonical_is_bare(repo: &ManagedRepoRecord) -> Result<()> {
+    if read_repo_view_metadata(&repo.path)?.is_some() {
+        bail!(
+            "canonical repository cannot be a repo-manager namespace view: {}",
+            repo.path.display()
+        );
+    }
+    if repo.path.exists() && !is_bare_repository(&repo.path)? {
+        convert_standalone_checkout_to_bare_repository(&repo.path)?;
+    }
+    ensure_bare_repository(&repo.path)
 }
 
 fn discovered_git_directory_dump(
@@ -7658,6 +8060,26 @@ fn output_related_resolution(output: &Output, resolution: &RelatedResolution) ->
     Ok(())
 }
 
+fn output_repo_type_change(output: &Output, result: &RepoTypeChangeResult) -> Result<()> {
+    if output.json {
+        return print_json(result);
+    }
+    println!(
+        "{}: {} -> {}",
+        result.id, result.previous_type, result.new_type
+    );
+    if let Some(canonical) = &result.repository.canonical {
+        println!("canonical: {}", canonical.id);
+    }
+    if let Some(shared_git_dir) = &result.shared_git_dir {
+        println!(
+            "materialized {} namespace: {}",
+            result.new_type, shared_git_dir.local_branch
+        );
+    }
+    Ok(())
+}
+
 fn print_json<T: Serialize>(value: &T) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
@@ -10582,6 +11004,159 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn repos_dump_reports_root_relative_ids_and_relationship_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let canonical_locator = Locator::parse("example.com/project/canonical").unwrap();
+        let fork_locator = Locator::parse("example.com/project/fork").unwrap();
+        let mirror_locator = Locator::parse("example.com/project/mirror").unwrap();
+        let canonical_path = locator_path(&config.clone_root, &canonical_locator);
+        let fork_path = locator_path(&config.clone_root, &fork_locator);
+        let mirror_path = locator_path(&config.clone_root, &mirror_locator);
+        let canonical_id = store
+            .upsert_repo(&canonical_locator, &canonical_path, None)
+            .unwrap();
+        let fork_id = store.upsert_repo(&fork_locator, &fork_path, None).unwrap();
+        let mirror_id = store
+            .upsert_repo(&mirror_locator, &mirror_path, None)
+            .unwrap();
+        store.record_fork(fork_id, canonical_id).unwrap();
+        store
+            .record_resolved_related(mirror_id, canonical_id, "mirror")
+            .unwrap();
+
+        let dump = repos_dump_report(&config, &store).unwrap();
+        let canonical_entry = dump
+            .repositories
+            .iter()
+            .find(|repo| repo.locator == canonical_locator)
+            .unwrap();
+        let fork_entry = dump
+            .repositories
+            .iter()
+            .find(|repo| repo.locator == fork_locator)
+            .unwrap();
+        let mirror_entry = dump
+            .repositories
+            .iter()
+            .find(|repo| repo.locator == mirror_locator)
+            .unwrap();
+
+        assert_eq!(canonical_entry.id, "clones/example.com/project/canonical");
+        assert_eq!(canonical_entry.repo_type, "canonical");
+        assert_eq!(fork_entry.id, "clones/example.com/project/fork");
+        assert_eq!(fork_entry.repo_type, "fork");
+        assert_eq!(
+            fork_entry.canonical.as_ref().unwrap().id,
+            canonical_entry.id
+        );
+        assert_eq!(mirror_entry.id, "clones/example.com/project/mirror");
+        assert_eq!(mirror_entry.repo_type, "mirror");
+        assert_eq!(
+            mirror_entry.canonical.as_ref().unwrap().id,
+            canonical_entry.id
+        );
+        assert_eq!(canonical_entry.dependents.len(), 2);
+        assert!(
+            canonical_entry
+                .dependents
+                .iter()
+                .any(|dependent| dependent.id == fork_entry.id && dependent.relationship == "fork")
+        );
+        assert!(
+            canonical_entry
+                .dependents
+                .iter()
+                .any(|dependent| dependent.id == mirror_entry.id
+                    && dependent.relationship == "mirror")
+        );
+    }
+
+    #[test]
+    fn repos_set_type_materializes_mirror_namespace_from_path_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let seed = dir.path().join("seed");
+        let mirror_remote = dir.path().join("mirror-remote");
+        let canonical_remote = dir.path().join("canonical-remote");
+        fs::create_dir_all(&seed).unwrap();
+        run_git_in(&seed, ["init"]).unwrap();
+        run_git_in(&seed, ["checkout", "-b", "main"]).unwrap();
+        fs::write(seed.join("README.md"), "shared history\n").unwrap();
+        run_git_in(&seed, ["add", "."]).unwrap();
+        run_git_in(
+            &seed,
+            [
+                "-c",
+                "user.name=repo-manager",
+                "-c",
+                "user.email=repo-manager@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        )
+        .unwrap();
+        clone_local_repo(&seed, &mirror_remote);
+        clone_local_repo(&seed, &canonical_remote);
+        let mirror_url = file_url_for_path(&mirror_remote);
+        let canonical_url = file_url_for_path(&canonical_remote);
+        let mirror_locator = Locator::parse(&mirror_url).unwrap();
+        let canonical_locator = Locator::parse(&canonical_url).unwrap();
+        let mirror_path = locator_path(&config.clone_root, &mirror_locator);
+        let canonical_path = locator_path(&config.clone_root, &canonical_locator);
+        clone_local_repo(&mirror_remote, &mirror_path);
+        clone_local_repo(&canonical_remote, &canonical_path);
+        run_git_in(&mirror_path, ["remote", "set-url", "origin", &mirror_url]).unwrap();
+        run_git_in(
+            &canonical_path,
+            ["remote", "set-url", "origin", &canonical_url],
+        )
+        .unwrap();
+        store
+            .upsert_repo(&mirror_locator, &mirror_path, None)
+            .unwrap();
+
+        repos_set_type(
+            &config,
+            &store,
+            &Output { json: true },
+            RepoSetTypeArgs {
+                repo_path: PathBuf::from(repository_path_id(&config, &mirror_path)),
+                repo_type: "mirror".to_string(),
+                canonical: Some(repository_path_id(&config, &canonical_path)),
+            },
+        )
+        .unwrap();
+
+        assert!(is_bare_repository(&canonical_path).unwrap());
+        let view = read_repo_view_metadata(&mirror_path).unwrap().unwrap();
+        assert_eq!(view.relationship, "mirror");
+        assert_eq!(view.locator, mirror_locator);
+        assert_eq!(view.canonical_locator, canonical_locator);
+        assert_eq!(
+            comparable_path(&view.canonical_path),
+            comparable_path(&canonical_path)
+        );
+
+        let dump = repos_dump_report(&config, &store).unwrap();
+        let mirror_entry = dump
+            .repositories
+            .iter()
+            .find(|repo| repo.locator == mirror_locator)
+            .unwrap();
+        assert_eq!(mirror_entry.repo_type, "mirror");
+        assert_eq!(
+            mirror_entry.canonical.as_ref().unwrap().id,
+            repository_path_id(&config, &canonical_path)
+        );
+        assert!(!mirror_path.join("objects").exists());
+        assert!(!mirror_path.join(".git").exists());
     }
 
     #[test]
