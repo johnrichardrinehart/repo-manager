@@ -33,6 +33,34 @@ worktree root into its managed locator path when needed, records it in
 repo-manager metadata, and asks `repod` to review repositories under the clone
 root for shared Git history.
 
+New remote repositories can be created and immediately cloned into the managed
+clone root:
+
+```sh
+repo create https://github.com/me/new-project --private
+```
+
+`repo create` infers GitHub and SourceHut from `github.com` and `git.sr.ht`.
+Other forges must be configured explicitly, for example:
+
+```json
+{
+  "config_version": 1,
+  "create_default_visibility": "private",
+  "forges": {
+    "git.example.test": {
+      "backend": "forgejo",
+      "token_env": "EXAMPLE_FORGE_TOKEN",
+      "api_base_url": "https://git.example.test"
+    }
+  }
+}
+```
+
+The command reads forge tokens from environment variables, fails if the remote
+repository already exists, and refuses to overwrite an existing local target
+path.
+
 ## Remotes
 
 `repo move` updates `origin` to the new locator. `repo reconcile` does the

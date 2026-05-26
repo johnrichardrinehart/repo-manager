@@ -53,6 +53,41 @@
     "background-fetch-minimum-interval-seconds": {
       "type": ["integer", "null"],
       "minimum": 0
+    },
+    "create_default_visibility": {
+      "enum": ["private", "public", null]
+    },
+    "create-default-visibility": {
+      "enum": ["private", "public", null]
+    },
+    "forges": {
+      "type": ["object", "null"],
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["backend"],
+        "properties": {
+          "backend": {
+            "enum": ["github", "sourcehut", "forgejo"]
+          },
+          "token_env": {
+            "type": ["string", "null"],
+            "minLength": 1
+          },
+          "token-env": {
+            "type": ["string", "null"],
+            "minLength": 1
+          },
+          "api_base_url": {
+            "type": ["string", "null"],
+            "minLength": 1
+          },
+          "api-base-url": {
+            "type": ["string", "null"],
+            "minLength": 1
+          }
+        }
+      }
     }
   }
 }

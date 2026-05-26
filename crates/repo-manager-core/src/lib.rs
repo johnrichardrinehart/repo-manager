@@ -242,6 +242,11 @@ enum SetupCommands {
 enum RepositoryOperationCommands {
     #[command(about = "Clone a repository into the managed clone root")]
     Clone(CloneArgs),
+    #[command(
+        about = "Create a remote repository and clone it into the managed clone root",
+        long_about = "Create a remote repository on GitHub, SourceHut, or a configured Forgejo host, then clone it into the managed clone root.\n\nThe forge backend is inferred for github.com and git.sr.ht. Other authorities must be listed under `forges` in repo-manager config. The command fails if the remote repository already exists or if the target path already exists locally."
+    )]
+    Create(CreateArgs),
     #[command(about = "Fetch a managed repository or namespace-backed fork view")]
     Fetch(FetchArgs),
     #[command(about = "List or create branches for a managed repository or fork view")]
@@ -393,6 +398,30 @@ struct CloneArgs {
         long_help = "Git URL or locator to clone. The URL is normalized into <authority>/<remote-path> and placed under the clone root."
     )]
     url: String,
+}
+
+#[derive(Debug, Args)]
+struct CreateArgs {
+    #[arg(
+        value_name = "URL",
+        help = "Git URL or locator for the repository to create",
+        long_help = "Git URL or locator for the repository to create. The URL is normalized into <authority>/<remote-path>, created on the corresponding forge, and cloned under the clone root."
+    )]
+    url: String,
+
+    #[arg(
+        long,
+        conflicts_with = "public",
+        help = "Create the remote repository as private"
+    )]
+    private: bool,
+
+    #[arg(
+        long,
+        conflicts_with = "private",
+        help = "Create the remote repository as public"
+    )]
+    public: bool,
 }
 
 #[derive(Debug, Args)]
@@ -679,6 +708,8 @@ struct Config {
     client_id: String,
     assume_origin_as_canonical: bool,
     clone_as_bare: bool,
+    create_default_visibility: RepoVisibility,
+    forges: HashMap<String, ForgeConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -712,6 +743,48 @@ struct FileConfig {
     rpc_rate_limit_per_second: Option<u32>,
     #[serde(alias = "background-fetch-minimum-interval-seconds")]
     background_fetch_minimum_interval_seconds: Option<u64>,
+    #[serde(alias = "create-default-visibility")]
+    create_default_visibility: Option<RepoVisibility>,
+    forges: Option<HashMap<String, ForgeConfig>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum RepoVisibility {
+    #[default]
+    Private,
+    Public,
+}
+
+impl RepoVisibility {
+    fn is_private(self) -> bool {
+        matches!(self, Self::Private)
+    }
+
+    fn sourcehut(self) -> &'static str {
+        match self {
+            Self::Private => "PRIVATE",
+            Self::Public => "PUBLIC",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct ForgeConfig {
+    backend: ForgeBackend,
+    #[serde(alias = "token-env")]
+    token_env: Option<String>,
+    #[serde(alias = "api-base-url")]
+    api_base_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum ForgeBackend {
+    Github,
+    Sourcehut,
+    Forgejo,
 }
 
 #[derive(Debug, Serialize)]
@@ -1149,6 +1222,16 @@ struct CloneResult {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct CreateResult {
+    action: &'static str,
+    locator: Locator,
+    path: PathBuf,
+    backend: ForgeBackend,
+    visibility: RepoVisibility,
+    clone: CloneResult,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct ManageResult {
     action: &'static str,
     locator: Locator,
@@ -1448,6 +1531,10 @@ pub fn run() -> Result<()> {
                 let db = Store::open(&config.state)?;
                 clone_repo(&config, &db, &output, &args.url)
             }
+            RepositoryOperationCommands::Create(args) => {
+                let db = Store::open(&config.state)?;
+                create_repo(&config, &db, &output, args)
+            }
             RepositoryOperationCommands::Fetch(args) => {
                 let db = Store::open(&config.state)?;
                 fetch_repo(&config, &db, &output, cli.dir.as_deref(), args)
@@ -1608,6 +1695,8 @@ impl Config {
             .or(file_config.assume_origin_as_canonical)
             .unwrap_or(false);
         let clone_as_bare = file_config.clone_as_bare.unwrap_or(false);
+        let create_default_visibility = file_config.create_default_visibility.unwrap_or_default();
+        let forges = file_config.forges.unwrap_or_default();
         Ok(Self {
             config_path,
             state,
@@ -1619,6 +1708,8 @@ impl Config {
             client_id,
             assume_origin_as_canonical,
             clone_as_bare,
+            create_default_visibility,
+            forges,
         })
     }
 }
@@ -1667,6 +1758,13 @@ impl FileConfig {
         self.background_fetch_minimum_interval_seconds = other
             .background_fetch_minimum_interval_seconds
             .or(self.background_fetch_minimum_interval_seconds);
+        self.create_default_visibility = other
+            .create_default_visibility
+            .or(self.create_default_visibility);
+        if let Some(other_forges) = other.forges {
+            let forges = self.forges.get_or_insert_with(HashMap::new);
+            forges.extend(other_forges);
+        }
     }
 
     fn save(&self, path: &Path) -> Result<()> {
@@ -1776,6 +1874,8 @@ fn setup_config(config: &Config, output: &Output, args: SetupArgs) -> Result<()>
         clone_start_ttl_minutes: None,
         rpc_rate_limit_per_second: None,
         background_fetch_minimum_interval_seconds: None,
+        create_default_visibility: Some(config.create_default_visibility),
+        forges: (!config.forges.is_empty()).then(|| config.forges.clone()),
     };
     file_config.save(&config_path)?;
     let result = SetupResult {
@@ -2998,6 +3098,11 @@ impl Store {
 }
 
 fn clone_repo(config: &Config, db: &Store, output: &Output, url: &str) -> Result<()> {
+    let result = clone_repo_inner(config, db, url)?;
+    output_clone(output, &result)
+}
+
+fn clone_repo_inner(config: &Config, db: &Store, url: &str) -> Result<CloneResult> {
     warn_pending_related(db)?;
     let locator = Locator::parse(url)?;
     let path = locator_path(&config.clone_root, &locator);
@@ -3068,14 +3173,508 @@ fn clone_repo(config: &Config, db: &Store, output: &Output, url: &str) -> Result
             scan_root: config.clone_root.clone(),
         }),
     );
-    output_clone(
+    Ok(CloneResult {
+        action: "clone",
+        locator,
+        path,
+    })
+}
+
+fn create_repo(config: &Config, db: &Store, output: &Output, args: CreateArgs) -> Result<()> {
+    let locator = Locator::parse(&args.url)?;
+    let path = locator_path(&config.clone_root, &locator);
+    if path.exists() {
+        bail!("target path already exists: {}", path.display());
+    }
+    let visibility = create_visibility(config, &args);
+    let forge = resolve_create_forge(config, &locator)?;
+    create_remote_repository(&forge, &locator, visibility)?;
+    let clone = clone_repo_inner(config, db, &args.url)?;
+    output_create(
         output,
-        &CloneResult {
-            action: "clone",
+        &CreateResult {
+            action: "create",
             locator,
             path,
+            backend: forge.backend,
+            visibility,
+            clone,
         },
     )
+}
+
+fn create_visibility(config: &Config, args: &CreateArgs) -> RepoVisibility {
+    if args.private {
+        RepoVisibility::Private
+    } else if args.public {
+        RepoVisibility::Public
+    } else {
+        config.create_default_visibility
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CreateForge {
+    backend: ForgeBackend,
+    token_envs: Vec<String>,
+    api_base_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteRepoParts {
+    owner: String,
+    name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HttpRequestPlan {
+    method: &'static str,
+    url: String,
+    headers: Vec<(String, String)>,
+    body: Option<String>,
+}
+
+#[derive(Debug)]
+struct HttpResponse {
+    status: u16,
+    body: String,
+}
+
+fn resolve_create_forge(config: &Config, locator: &Locator) -> Result<CreateForge> {
+    if let Some(forge) = config.forges.get(&locator.authority) {
+        return Ok(CreateForge {
+            backend: forge.backend,
+            token_envs: vec![
+                forge
+                    .token_env
+                    .clone()
+                    .unwrap_or_else(|| default_token_env(forge.backend).to_string()),
+            ],
+            api_base_url: forge
+                .api_base_url
+                .clone()
+                .unwrap_or_else(|| default_api_base_url(forge.backend, &locator.authority)),
+        });
+    }
+
+    match locator.authority.as_str() {
+        "github.com" => Ok(CreateForge {
+            backend: ForgeBackend::Github,
+            token_envs: vec!["GITHUB_TOKEN".to_string()],
+            api_base_url: "https://api.github.com".to_string(),
+        }),
+        "git.sr.ht" => Ok(CreateForge {
+            backend: ForgeBackend::Sourcehut,
+            token_envs: vec!["SOURCEHUT_TOKEN".to_string(), "SRHT_TOKEN".to_string()],
+            api_base_url: "https://git.sr.ht/query".to_string(),
+        }),
+        authority => bail!(
+            "no forge backend configured for {}; add it under `forges` in repo-manager config",
+            authority
+        ),
+    }
+}
+
+fn default_token_env(backend: ForgeBackend) -> &'static str {
+    match backend {
+        ForgeBackend::Github => "GITHUB_TOKEN",
+        ForgeBackend::Sourcehut => "SOURCEHUT_TOKEN",
+        ForgeBackend::Forgejo => "FORGEJO_TOKEN",
+    }
+}
+
+fn default_api_base_url(backend: ForgeBackend, authority: &str) -> String {
+    match backend {
+        ForgeBackend::Github => "https://api.github.com".to_string(),
+        ForgeBackend::Sourcehut => format!("https://{authority}/query"),
+        ForgeBackend::Forgejo => format!("https://{authority}"),
+    }
+}
+
+fn create_remote_repository(
+    forge: &CreateForge,
+    locator: &Locator,
+    visibility: RepoVisibility,
+) -> Result<()> {
+    let token = read_forge_token(&forge.token_envs)?;
+    match forge.backend {
+        ForgeBackend::Github => create_rest_repository(forge, locator, visibility, &token, true),
+        ForgeBackend::Forgejo => create_rest_repository(forge, locator, visibility, &token, false),
+        ForgeBackend::Sourcehut => create_sourcehut_repository(forge, locator, visibility, &token),
+    }
+}
+
+fn read_forge_token(token_envs: &[String]) -> Result<String> {
+    for token_env in token_envs {
+        if let Ok(token) = env::var(token_env)
+            && !token.trim().is_empty()
+        {
+            return Ok(token);
+        }
+    }
+    bail!("missing forge token; set one of: {}", token_envs.join(", "))
+}
+
+fn create_rest_repository(
+    forge: &CreateForge,
+    locator: &Locator,
+    visibility: RepoVisibility,
+    token: &str,
+    github: bool,
+) -> Result<()> {
+    let parts = parse_owner_repo(locator)?;
+    let user = rest_authenticated_user(forge, token, github)?;
+    let exists_response =
+        curl_http_json(&rest_repository_get_request(forge, &parts, token, github))?;
+    match exists_response.status {
+        200 => bail!("remote repository already exists: {}", locator.key()),
+        404 => {}
+        status => bail!(
+            "checking remote repository existence failed with HTTP {status}: {}",
+            trim_http_body(&exists_response.body)
+        ),
+    }
+    let request = rest_repository_create_request(forge, &parts, visibility, token, &user, github);
+    let response = curl_http_json(&request)?;
+    if response.status != 201 {
+        bail!(
+            "creating remote repository failed with HTTP {}: {}",
+            response.status,
+            trim_http_body(&response.body)
+        );
+    }
+    Ok(())
+}
+
+fn rest_authenticated_user(forge: &CreateForge, token: &str, github: bool) -> Result<String> {
+    let response = curl_http_json(&rest_authenticated_user_request(forge, token, github))?;
+    if response.status != 200 {
+        bail!(
+            "reading authenticated forge user failed with HTTP {}: {}",
+            response.status,
+            trim_http_body(&response.body)
+        );
+    }
+    let json: serde_json::Value =
+        serde_json::from_str(&response.body).context("parsing authenticated user response")?;
+    json.get("login")
+        .and_then(|value| value.as_str())
+        .filter(|login| !login.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("authenticated user response did not include `login`"))
+}
+
+fn create_sourcehut_repository(
+    forge: &CreateForge,
+    locator: &Locator,
+    visibility: RepoVisibility,
+    token: &str,
+) -> Result<()> {
+    let parts = parse_sourcehut_repo(locator)?;
+    let user_response = curl_http_json(&sourcehut_me_request(forge, token))?;
+    ensure_sourcehut_success(&user_response, "reading authenticated SourceHut user")?;
+    let user = sourcehut_username(&user_response.body)?;
+    if user != parts.owner {
+        bail!(
+            "SourceHut can only create repositories for the authenticated user `{user}`, got `{}`",
+            parts.owner
+        );
+    }
+
+    let exists_response =
+        curl_http_json(&sourcehut_repository_by_path_request(forge, token, locator))?;
+    ensure_sourcehut_success(&exists_response, "checking remote repository existence")?;
+    if sourcehut_repository_exists(&exists_response.body)? {
+        bail!("remote repository already exists: {}", locator.key());
+    }
+
+    let create_response = curl_http_json(&sourcehut_create_request(
+        forge,
+        token,
+        &parts.name,
+        visibility,
+    ))?;
+    ensure_sourcehut_success(&create_response, "creating SourceHut repository")
+}
+
+fn parse_owner_repo(locator: &Locator) -> Result<RemoteRepoParts> {
+    let mut parts = locator.remote_path.split('/');
+    let owner = parts.next().unwrap_or_default();
+    let name = parts.next().unwrap_or_default();
+    if owner.is_empty() || name.is_empty() || parts.next().is_some() {
+        bail!(
+            "repository URL for {} must have exactly <owner>/<repo>",
+            locator.authority
+        );
+    }
+    Ok(RemoteRepoParts {
+        owner: owner.to_string(),
+        name: name.to_string(),
+    })
+}
+
+fn parse_sourcehut_repo(locator: &Locator) -> Result<RemoteRepoParts> {
+    let parts = parse_owner_repo(locator)?;
+    let owner = parts.owner.strip_prefix('~').ok_or_else(|| {
+        anyhow!(
+            "SourceHut repository path must be ~<user>/<repo>, got {}",
+            locator.key()
+        )
+    })?;
+    Ok(RemoteRepoParts {
+        owner: owner.to_string(),
+        name: parts.name,
+    })
+}
+
+fn rest_authenticated_user_request(
+    forge: &CreateForge,
+    token: &str,
+    github: bool,
+) -> HttpRequestPlan {
+    HttpRequestPlan {
+        method: "GET",
+        url: if github {
+            format!("{}/user", forge.api_base_url.trim_end_matches('/'))
+        } else {
+            format!("{}/api/v1/user", forge.api_base_url.trim_end_matches('/'))
+        },
+        headers: rest_headers(token, github, false),
+        body: None,
+    }
+}
+
+fn rest_repository_get_request(
+    forge: &CreateForge,
+    parts: &RemoteRepoParts,
+    token: &str,
+    github: bool,
+) -> HttpRequestPlan {
+    HttpRequestPlan {
+        method: "GET",
+        url: if github {
+            format!(
+                "{}/repos/{}/{}",
+                forge.api_base_url.trim_end_matches('/'),
+                parts.owner,
+                parts.name
+            )
+        } else {
+            format!(
+                "{}/api/v1/repos/{}/{}",
+                forge.api_base_url.trim_end_matches('/'),
+                parts.owner,
+                parts.name
+            )
+        },
+        headers: rest_headers(token, github, false),
+        body: None,
+    }
+}
+
+fn rest_repository_create_request(
+    forge: &CreateForge,
+    parts: &RemoteRepoParts,
+    visibility: RepoVisibility,
+    token: &str,
+    authenticated_user: &str,
+    github: bool,
+) -> HttpRequestPlan {
+    let user_repo = parts.owner.eq_ignore_ascii_case(authenticated_user);
+    let url = if github {
+        if user_repo {
+            format!("{}/user/repos", forge.api_base_url.trim_end_matches('/'))
+        } else {
+            format!(
+                "{}/orgs/{}/repos",
+                forge.api_base_url.trim_end_matches('/'),
+                parts.owner
+            )
+        }
+    } else if user_repo {
+        format!(
+            "{}/api/v1/user/repos",
+            forge.api_base_url.trim_end_matches('/')
+        )
+    } else {
+        format!(
+            "{}/api/v1/orgs/{}/repos",
+            forge.api_base_url.trim_end_matches('/'),
+            parts.owner
+        )
+    };
+    HttpRequestPlan {
+        method: "POST",
+        url,
+        headers: rest_headers(token, github, true),
+        body: Some(
+            serde_json::json!({
+                "name": parts.name,
+                "private": visibility.is_private()
+            })
+            .to_string(),
+        ),
+    }
+}
+
+fn rest_headers(token: &str, github: bool, json_body: bool) -> Vec<(String, String)> {
+    let mut headers = if github {
+        vec![
+            (
+                "Accept".to_string(),
+                "application/vnd.github+json".to_string(),
+            ),
+            ("X-GitHub-Api-Version".to_string(), "2022-11-28".to_string()),
+            ("User-Agent".to_string(), "repo-manager".to_string()),
+            ("Authorization".to_string(), format!("Bearer {token}")),
+        ]
+    } else {
+        vec![
+            ("Accept".to_string(), "application/json".to_string()),
+            ("Authorization".to_string(), format!("token {token}")),
+        ]
+    };
+    if json_body {
+        headers.push(("Content-Type".to_string(), "application/json".to_string()));
+    }
+    headers
+}
+
+fn sourcehut_me_request(forge: &CreateForge, token: &str) -> HttpRequestPlan {
+    sourcehut_graphql_request(
+        forge,
+        token,
+        "query me { me { username canonicalName } }",
+        serde_json::json!({}),
+    )
+}
+
+fn sourcehut_repository_by_path_request(
+    forge: &CreateForge,
+    token: &str,
+    locator: &Locator,
+) -> HttpRequestPlan {
+    sourcehut_graphql_request(
+        forge,
+        token,
+        "query repositoryByDiskPath($path: String!) { repositoryByDiskPath(path: $path) { id name } }",
+        serde_json::json!({ "path": locator.remote_path }),
+    )
+}
+
+fn sourcehut_create_request(
+    forge: &CreateForge,
+    token: &str,
+    name: &str,
+    visibility: RepoVisibility,
+) -> HttpRequestPlan {
+    sourcehut_graphql_request(
+        forge,
+        token,
+        "mutation createRepository($name: String!, $visibility: Visibility!) { createRepository(name: $name, visibility: $visibility) { id name visibility } }",
+        serde_json::json!({ "name": name, "visibility": visibility.sourcehut() }),
+    )
+}
+
+fn sourcehut_graphql_request(
+    forge: &CreateForge,
+    token: &str,
+    query: &str,
+    variables: serde_json::Value,
+) -> HttpRequestPlan {
+    HttpRequestPlan {
+        method: "POST",
+        url: forge.api_base_url.clone(),
+        headers: vec![
+            ("Authorization".to_string(), format!("Bearer {token}")),
+            ("Content-Type".to_string(), "application/json".to_string()),
+        ],
+        body: Some(
+            serde_json::json!({
+                "query": query,
+                "variables": variables,
+            })
+            .to_string(),
+        ),
+    }
+}
+
+fn ensure_sourcehut_success(response: &HttpResponse, action: &str) -> Result<()> {
+    if response.status != 200 {
+        bail!(
+            "{action} failed with HTTP {}: {}",
+            response.status,
+            trim_http_body(&response.body)
+        );
+    }
+    let json: serde_json::Value =
+        serde_json::from_str(&response.body).with_context(|| format!("{action}: parsing JSON"))?;
+    if let Some(errors) = json.get("errors") {
+        bail!("{action} failed: {errors}");
+    }
+    Ok(())
+}
+
+fn sourcehut_username(body: &str) -> Result<String> {
+    let json: serde_json::Value = serde_json::from_str(body).context("parsing SourceHut user")?;
+    json.pointer("/data/me/username")
+        .or_else(|| json.pointer("/data/me/canonicalName"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim_start_matches('~').to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("SourceHut user response did not include username"))
+}
+
+fn sourcehut_repository_exists(body: &str) -> Result<bool> {
+    let json: serde_json::Value =
+        serde_json::from_str(body).context("parsing SourceHut repository lookup")?;
+    Ok(!json
+        .pointer("/data/repositoryByDiskPath")
+        .unwrap_or(&serde_json::Value::Null)
+        .is_null())
+}
+
+fn curl_http_json(request: &HttpRequestPlan) -> Result<HttpResponse> {
+    let mut command = Command::new("curl");
+    command.args(["-sS", "-L", "-X", request.method]);
+    for (name, value) in &request.headers {
+        command.arg("-H").arg(format!("{name}: {value}"));
+    }
+    if let Some(body) = &request.body {
+        command.arg("-d").arg(body);
+    }
+    command.args(["-w", "\nrepo-manager-http-status:%{http_code}"]);
+    command.arg(&request.url);
+    let output = command
+        .output()
+        .with_context(|| format!("requesting {}", request.url))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "curl failed with status {}: {}",
+            output.status,
+            stderr.trim()
+        );
+    }
+    let stdout = String::from_utf8(output.stdout).context("HTTP response is not UTF-8")?;
+    let Some((body, status)) = stdout.rsplit_once("\nrepo-manager-http-status:") else {
+        bail!("curl response did not include HTTP status marker");
+    };
+    Ok(HttpResponse {
+        status: status.trim().parse().context("parsing HTTP status")?,
+        body: body.to_string(),
+    })
+}
+
+fn trim_http_body(body: &str) -> String {
+    let body = body.trim();
+    let mut chars = body.chars();
+    let trimmed = chars.by_ref().take(500).collect::<String>();
+    if chars.next().is_some() {
+        format!("{trimmed}...")
+    } else {
+        body.to_string()
+    }
 }
 
 fn manage_repo(config: &Config, db: &Store, output: &Output, args: ManageArgs) -> Result<()> {
@@ -7864,6 +8463,27 @@ fn output_clone(output: &Output, result: &CloneResult) -> Result<()> {
     Ok(())
 }
 
+fn output_create(output: &Output, result: &CreateResult) -> Result<()> {
+    if output.json {
+        return print_json(result);
+    }
+    println!(
+        "created {} {} repository {} -> {}",
+        match result.visibility {
+            RepoVisibility::Private => "private",
+            RepoVisibility::Public => "public",
+        },
+        match result.backend {
+            ForgeBackend::Github => "GitHub",
+            ForgeBackend::Sourcehut => "SourceHut",
+            ForgeBackend::Forgejo => "Forgejo",
+        },
+        result.locator.key(),
+        result.path.display()
+    );
+    Ok(())
+}
+
 fn output_manage(output: &Output, result: &ManageResult) -> Result<()> {
     if output.json {
         return print_json(result);
@@ -8704,6 +9324,182 @@ mod tests {
     fn rejects_unsafe_remote_paths() {
         assert!(Locator::parse("github.com/../repo").is_err());
         assert!(Locator::parse("github.com/org/./repo").is_err());
+    }
+
+    #[test]
+    fn create_resolves_builtin_and_configured_forges() {
+        let config = test_config(Path::new("/tmp/repo-manager-test"));
+        let github = resolve_create_forge(
+            &config,
+            &Locator::parse("https://github.com/example/project.git").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(github.backend, ForgeBackend::Github);
+        assert_eq!(github.token_envs, vec!["GITHUB_TOKEN"]);
+        assert_eq!(github.api_base_url, "https://api.github.com");
+
+        let sourcehut = resolve_create_forge(
+            &config,
+            &Locator::parse("https://git.sr.ht/~me/tool").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sourcehut.backend, ForgeBackend::Sourcehut);
+        assert_eq!(
+            sourcehut.token_envs,
+            vec!["SOURCEHUT_TOKEN".to_string(), "SRHT_TOKEN".to_string()]
+        );
+        assert_eq!(sourcehut.api_base_url, "https://git.sr.ht/query");
+
+        let mut configured = config;
+        configured.forges.insert(
+            "git.example.test".to_string(),
+            ForgeConfig {
+                backend: ForgeBackend::Forgejo,
+                token_env: Some("EXAMPLE_FORGE_TOKEN".to_string()),
+                api_base_url: Some("https://git.example.test/api-root".to_string()),
+            },
+        );
+        let forge = resolve_create_forge(
+            &configured,
+            &Locator::parse("https://git.example.test/me/tool.git").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(forge.backend, ForgeBackend::Forgejo);
+        assert_eq!(forge.token_envs, vec!["EXAMPLE_FORGE_TOKEN"]);
+        assert_eq!(forge.api_base_url, "https://git.example.test/api-root");
+
+        assert!(
+            resolve_create_forge(
+                &configured,
+                &Locator::parse("https://git.unconfigured.test/me/tool.git").unwrap(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn create_visibility_prefers_cli_flags_over_config_default() {
+        let mut config = test_config(Path::new("/tmp/repo-manager-test"));
+        config.create_default_visibility = RepoVisibility::Public;
+        assert_eq!(
+            create_visibility(
+                &config,
+                &CreateArgs {
+                    url: "github.com/me/tool".to_string(),
+                    private: false,
+                    public: false,
+                }
+            ),
+            RepoVisibility::Public
+        );
+        assert_eq!(
+            create_visibility(
+                &config,
+                &CreateArgs {
+                    url: "github.com/me/tool".to_string(),
+                    private: true,
+                    public: false,
+                }
+            ),
+            RepoVisibility::Private
+        );
+    }
+
+    #[test]
+    fn create_refuses_existing_local_target_before_remote_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let path = config.clone_root.join("github.com/example/project");
+        fs::create_dir_all(&path).unwrap();
+
+        let error = create_repo(
+            &config,
+            &store,
+            &Output { json: true },
+            CreateArgs {
+                url: "https://github.com/example/project.git".to_string(),
+                private: false,
+                public: false,
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("target path already exists"));
+    }
+
+    #[test]
+    fn create_builds_rest_and_sourcehut_requests() {
+        let github = CreateForge {
+            backend: ForgeBackend::Github,
+            token_envs: vec!["GITHUB_TOKEN".to_string()],
+            api_base_url: "https://api.github.com".to_string(),
+        };
+        let parts = RemoteRepoParts {
+            owner: "org".to_string(),
+            name: "tool".to_string(),
+        };
+        let github_request = rest_repository_create_request(
+            &github,
+            &parts,
+            RepoVisibility::Public,
+            "tok",
+            "me",
+            true,
+        );
+        assert_eq!(github_request.method, "POST");
+        assert_eq!(github_request.url, "https://api.github.com/orgs/org/repos");
+        assert!(
+            github_request
+                .headers
+                .contains(&("Authorization".to_string(), "Bearer tok".to_string()))
+        );
+        let github_body: serde_json::Value =
+            serde_json::from_str(github_request.body.as_deref().unwrap()).unwrap();
+        assert_eq!(github_body["name"], "tool");
+        assert_eq!(github_body["private"], false);
+
+        let forgejo = CreateForge {
+            backend: ForgeBackend::Forgejo,
+            token_envs: vec!["FORGEJO_TOKEN".to_string()],
+            api_base_url: "https://git.example.test".to_string(),
+        };
+        let forgejo_request = rest_authenticated_user_request(&forgejo, "tok", false);
+        assert_eq!(forgejo_request.url, "https://git.example.test/api/v1/user");
+        assert!(
+            forgejo_request
+                .headers
+                .contains(&("Authorization".to_string(), "token tok".to_string()))
+        );
+
+        let sourcehut = CreateForge {
+            backend: ForgeBackend::Sourcehut,
+            token_envs: vec!["SOURCEHUT_TOKEN".to_string()],
+            api_base_url: "https://git.sr.ht/query".to_string(),
+        };
+        let sourcehut_request =
+            sourcehut_create_request(&sourcehut, "tok", "tool", RepoVisibility::Private);
+        assert_eq!(sourcehut_request.method, "POST");
+        assert_eq!(sourcehut_request.url, "https://git.sr.ht/query");
+        let sourcehut_body: serde_json::Value =
+            serde_json::from_str(sourcehut_request.body.as_deref().unwrap()).unwrap();
+        assert_eq!(sourcehut_body["variables"]["name"], "tool");
+        assert_eq!(sourcehut_body["variables"]["visibility"], "PRIVATE");
+    }
+
+    #[test]
+    fn sourcehut_create_requires_tilde_owner_paths() {
+        let locator = Locator::parse("https://git.sr.ht/~john/tool").unwrap();
+        assert_eq!(
+            parse_sourcehut_repo(&locator).unwrap(),
+            RemoteRepoParts {
+                owner: "john".to_string(),
+                name: "tool".to_string()
+            }
+        );
+        assert!(
+            parse_sourcehut_repo(&Locator::parse("https://git.sr.ht/john/tool").unwrap()).is_err()
+        );
     }
 
     #[test]
@@ -9822,6 +10618,8 @@ mod tests {
             client_id: generate_client_id().unwrap(),
             assume_origin_as_canonical: false,
             clone_as_bare: false,
+            create_default_visibility: RepoVisibility::Private,
+            forges: HashMap::new(),
         };
 
         let report = reconcile_repos(&config, &store).unwrap();
@@ -9888,6 +10686,8 @@ mod tests {
             client_id: generate_client_id().unwrap(),
             assume_origin_as_canonical: false,
             clone_as_bare: false,
+            create_default_visibility: RepoVisibility::Private,
+            forges: HashMap::new(),
         };
 
         let report = reconcile_repos(&config, &store).unwrap();
@@ -9926,7 +10726,15 @@ mod tests {
             "detect_related": true,
             "clone_start_ttl_minutes": 45,
             "rpc_rate_limit_per_second": 7,
-            "background-fetch-minimum-interval-seconds": 3600
+            "background-fetch-minimum-interval-seconds": 3600,
+            "create_default_visibility": "public",
+            "forges": {
+                "git.example.test": {
+                    "backend": "forgejo",
+                    "token-env": "EXAMPLE_FORGE_TOKEN",
+                    "api-base-url": "https://git.example.test"
+                }
+            }
         });
         fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         fs::write(&config_path, format!("{content}\n")).unwrap();
@@ -9943,6 +10751,15 @@ mod tests {
             clone_start_ttl_minutes: Some(45),
             rpc_rate_limit_per_second: Some(7),
             background_fetch_minimum_interval_seconds: None,
+            create_default_visibility: Some(RepoVisibility::Public),
+            forges: Some(HashMap::from([(
+                "git.example.test".to_string(),
+                ForgeConfig {
+                    backend: ForgeBackend::Forgejo,
+                    token_env: Some("EXAMPLE_FORGE_TOKEN".to_string()),
+                    api_base_url: Some("https://git.example.test".to_string()),
+                },
+            )])),
         };
 
         let cli = Cli {
@@ -9982,6 +10799,14 @@ mod tests {
         assert_eq!(config.client_id, "00000000-0000-4000-8000-000000000002");
         assert!(config.assume_origin_as_canonical);
         assert!(config.clone_as_bare);
+        assert_eq!(config.create_default_visibility, RepoVisibility::Public);
+        assert_eq!(
+            config
+                .forges
+                .get("git.example.test")
+                .and_then(|forge| forge.token_env.as_deref()),
+            Some("EXAMPLE_FORGE_TOKEN")
+        );
         let (_daemon_config, _rpc_url) = DaemonConfig::from_args(&DaemonConfigArgs {
             config: Some(config_path),
             state: None,
@@ -10025,6 +10850,17 @@ mod tests {
                 "clone_as_bare": null,
                 "background_fetch_minimum_interval_seconds": null
             }),
+            serde_json::json!({
+                "config_version": 1,
+                "create_default_visibility": "public",
+                "forges": {
+                    "git.example.test": {
+                        "backend": "forgejo",
+                        "token_env": "EXAMPLE_FORGE_TOKEN",
+                        "api_base_url": "https://git.example.test"
+                    }
+                }
+            }),
         ];
 
         for fixture in fixtures {
@@ -10039,6 +10875,16 @@ mod tests {
         assert!(
             validate_config_json(
                 &serde_json::json!({ "background_fetch_minimum_interval_seconds": -1 })
+            )
+            .is_err()
+        );
+        assert!(
+            validate_config_json(&serde_json::json!({ "create_default_visibility": "protected" }))
+                .is_err()
+        );
+        assert!(
+            validate_config_json(
+                &serde_json::json!({ "forges": { "git.example.test": { "backend": "unknown" } } })
             )
             .is_err()
         );
@@ -10100,6 +10946,8 @@ mod tests {
             client_id: "00000000-0000-4000-8000-000000000003".to_string(),
             assume_origin_as_canonical: false,
             clone_as_bare: false,
+            create_default_visibility: RepoVisibility::Private,
+            forges: HashMap::new(),
         };
         let explicit_file = dir.path().join("custom/repo-config.json");
 
@@ -10136,6 +10984,11 @@ mod tests {
         assert_eq!(saved.detect_related, None);
         assert_eq!(saved.clone_start_ttl_minutes, None);
         assert_eq!(saved.rpc_rate_limit_per_second, None);
+        assert_eq!(
+            saved.create_default_visibility,
+            Some(RepoVisibility::Private)
+        );
+        assert_eq!(saved.forges, None);
     }
 
     #[test]
@@ -10154,6 +11007,8 @@ mod tests {
             clone_start_ttl_minutes: Some(60),
             rpc_rate_limit_per_second: Some(1),
             background_fetch_minimum_interval_seconds: None,
+            create_default_visibility: None,
+            forges: None,
         };
 
         base.merge(FileConfig {
@@ -10169,6 +11024,8 @@ mod tests {
             clone_start_ttl_minutes: Some(10),
             rpc_rate_limit_per_second: Some(9),
             background_fetch_minimum_interval_seconds: None,
+            create_default_visibility: None,
+            forges: None,
         });
 
         assert_eq!(base.state, Some(dir.path().join("state/base.sqlite")));
@@ -10937,6 +11794,8 @@ mod tests {
             client_id: "00000000-0000-4000-8000-000000000099".to_string(),
             assume_origin_as_canonical: false,
             clone_as_bare: false,
+            create_default_visibility: RepoVisibility::Private,
+            forges: HashMap::new(),
         }
     }
 
