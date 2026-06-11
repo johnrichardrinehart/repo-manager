@@ -29,6 +29,12 @@
     "assume_origin_as_canonical": {
       "type": ["boolean", "null"]
     },
+    "auto_create_remote": {
+      "type": ["boolean", "null"]
+    },
+    "auto-create-remote": {
+      "type": ["boolean", "null"]
+    },
     "clone_as_bare": {
       "type": ["boolean", "null"]
     },

@@ -132,6 +132,16 @@ struct ConfigArgs {
         help = "Treat origin as canonical during manage without prompting"
     )]
     assume_origin_as_canonical: Option<bool>,
+
+    #[arg(
+        long,
+        env = "REPO_MANAGER_AUTO_CREATE_REMOTE",
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        help = "Create remote repositories during `repo create` by default"
+    )]
+    auto_create_remote: Option<bool>,
 }
 
 #[derive(Debug, Parser)]
@@ -378,6 +388,15 @@ struct SetupArgs {
         help = "Persist origin-as-canonical behavior for `repo manage`"
     )]
     assume_origin_as_canonical: Option<bool>,
+
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        help = "Persist whether `repo create` creates a remote before cloning"
+    )]
+    auto_create_remote: Option<bool>,
 }
 
 #[derive(Debug, Args)]
@@ -422,6 +441,23 @@ struct CreateArgs {
         help = "Create the remote repository as public"
     )]
     public: bool,
+
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        overrides_with = "no_auto_create_remote",
+        help = "Create the remote repository before cloning"
+    )]
+    auto_create_remote: Option<bool>,
+
+    #[arg(
+        long,
+        overrides_with = "auto_create_remote",
+        help = "Only create the local managed checkout; do not create a remote repository"
+    )]
+    no_auto_create_remote: bool,
 }
 
 #[derive(Debug, Args)]
@@ -707,6 +743,7 @@ struct Config {
     rpc_url: String,
     client_id: String,
     assume_origin_as_canonical: bool,
+    auto_create_remote: bool,
     clone_as_bare: bool,
     create_default_visibility: RepoVisibility,
     forges: HashMap<String, ForgeConfig>,
@@ -736,6 +773,8 @@ struct FileConfig {
     rpc_url: Option<String>,
     client_id: Option<String>,
     assume_origin_as_canonical: Option<bool>,
+    #[serde(alias = "auto-create-remote")]
+    auto_create_remote: Option<bool>,
     #[serde(alias = "clone-as-bare")]
     clone_as_bare: Option<bool>,
     detect_related: Option<bool>,
@@ -1226,8 +1265,9 @@ struct CreateResult {
     action: &'static str,
     locator: Locator,
     path: PathBuf,
-    backend: ForgeBackend,
-    visibility: RepoVisibility,
+    remote_created: bool,
+    backend: Option<ForgeBackend>,
+    visibility: Option<RepoVisibility>,
     clone: CloneResult,
 }
 
@@ -1694,6 +1734,10 @@ impl Config {
             .assume_origin_as_canonical
             .or(file_config.assume_origin_as_canonical)
             .unwrap_or(false);
+        let auto_create_remote = args
+            .auto_create_remote
+            .or(file_config.auto_create_remote)
+            .unwrap_or(true);
         let clone_as_bare = file_config.clone_as_bare.unwrap_or(false);
         let create_default_visibility = file_config.create_default_visibility.unwrap_or_default();
         let forges = file_config.forges.unwrap_or_default();
@@ -1707,6 +1751,7 @@ impl Config {
             rpc_url,
             client_id,
             assume_origin_as_canonical,
+            auto_create_remote,
             clone_as_bare,
             create_default_visibility,
             forges,
@@ -1747,6 +1792,7 @@ impl FileConfig {
         self.assume_origin_as_canonical = other
             .assume_origin_as_canonical
             .or(self.assume_origin_as_canonical);
+        self.auto_create_remote = other.auto_create_remote.or(self.auto_create_remote);
         self.clone_as_bare = other.clone_as_bare.or(self.clone_as_bare);
         self.detect_related = other.detect_related.or(self.detect_related);
         self.clone_start_ttl_minutes = other
@@ -1869,6 +1915,7 @@ fn setup_config(config: &Config, output: &Output, args: SetupArgs) -> Result<()>
         assume_origin_as_canonical: args
             .assume_origin_as_canonical
             .or(Some(config.assume_origin_as_canonical)),
+        auto_create_remote: args.auto_create_remote.or(Some(config.auto_create_remote)),
         clone_as_bare: Some(config.clone_as_bare),
         detect_related: None,
         clone_start_ttl_minutes: None,
@@ -3186,21 +3233,72 @@ fn create_repo(config: &Config, db: &Store, output: &Output, args: CreateArgs) -
     if path.exists() {
         bail!("target path already exists: {}", path.display());
     }
-    let visibility = create_visibility(config, &args);
-    let forge = resolve_create_forge(config, &locator)?;
-    create_remote_repository(&forge, &locator, visibility)?;
-    let clone = clone_repo_inner(config, db, &args.url)?;
+    let auto_create_remote = create_auto_remote(config, &args);
+    let (backend, visibility, clone) = if auto_create_remote {
+        let visibility = create_visibility(config, &args);
+        let forge = resolve_create_forge(config, &locator)?;
+        create_remote_repository(&forge, &locator, visibility)?;
+        let clone = clone_repo_inner(config, db, &args.url)?;
+        (Some(forge.backend), Some(visibility), clone)
+    } else {
+        let clone = create_local_repo_inner(config, db, &locator, &path)?;
+        (None, None, clone)
+    };
     output_create(
         output,
         &CreateResult {
             action: "create",
             locator,
             path,
-            backend: forge.backend,
+            remote_created: auto_create_remote,
+            backend,
             visibility,
             clone,
         },
     )
+}
+
+fn create_auto_remote(config: &Config, args: &CreateArgs) -> bool {
+    if args.no_auto_create_remote {
+        false
+    } else {
+        args.auto_create_remote.unwrap_or(config.auto_create_remote)
+    }
+}
+
+fn create_local_repo_inner(
+    config: &Config,
+    db: &Store,
+    locator: &Locator,
+    path: &Path,
+) -> Result<CloneResult> {
+    warn_pending_related(db)?;
+    fs::create_dir_all(path.parent().context("create path has no parent")?)?;
+    fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
+    if config.clone_as_bare {
+        run_git_in(path, ["init", "--bare"])?;
+    } else {
+        run_git_in(path, ["init"])?;
+    }
+    let remote_url = remote_url_for_locator(None, locator);
+    run_git_in(path, ["remote", "add", "origin", remote_url.as_str()])?;
+    db.upsert_repo(locator, path, None)?;
+    send_rpc_event_best_effort(
+        &config.rpc_url,
+        &RpcEvent::Finished(CloneFinishedEvent {
+            client_id: config.client_id.clone(),
+            url: remote_url,
+            locator: locator.clone(),
+            path: path.to_path_buf(),
+            success: true,
+            scan_root: config.clone_root.clone(),
+        }),
+    );
+    Ok(CloneResult {
+        action: "clone",
+        locator: locator.clone(),
+        path: path.to_path_buf(),
+    })
 }
 
 fn create_visibility(config: &Config, args: &CreateArgs) -> RepoVisibility {
@@ -8467,16 +8565,26 @@ fn output_create(output: &Output, result: &CreateResult) -> Result<()> {
     if output.json {
         return print_json(result);
     }
+    if !result.remote_created {
+        println!(
+            "created local repository {} -> {}",
+            result.locator.key(),
+            result.path.display()
+        );
+        return Ok(());
+    }
     println!(
         "created {} {} repository {} -> {}",
         match result.visibility {
-            RepoVisibility::Private => "private",
-            RepoVisibility::Public => "public",
+            Some(RepoVisibility::Private) => "private",
+            Some(RepoVisibility::Public) => "public",
+            None => "unknown-visibility",
         },
         match result.backend {
-            ForgeBackend::Github => "GitHub",
-            ForgeBackend::Sourcehut => "SourceHut",
-            ForgeBackend::Forgejo => "Forgejo",
+            Some(ForgeBackend::Github) => "GitHub",
+            Some(ForgeBackend::Sourcehut) => "SourceHut",
+            Some(ForgeBackend::Forgejo) => "Forgejo",
+            None => "remote",
         },
         result.locator.key(),
         result.path.display()
@@ -9388,6 +9496,8 @@ mod tests {
                     url: "github.com/me/tool".to_string(),
                     private: false,
                     public: false,
+                    auto_create_remote: None,
+                    no_auto_create_remote: false,
                 }
             ),
             RepoVisibility::Public
@@ -9399,10 +9509,59 @@ mod tests {
                     url: "github.com/me/tool".to_string(),
                     private: true,
                     public: false,
+                    auto_create_remote: None,
+                    no_auto_create_remote: false,
                 }
             ),
             RepoVisibility::Private
         );
+    }
+
+    #[test]
+    fn create_auto_remote_prefers_cli_flags_over_config_default() {
+        let mut config = test_config(Path::new("/tmp/repo-manager-test"));
+        config.auto_create_remote = false;
+        let mut args = CreateArgs {
+            url: "github.com/me/tool".to_string(),
+            private: false,
+            public: false,
+            auto_create_remote: None,
+            no_auto_create_remote: false,
+        };
+        assert!(!create_auto_remote(&config, &args));
+        args.auto_create_remote = Some(true);
+        assert!(create_auto_remote(&config, &args));
+        args.no_auto_create_remote = true;
+        assert!(!create_auto_remote(&config, &args));
+    }
+
+    #[test]
+    fn create_without_remote_initializes_local_managed_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+
+        create_repo(
+            &config,
+            &store,
+            &Output { json: true },
+            CreateArgs {
+                url: "example.test/me/tool".to_string(),
+                private: false,
+                public: false,
+                auto_create_remote: None,
+                no_auto_create_remote: true,
+            },
+        )
+        .unwrap();
+
+        let path = config.clone_root.join("example.test/me/tool");
+        assert!(path.join(".git").is_dir());
+        assert_eq!(
+            git_origin_url(&path).unwrap().as_deref(),
+            Some("https://example.test/me/tool.git")
+        );
+        assert!(store.find_repo("example.test/me/tool").unwrap().is_some());
     }
 
     #[test]
@@ -9421,6 +9580,8 @@ mod tests {
                 url: "https://github.com/example/project.git".to_string(),
                 private: false,
                 public: false,
+                auto_create_remote: None,
+                no_auto_create_remote: true,
             },
         )
         .unwrap_err();
@@ -10617,6 +10778,7 @@ mod tests {
             rpc_url: test_rpc_url(dir.path()),
             client_id: generate_client_id().unwrap(),
             assume_origin_as_canonical: false,
+            auto_create_remote: true,
             clone_as_bare: false,
             create_default_visibility: RepoVisibility::Private,
             forges: HashMap::new(),
@@ -10685,6 +10847,7 @@ mod tests {
             rpc_url: test_rpc_url(dir.path()),
             client_id: generate_client_id().unwrap(),
             assume_origin_as_canonical: false,
+            auto_create_remote: true,
             clone_as_bare: false,
             create_default_visibility: RepoVisibility::Private,
             forges: HashMap::new(),
@@ -10722,6 +10885,7 @@ mod tests {
             "rpc_url": "unix:///tmp/repo-manager-from-file.sock",
             "client_id": "00000000-0000-4000-8000-000000000001",
             "assume_origin_as_canonical": false,
+            "auto-create-remote": false,
             "clone-as-bare": true,
             "detect_related": true,
             "clone_start_ttl_minutes": 45,
@@ -10746,6 +10910,7 @@ mod tests {
             rpc_url: Some("unix:///tmp/repo-manager-from-file.sock".to_string()),
             client_id: Some("00000000-0000-4000-8000-000000000001".to_string()),
             assume_origin_as_canonical: Some(false),
+            auto_create_remote: Some(false),
             clone_as_bare: None,
             detect_related: Some(true),
             clone_start_ttl_minutes: Some(45),
@@ -10771,6 +10936,7 @@ mod tests {
                 rpc_url: Some("unix:///tmp/repo-manager-from-cli.sock".to_string()),
                 client_id: Some("00000000-0000-4000-8000-000000000002".to_string()),
                 assume_origin_as_canonical: Some(true),
+                auto_create_remote: Some(true),
             },
             dir: None,
             json: false,
@@ -10782,6 +10948,7 @@ mod tests {
                 rpc_url: None,
                 client_id: None,
                 assume_origin_as_canonical: None,
+                auto_create_remote: None,
             })),
         };
         let config = Config::from_cli(&cli).unwrap();
@@ -10798,6 +10965,7 @@ mod tests {
         assert_eq!(config.rpc_url, "unix:///tmp/repo-manager-from-cli.sock");
         assert_eq!(config.client_id, "00000000-0000-4000-8000-000000000002");
         assert!(config.assume_origin_as_canonical);
+        assert!(config.auto_create_remote);
         assert!(config.clone_as_bare);
         assert_eq!(config.create_default_visibility, RepoVisibility::Public);
         assert_eq!(
@@ -10945,6 +11113,7 @@ mod tests {
             rpc_url: test_rpc_url(dir.path()),
             client_id: "00000000-0000-4000-8000-000000000003".to_string(),
             assume_origin_as_canonical: false,
+            auto_create_remote: true,
             clone_as_bare: false,
             create_default_visibility: RepoVisibility::Private,
             forges: HashMap::new(),
@@ -10962,6 +11131,7 @@ mod tests {
                 rpc_url: Some("unix:///tmp/repo-manager-explicit.sock".to_string()),
                 client_id: Some("00000000-0000-4000-8000-000000000004".to_string()),
                 assume_origin_as_canonical: Some(true),
+                auto_create_remote: Some(false),
             },
         )
         .unwrap();
@@ -10981,6 +11151,7 @@ mod tests {
             Some("00000000-0000-4000-8000-000000000004".to_string())
         );
         assert_eq!(saved.assume_origin_as_canonical, Some(true));
+        assert_eq!(saved.auto_create_remote, Some(false));
         assert_eq!(saved.detect_related, None);
         assert_eq!(saved.clone_start_ttl_minutes, None);
         assert_eq!(saved.rpc_rate_limit_per_second, None);
@@ -11002,6 +11173,7 @@ mod tests {
             rpc_url: Some("unix:///run/base.sock".to_string()),
             client_id: None,
             assume_origin_as_canonical: Some(false),
+            auto_create_remote: Some(true),
             clone_as_bare: None,
             detect_related: Some(false),
             clone_start_ttl_minutes: Some(60),
@@ -11019,6 +11191,7 @@ mod tests {
             rpc_url: None,
             client_id: Some("00000000-0000-4000-8000-000000000005".to_string()),
             assume_origin_as_canonical: Some(true),
+            auto_create_remote: Some(false),
             clone_as_bare: None,
             detect_related: Some(true),
             clone_start_ttl_minutes: Some(10),
@@ -11032,6 +11205,7 @@ mod tests {
         assert_eq!(base.cache_root, Some(dir.path().join("cache/user")));
         assert_eq!(base.root, Some(dir.path().join("code/user")));
         assert_eq!(base.rpc_url, Some("unix:///run/base.sock".to_string()));
+        assert_eq!(base.auto_create_remote, Some(false));
         assert_eq!(base.clone_start_ttl_minutes, Some(10));
         assert_eq!(
             base.client_id,
@@ -11793,6 +11967,7 @@ mod tests {
             rpc_url: test_rpc_url(root),
             client_id: "00000000-0000-4000-8000-000000000099".to_string(),
             assume_origin_as_canonical: false,
+            auto_create_remote: true,
             clone_as_bare: false,
             create_default_visibility: RepoVisibility::Private,
             forges: HashMap::new(),
