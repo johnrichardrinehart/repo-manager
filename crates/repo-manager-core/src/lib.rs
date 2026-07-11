@@ -6647,6 +6647,7 @@ fn add_repo_view_worktree(
     }
     if let Some(branch_ref) = branch_ref {
         set_worktree_head(&worktree_path, &branch_ref)?;
+        configure_repo_view_worktree_remote(view, &worktree_path, &branch_ref)?;
     }
     if args.reset {
         run_git_in(&worktree_path, ["reset", "--hard", checkout_ref.as_str()])?;
@@ -6675,6 +6676,58 @@ fn add_repo_view_worktree(
                 checkout_ref,
             ],
         },
+    )
+}
+
+fn configure_repo_view_worktree_remote(
+    view: &RepoViewMetadata,
+    worktree_path: &Path,
+    branch_ref: &str,
+) -> Result<()> {
+    let branch = branch_ref
+        .strip_prefix(&format!("{}/heads/", view.refs_prefix))
+        .ok_or_else(|| anyhow!("branch ref `{branch_ref}` is outside the fork namespace"))?;
+    run_git_in(
+        &view.canonical_path,
+        ["config", "extensions.worktreeConfig", "true"],
+    )?;
+    // The canonical repository is bare. Once worktreeConfig is enabled, each
+    // linked worktree must override the common core.bare setting or Git will
+    // reject ordinary worktree commands.
+    run_git_in(
+        worktree_path,
+        ["config", "--worktree", "core.bare", "false"],
+    )?;
+    run_git_in(
+        worktree_path,
+        [
+            "config",
+            "--worktree",
+            "core.worktree",
+            worktree_path
+                .to_str()
+                .ok_or_else(|| anyhow!("worktree path is not valid UTF-8"))?,
+        ],
+    )?;
+    // Use a distinct remote name. Reusing `origin` would combine the
+    // canonical repository's URL with the worktree-local URL because remote
+    // URLs are multi-valued, causing one `git push` to update both repos.
+    run_git_in(
+        worktree_path,
+        ["config", "--worktree", "remote.fork.url", &view.origin_url],
+    )?;
+    run_git_in(
+        worktree_path,
+        [
+            "config",
+            "--worktree",
+            "remote.fork.push",
+            &format!("HEAD:refs/heads/{branch}"),
+        ],
+    )?;
+    run_git_in(
+        worktree_path,
+        ["config", "--worktree", "remote.pushDefault", "fork"],
     )
 }
 
@@ -10198,6 +10251,43 @@ mod tests {
         assert_eq!(
             fs::read_to_string(git_dir.join("HEAD")).unwrap(),
             format!("ref: {topic_ref}\n")
+        );
+        assert_eq!(
+            git_remote_url(&worktree_path, "fork").unwrap(),
+            Some(fork_url)
+        );
+        fs::write(worktree_path.join("topic.txt"), "topic\n").unwrap();
+        run_git_in(&worktree_path, ["add", "topic.txt"]).unwrap();
+        run_git_in(
+            &worktree_path,
+            [
+                "-c",
+                "user.name=repo-manager",
+                "-c",
+                "user.email=repo-manager@example.com",
+                "commit",
+                "-m",
+                "topic",
+            ],
+        )
+        .unwrap();
+        run_git_in(&worktree_path, ["push"]).unwrap();
+        assert!(!canonical_seed.join(".git/refs/heads/topic").exists());
+        assert_eq!(
+            git_output(
+                &fork_seed,
+                ["rev-parse", "refs/heads/topic"],
+                "reading pushed topic"
+            )
+            .unwrap()
+            .trim(),
+            git_output(
+                &worktree_path,
+                ["rev-parse", "HEAD"],
+                "reading worktree head"
+            )
+            .unwrap()
+            .trim()
         );
         let dump = check_dump_report(&config, &store).unwrap();
         let worktree = dump
