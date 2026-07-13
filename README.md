@@ -77,9 +77,13 @@ Set `clone-as-bare` to `true` in the config file to keep clone-root repositories
 bare. In that mode, `repo clone` creates bare repositories, `repo fork` records
 bare fork repositories instead of fork worktrees, and fork/mirror repair avoids
 creating checked-out dependent trees. Checked-out working trees should be
-created under the dev-worktree root with `repo worktree add`. `repo check`
-reports existing non-bare clone-root repositories as repairable; `repo check
---repair` converts clean managed checkouts to bare repositories.
+created under the dev-worktree root. `repo worktree add` delegates their
+lifecycle to Git while supplying the managed path and, for fork views, mapping
+namespaced refs and configuring fork-safe pushes. Worktrees are not persisted
+in repo-manager's database, so direct `git worktree add`, `git worktree remove`,
+and `git worktree prune` remain authoritative. `repo check` reports existing
+non-bare clone-root repositories as repairable; `repo check --repair` converts
+clean managed checkouts to bare repositories.
 
 ## Daemon API
 

@@ -938,9 +938,6 @@ struct GitDirectoryDump {
     id: Option<String>,
     path: PathBuf,
     kind: Option<String>,
-    tracked: bool,
-    managed: bool,
-    worktree_name: Option<String>,
     repository: Option<String>,
     repository_type: Option<String>,
     namespace: Option<String>,
@@ -954,25 +951,13 @@ struct GitDirectoryRepositoryLink {
     repo_type: String,
     locator: Locator,
     namespace: Option<String>,
+    worktree_source: PathBuf,
 }
 
 #[derive(Debug, Clone)]
 struct GitDirectoryLink {
     id: Option<String>,
-    tracked: bool,
-    managed: bool,
-    worktree_name: Option<String>,
     repository: Option<GitDirectoryRepositoryLink>,
-}
-
-#[derive(Debug, Clone)]
-struct ManagedWorktreeRecord {
-    repo_id: i64,
-    repo_locator: Locator,
-    repo_type: String,
-    path: PathBuf,
-    name: Option<String>,
-    refs_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2412,15 +2397,7 @@ impl Store {
               last_error TEXT
             );
 
-            CREATE TABLE IF NOT EXISTS worktrees (
-              id INTEGER PRIMARY KEY,
-              repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
-              path TEXT NOT NULL UNIQUE,
-              name TEXT,
-              refs_prefix TEXT,
-              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            );
+            DROP TABLE IF EXISTS worktrees;
             ",
         )?;
         Ok(())
@@ -2727,60 +2704,6 @@ impl Store {
             ))
         })?;
         rows.collect::<std::result::Result<HashMap<_, _>, _>>()
-            .map_err(Into::into)
-    }
-
-    fn record_worktree(
-        &self,
-        repo_id: i64,
-        path: &Path,
-        name: Option<&str>,
-        refs_prefix: Option<&str>,
-    ) -> Result<()> {
-        self.conn.execute(
-            "
-            INSERT INTO worktrees (repo_id, path, name, refs_prefix)
-            VALUES (?1, ?2, ?3, ?4)
-            ON CONFLICT(path) DO UPDATE SET
-              repo_id = excluded.repo_id,
-              name = excluded.name,
-              refs_prefix = excluded.refs_prefix,
-              updated_at = CURRENT_TIMESTAMP
-            ",
-            params![repo_id, path.display().to_string(), name, refs_prefix],
-        )?;
-        Ok(())
-    }
-
-    fn managed_worktrees(&self) -> Result<Vec<ManagedWorktreeRecord>> {
-        let mut stmt = self.conn.prepare(
-            "
-            SELECT
-              worktrees.repo_id,
-              repos.current_authority,
-              repos.current_remote_path,
-              worktrees.path,
-              worktrees.name,
-              worktrees.refs_prefix
-            FROM worktrees
-            JOIN repos ON repos.id = worktrees.repo_id
-            ORDER BY worktrees.path
-            ",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(ManagedWorktreeRecord {
-                repo_id: row.get(0)?,
-                repo_locator: Locator {
-                    authority: row.get(1)?,
-                    remote_path: row.get(2)?,
-                },
-                repo_type: "canonical".to_string(),
-                path: PathBuf::from(row.get::<_, String>(3)?),
-                name: row.get(4)?,
-                refs_prefix: row.get(5)?,
-            })
-        })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
 
@@ -5042,52 +4965,25 @@ fn check_dump_report(config: &Config, db: &Store) -> Result<CheckDump> {
     let background_fetch = db.background_fetch_state_by_repo_id()?;
     let current_repos = managed_repository_dumps(config, db)?;
     let mut tracked_by_path = HashMap::new();
-    let mut repository_by_db_id = HashMap::new();
     let mut tracked_repositories = Vec::new();
 
     for repo in &current_repos {
-        let link = GitDirectoryRepositoryLink {
-            id: repo.id.clone(),
-            repo_type: repo.repo_type.clone(),
-            locator: repo.locator.clone(),
-            namespace: repo_namespace(&repo.path)?,
-        };
+        let view = read_repo_view_metadata(&repo.path)?;
         tracked_by_path.insert(
             comparable_path(&repo.path),
             GitDirectoryLink {
                 id: Some(repo.id.clone()),
-                tracked: true,
-                managed: true,
-                worktree_name: None,
-                repository: Some(link.clone()),
+                repository: Some(GitDirectoryRepositoryLink {
+                    id: repo.id.clone(),
+                    repo_type: repo.repo_type.clone(),
+                    locator: repo.locator.clone(),
+                    namespace: view.as_ref().map(|view| view.refs_prefix.clone()),
+                    worktree_source: view
+                        .map(|view| view.canonical_path)
+                        .unwrap_or_else(|| repo.path.clone()),
+                }),
             },
         );
-        repository_by_db_id.insert(repo.db_id, link);
-    }
-
-    let mut managed_worktrees_by_path = HashMap::new();
-    for mut worktree in db.managed_worktrees()? {
-        if let Some(repository) = repository_by_db_id.get(&worktree.repo_id) {
-            worktree.repo_type = repository.repo_type.clone();
-            managed_worktrees_by_path.insert(
-                comparable_path(&worktree.path),
-                GitDirectoryLink {
-                    id: Some(repository_path_id(config, &worktree.path)),
-                    tracked: true,
-                    managed: true,
-                    worktree_name: worktree.name.clone(),
-                    repository: Some(GitDirectoryRepositoryLink {
-                        id: repository.id.clone(),
-                        repo_type: repository.repo_type.clone(),
-                        locator: worktree.repo_locator.clone(),
-                        namespace: worktree
-                            .refs_prefix
-                            .clone()
-                            .or_else(|| repository.namespace.clone()),
-                    }),
-                },
-            );
-        }
     }
 
     for repo in current_repos {
@@ -5112,8 +5008,7 @@ fn check_dump_report(config: &Config, db: &Store) -> Result<CheckDump> {
         });
     }
 
-    let linked_worktree_links =
-        linked_worktree_directory_links(&tracked_by_path, &managed_worktrees_by_path)?;
+    let linked_worktree_links = linked_worktree_directory_links(config, &tracked_by_path)?;
     let mut git_directory_paths = discover_git_repositories(&config.clone_root)?;
     git_directory_paths.extend(discover_git_repositories(&config.dev_worktree_root)?);
     git_directory_paths.extend(linked_worktree_links.keys().cloned());
@@ -5122,15 +5017,7 @@ fn check_dump_report(config: &Config, db: &Store) -> Result<CheckDump> {
 
     let git_directories = git_directory_paths
         .into_iter()
-        .map(|path| {
-            git_directory_dump(
-                config,
-                path,
-                &tracked_by_path,
-                &managed_worktrees_by_path,
-                &linked_worktree_links,
-            )
-        })
+        .map(|path| git_directory_dump(config, path, &tracked_by_path, &linked_worktree_links))
         .collect::<Result<Vec<_>>>()?;
     Ok(CheckDump {
         action: "check-dump",
@@ -5145,55 +5032,108 @@ fn check_dump_report(config: &Config, db: &Store) -> Result<CheckDump> {
 }
 
 fn linked_worktree_directory_links(
+    config: &Config,
     tracked_by_path: &HashMap<PathBuf, GitDirectoryLink>,
-    managed_worktrees_by_path: &HashMap<PathBuf, GitDirectoryLink>,
 ) -> Result<HashMap<PathBuf, GitDirectoryLink>> {
-    let mut links = HashMap::new();
-    for (path, link) in tracked_by_path {
+    let mut candidates_by_source: HashMap<PathBuf, Vec<GitDirectoryRepositoryLink>> =
+        HashMap::new();
+    for link in tracked_by_path.values() {
         let Some(repository) = &link.repository else {
             continue;
         };
-        if !path.exists() {
+        let candidates = candidates_by_source
+            .entry(comparable_path(&repository.worktree_source))
+            .or_default();
+        if !candidates
+            .iter()
+            .any(|candidate| candidate.id == repository.id)
+        {
+            candidates.push(repository.clone());
+        }
+    }
+
+    let mut links = HashMap::new();
+    for (source, mut candidates) in candidates_by_source {
+        if !source.exists() {
             continue;
         }
-        let Ok(worktrees) = linked_worktree_paths(path) else {
+        let Ok(worktrees) = linked_worktree_paths(&source) else {
             continue;
         };
+        candidates.sort_by(|left, right| left.id.cmp(&right.id));
         for worktree_path in worktrees {
-            let comparable = comparable_path(&worktree_path);
-            if tracked_by_path.contains_key(&comparable) {
+            let path = comparable_path(&worktree_path);
+            if tracked_by_path.contains_key(&path) {
                 continue;
             }
-            if let Some(managed) = managed_worktrees_by_path.get(&comparable) {
-                links.insert(comparable, managed.clone());
-            } else {
-                links.insert(
-                    comparable,
-                    GitDirectoryLink {
-                        id: None,
-                        tracked: false,
-                        managed: false,
-                        worktree_name: None,
-                        repository: Some(repository.clone()),
-                    },
-                );
-            }
+            let repository = worktree_repository_link(config, &path, &candidates)?;
+            links.insert(
+                path,
+                GitDirectoryLink {
+                    id: None,
+                    repository,
+                },
+            );
         }
     }
     Ok(links)
+}
+
+fn worktree_repository_link(
+    config: &Config,
+    worktree_path: &Path,
+    candidates: &[GitDirectoryRepositoryLink],
+) -> Result<Option<GitDirectoryRepositoryLink>> {
+    let head = git_output_optional(
+        worktree_path,
+        ["symbolic-ref", "--quiet", "HEAD"],
+        "reading linked worktree HEAD",
+    )?;
+    if let Some(head) = head {
+        let head = head.trim();
+        if let Some(repository) = candidates
+            .iter()
+            .filter_map(|candidate| {
+                candidate.namespace.as_deref().and_then(|namespace| {
+                    head.starts_with(&format!("{namespace}/heads/"))
+                        .then_some((namespace.len(), candidate))
+                })
+            })
+            .max_by_key(|(namespace_len, _)| *namespace_len)
+            .map(|(_, candidate)| candidate)
+        {
+            return Ok(Some(repository.clone()));
+        }
+    }
+
+    if let Some(repository) = candidates
+        .iter()
+        .filter_map(|candidate| {
+            let root = locator_path(&config.dev_worktree_root, &candidate.locator);
+            path_is_under(worktree_path, &root).then_some((root.components().count(), candidate))
+        })
+        .max_by_key(|(component_count, _)| *component_count)
+        .map(|(_, candidate)| candidate)
+    {
+        return Ok(Some(repository.clone()));
+    }
+
+    Ok(candidates
+        .iter()
+        .find(|candidate| candidate.repo_type == "canonical")
+        .or_else(|| candidates.first())
+        .cloned())
 }
 
 fn git_directory_dump(
     config: &Config,
     path: PathBuf,
     tracked_by_path: &HashMap<PathBuf, GitDirectoryLink>,
-    managed_worktrees_by_path: &HashMap<PathBuf, GitDirectoryLink>,
     linked_worktree_links: &HashMap<PathBuf, GitDirectoryLink>,
 ) -> Result<GitDirectoryDump> {
     let comparable = comparable_path(&path);
     let link = tracked_by_path
         .get(&comparable)
-        .or_else(|| managed_worktrees_by_path.get(&comparable))
         .or_else(|| linked_worktree_links.get(&comparable));
     let view = read_repo_view_metadata(&path)?;
     let locator = match (link.and_then(|link| link.repository.as_ref()), &view) {
@@ -5212,19 +5152,12 @@ fn git_directory_dump(
         }),
         path,
         kind,
-        tracked: link.is_some_and(|link| link.tracked),
-        managed: link.is_some_and(|link| link.managed),
-        worktree_name: link.and_then(|link| link.worktree_name.clone()),
         repository: repository.map(|repo| repo.id.clone()),
         repository_type: repository.map(|repo| repo.repo_type.clone()),
         namespace: repository.and_then(|repo| repo.namespace.clone()),
         locator,
         error,
     })
-}
-
-fn repo_namespace(path: &Path) -> Result<Option<String>> {
-    Ok(read_repo_view_metadata(path)?.map(|view| view.refs_prefix))
 }
 
 fn git_directory_kind(path: &Path) -> Result<String> {
@@ -6478,10 +6411,8 @@ fn add_worktree(
     warn_pending_related(db)?;
     if let Some(context) = worktree_context(config, db, dir, &args)? {
         return match context {
-            RepoContext::Managed(repo) => {
-                add_managed_context_worktree(config, db, output, &repo, args)
-            }
-            RepoContext::View(view) => add_repo_view_worktree(config, db, output, &view, args),
+            RepoContext::Managed(repo) => add_managed_context_worktree(config, output, &repo, args),
+            RepoContext::View(view) => add_repo_view_worktree(config, output, &view, args),
         };
     }
     let canonical_url = args.repo_or_name.clone();
@@ -6515,8 +6446,7 @@ fn add_worktree(
             .ok_or_else(|| anyhow!("--reset requires a start point"))?;
         run_git_in(&plan.worktree_path, ["reset", "--hard", start])?;
     }
-    let repo_id = db.upsert_repo(&plan.canonical_locator, &plan.canonical_path, None)?;
-    db.record_worktree(repo_id, &plan.worktree_path, Some(name), None)?;
+    db.upsert_repo(&plan.canonical_locator, &plan.canonical_path, None)?;
     output_worktree(output, &plan)
 }
 
@@ -6540,7 +6470,6 @@ fn worktree_context(
 
 fn add_managed_context_worktree(
     config: &Config,
-    db: &Store,
     output: &Output,
     repo: &ManagedRepoRecord,
     args: WorktreeAddArgs,
@@ -6578,8 +6507,6 @@ fn add_managed_context_worktree(
         let start = start_point.ok_or_else(|| anyhow!("--reset requires a start point"))?;
         run_git_in(&worktree_path, ["reset", "--hard", start])?;
     }
-    let repo_id = db.upsert_repo(&repo.current, &repo.path, None)?;
-    db.record_worktree(repo_id, &worktree_path, Some(&name), None)?;
     output_worktree(
         output,
         &WorktreePlan {
@@ -6593,7 +6520,6 @@ fn add_managed_context_worktree(
 
 fn add_repo_view_worktree(
     config: &Config,
-    db: &Store,
     output: &Output,
     view: &RepoViewMetadata,
     args: WorktreeAddArgs,
@@ -6652,17 +6578,6 @@ fn add_repo_view_worktree(
     if args.reset {
         run_git_in(&worktree_path, ["reset", "--hard", checkout_ref.as_str()])?;
     }
-    let repo_id = db.upsert_repo(
-        &view.locator,
-        &view.path,
-        Some(&view.canonical_locator.key()),
-    )?;
-    db.record_worktree(
-        repo_id,
-        &worktree_path,
-        Some(&name),
-        Some(&view.refs_prefix),
-    )?;
     output_worktree(
         output,
         &WorktreePlan {
@@ -10289,14 +10204,42 @@ mod tests {
             .unwrap()
             .trim()
         );
+
+        add_worktree(
+            &config,
+            &store,
+            &Output { json: true },
+            Some(&fork_path),
+            WorktreeAddArgs {
+                repo_or_name: "detached-worktree".to_string(),
+                name_or_start_point: Some("origin/main".to_string()),
+                start_point: None,
+                branch: None,
+                detach: false,
+                force: false,
+                reset: false,
+            },
+        )
+        .unwrap();
+        let detached_worktree_path =
+            locator_path(&config.dev_worktree_root, &fork_locator).join("detached-worktree");
+        assert_eq!(
+            git_output(
+                &detached_worktree_path,
+                ["branch", "--show-current"],
+                "reading detached worktree branch"
+            )
+            .unwrap()
+            .trim(),
+            ""
+        );
+
         let dump = check_dump_report(&config, &store).unwrap();
         let worktree = dump
             .git_directories
             .iter()
             .find(|entry| entry.path == worktree_path)
             .unwrap();
-        assert!(worktree.tracked);
-        assert!(worktree.managed);
         assert_eq!(
             worktree.repository.as_deref(),
             Some(repository_path_id(&config, &fork_path).as_str())
@@ -10304,6 +10247,20 @@ mod tests {
         assert_eq!(worktree.repository_type.as_deref(), Some("fork"));
         assert_eq!(
             worktree.namespace.as_deref(),
+            Some(view.refs_prefix.as_str())
+        );
+        let detached_worktree = dump
+            .git_directories
+            .iter()
+            .find(|entry| entry.path == detached_worktree_path)
+            .unwrap();
+        assert_eq!(
+            detached_worktree.repository.as_deref(),
+            Some(repository_path_id(&config, &fork_path).as_str())
+        );
+        assert_eq!(detached_worktree.repository_type.as_deref(), Some("fork"));
+        assert_eq!(
+            detached_worktree.namespace.as_deref(),
             Some(view.refs_prefix.as_str())
         );
 
@@ -11702,16 +11659,12 @@ mod tests {
 
         assert!(dump.git_directories.iter().any(|entry| {
             entry.path == tracked_path
-                && entry.tracked
-                && entry.managed
                 && entry.repository.as_deref() == Some("clones/example.com/tracked/repo")
                 && entry.repository_type.as_deref() == Some("canonical")
                 && entry.kind.as_deref() == Some("bare")
         }));
         assert!(dump.git_directories.iter().any(|entry| {
             entry.path == untracked_path
-                && !entry.tracked
-                && !entry.managed
                 && entry.repository.is_none()
                 && entry.repository_type.is_none()
                 && entry.kind.as_deref() == Some("non-bare")
@@ -11720,9 +11673,14 @@ mod tests {
     }
 
     #[test]
-    fn repo_worktree_add_records_tracked_worktree() {
+    fn repo_worktree_add_delegates_lifecycle_to_git() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
+        let legacy_store = Connection::open(&config.state).unwrap();
+        legacy_store
+            .execute("CREATE TABLE worktrees (path TEXT)", [])
+            .unwrap();
+        drop(legacy_store);
         let store = Store::open(&config.state).unwrap();
         let seed = dir.path().join("seed");
         fs::create_dir_all(&seed).unwrap();
@@ -11787,18 +11745,36 @@ mod tests {
             Some("dev-worktrees/example.com/worktree/repo/managed-topic")
         );
         assert_eq!(worktree.kind.as_deref(), Some("worktree"));
-        assert!(worktree.tracked);
-        assert!(worktree.managed);
-        assert_eq!(worktree.worktree_name.as_deref(), Some("managed-topic"));
         assert_eq!(
             worktree.repository.as_deref(),
             Some("clones/example.com/worktree/repo")
         );
         assert_eq!(worktree.repository_type.as_deref(), Some("canonical"));
+        let worktree_table_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'worktrees'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(worktree_table_count, 0);
+
+        run_git_in(
+            &repo_path,
+            ["worktree", "remove", worktree_path.to_str().unwrap()],
+        )
+        .unwrap();
+        let dump = check_dump_report(&config, &store).unwrap();
+        assert!(
+            dump.git_directories
+                .iter()
+                .all(|entry| entry.path != worktree_path)
+        );
     }
 
     #[test]
-    fn check_dump_reports_raw_git_worktrees_as_untracked_even_outside_roots() {
+    fn check_dump_derives_git_worktrees_even_outside_roots() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
         let store = Store::open(&config.state).unwrap();
@@ -11856,8 +11832,6 @@ mod tests {
             .unwrap();
         assert_eq!(raw_worktree.id, None);
         assert_eq!(raw_worktree.kind.as_deref(), Some("worktree"));
-        assert!(!raw_worktree.tracked);
-        assert!(!raw_worktree.managed);
         assert_eq!(
             raw_worktree.repository.as_deref(),
             Some("clones/example.com/raw/repo")
