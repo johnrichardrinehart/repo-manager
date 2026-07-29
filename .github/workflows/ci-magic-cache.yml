@@ -1,0 +1,23 @@
+name: CI / Magic Nix Cache
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-with-magic-cache:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # Provisioning and cache adapters belong to the CI platform layer.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: DeterminateSystems/determinate-nix-action@2a0be2498974c2b6327e19780488744384637d88 # v3.21.7
+      - uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
+
+      # Keep this identical to ci-no-cache.yml so runtimes are comparable.
+      - run: nix flake check --print-build-logs
