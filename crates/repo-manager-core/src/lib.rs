@@ -553,6 +553,8 @@ struct MoveArgs {
 enum WorktreeSubcommand {
     #[command(about = "Create a development worktree under the managed dev-worktree root")]
     Add(WorktreeAddArgs),
+    #[command(about = "Remove empty worktree directories below each authority")]
+    Clean,
 }
 
 #[derive(Debug, Args)]
@@ -1463,6 +1465,21 @@ pub struct AliasPlan {
     pub target_path: PathBuf,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct WorktreeCleanReport {
+    action: &'static str,
+    root: PathBuf,
+    removed: Vec<PathBuf>,
+    blocked: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorktreeCleanState {
+    Empty,
+    Protected,
+    Blocked,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorktreePlan {
     pub canonical_locator: Locator,
@@ -1599,6 +1616,10 @@ pub fn run() -> Result<()> {
                 WorktreeSubcommand::Add(args) => {
                     let db = Store::open(&config.state)?;
                     add_worktree(&config, &db, &output, cli.dir.as_deref(), args)
+                }
+                WorktreeSubcommand::Clean => {
+                    let db = Store::open(&config.state)?;
+                    clean_worktree_directories(&config, &db, &output)
                 }
             },
             RepositoryOperationCommands::Repos(command) => {
@@ -6401,6 +6422,107 @@ fn shared_git_dir_relationship_repair_reasons(
     Ok(reasons)
 }
 
+fn clean_worktree_directories(config: &Config, db: &Store, output: &Output) -> Result<()> {
+    let protected = check_dump_report(config, db)?
+        .git_directories
+        .into_iter()
+        .filter(|entry| entry.kind.as_deref() == Some("worktree"))
+        .map(|entry| comparable_path(&entry.path))
+        .collect::<HashSet<_>>();
+    let mut removed = Vec::new();
+    let mut blocked = Vec::new();
+    prune_empty_worktree_directories(
+        &config.dev_worktree_root,
+        0,
+        &protected,
+        &mut removed,
+        &mut blocked,
+    )?;
+    removed.sort();
+    blocked.sort();
+    let report = WorktreeCleanReport {
+        action: "worktree-clean",
+        root: config.dev_worktree_root.clone(),
+        removed,
+        blocked,
+    };
+    if output.json {
+        print_json(&report)?;
+    } else {
+        for path in &report.removed {
+            println!("removed {}", path.display());
+        }
+        for path in &report.blocked {
+            eprintln!("blocked by unexpected contents: {}", path.display());
+        }
+        if report.removed.is_empty() && report.blocked.is_empty() {
+            println!("no empty worktree directories found");
+        }
+    }
+    if !report.blocked.is_empty() {
+        bail!(
+            "could not prune {} worktree directory subtree(s)",
+            report.blocked.len()
+        );
+    }
+    Ok(())
+}
+
+fn prune_empty_worktree_directories(
+    path: &Path,
+    depth: usize,
+    protected: &HashSet<PathBuf>,
+    removed: &mut Vec<PathBuf>,
+    blocked: &mut Vec<PathBuf>,
+) -> Result<WorktreeCleanState> {
+    if !path.exists() {
+        return Ok(WorktreeCleanState::Empty);
+    }
+    if protected.contains(&comparable_path(path)) {
+        return Ok(WorktreeCleanState::Protected);
+    }
+
+    let mut state = WorktreeCleanState::Empty;
+    let mut directly_blocked = false;
+    for entry in fs::read_dir(path).with_context(|| format!("reading {}", path.display()))? {
+        let entry = entry.with_context(|| format!("reading entry in {}", path.display()))?;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("reading file type for {}", entry.path().display()))?;
+        if file_type.is_dir() {
+            match prune_empty_worktree_directories(
+                &entry.path(),
+                depth + 1,
+                protected,
+                removed,
+                blocked,
+            )? {
+                WorktreeCleanState::Empty => {}
+                WorktreeCleanState::Protected => {
+                    if state == WorktreeCleanState::Empty {
+                        state = WorktreeCleanState::Protected;
+                    }
+                }
+                WorktreeCleanState::Blocked => state = WorktreeCleanState::Blocked,
+            }
+        } else {
+            directly_blocked = true;
+            state = WorktreeCleanState::Blocked;
+        }
+    }
+
+    if state == WorktreeCleanState::Empty && depth >= 2 {
+        fs::remove_dir(path)
+            .with_context(|| format!("removing empty directory {}", path.display()))?;
+        removed.push(path.to_path_buf());
+        return Ok(WorktreeCleanState::Empty);
+    }
+    if directly_blocked {
+        blocked.push(path.to_path_buf());
+    }
+    Ok(state)
+}
+
 fn add_worktree(
     config: &Config,
     db: &Store,
@@ -9254,6 +9376,7 @@ mod tests {
                         assert_eq!(args.repo_or_name, "topic-worktree");
                         assert_eq!(args.name_or_start_point.as_deref(), Some("topic"));
                     }
+                    WorktreeSubcommand::Clean => panic!("unexpected clean command"),
                 }
             }
             command => panic!("unexpected command: {command:?}"),
@@ -11670,6 +11793,57 @@ mod tests {
                 && entry.kind.as_deref() == Some("non-bare")
                 && entry.locator == Some(Locator::parse("example.com/untracked/repo").unwrap())
         }));
+    }
+
+    #[test]
+    fn worktree_clean_prunes_empty_directories_below_authorities() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("dev-worktrees");
+        let authority = root.join("github.com");
+        let empty_repo = authority.join("empty-owner/empty-repo");
+        let live_repo = authority.join("live-owner/live-repo/main");
+        let hidden_repo = authority.join("hidden-owner/hidden-repo");
+        let symlink_repo = authority.join("symlink-owner/symlink-repo");
+        fs::create_dir_all(&empty_repo).unwrap();
+        fs::create_dir_all(&live_repo).unwrap();
+        fs::create_dir_all(&hidden_repo).unwrap();
+        fs::create_dir_all(&symlink_repo).unwrap();
+        fs::write(hidden_repo.join(".keep"), "keep\n").unwrap();
+        std::os::unix::fs::symlink("missing", symlink_repo.join("link")).unwrap();
+
+        let protected = HashSet::from([comparable_path(&live_repo)]);
+        let mut removed = Vec::new();
+        let mut blocked = Vec::new();
+        prune_empty_worktree_directories(&root, 0, &protected, &mut removed, &mut blocked).unwrap();
+
+        assert!(!empty_repo.exists());
+        assert!(!authority.join("empty-owner").exists());
+        assert!(live_repo.exists());
+        assert!(hidden_repo.exists());
+        assert!(symlink_repo.exists());
+        assert!(authority.exists());
+        assert!(root.exists());
+        assert_eq!(removed.len(), 2);
+        assert_eq!(blocked.len(), 2);
+        assert!(blocked.contains(&hidden_repo));
+        assert!(blocked.contains(&symlink_repo));
+    }
+
+    #[test]
+    fn worktree_clean_fails_when_unexpected_contents_block_pruning() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let blocked = config.dev_worktree_root.join("github.com/owner/repo");
+        fs::create_dir_all(&blocked).unwrap();
+        fs::write(blocked.join(".keep"), "keep\n").unwrap();
+
+        let error = clean_worktree_directories(&config, &store, &Output { json: false })
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(error, "could not prune 1 worktree directory subtree(s)");
+        assert!(blocked.join(".keep").exists());
     }
 
     #[test]

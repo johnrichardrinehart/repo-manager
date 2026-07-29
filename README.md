@@ -81,9 +81,13 @@ created under the dev-worktree root. `repo worktree add` delegates their
 lifecycle to Git while supplying the managed path and, for fork views, mapping
 namespaced refs and configuring fork-safe pushes. Worktrees are not persisted
 in repo-manager's database, so direct `git worktree add`, `git worktree remove`,
-and `git worktree prune` remain authoritative. `repo check` reports existing
-non-bare clone-root repositories as repairable; `repo check --repair` converts
-clean managed checkouts to bare repositories.
+and `git worktree prune` remain authoritative. After removing worktrees,
+`repo worktree clean` removes empty repository and owner directories while
+preserving each authority directory. It leaves active worktrees intact and
+exits nonzero with a list of stale subtrees that contain any file, hidden
+entry, or symlink. `repo check` reports existing non-bare clone-root
+repositories as repairable; `repo check --repair` converts clean managed
+checkouts to bare repositories.
 
 ## Daemon API
 
