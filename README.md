@@ -89,6 +89,13 @@ entry, or symlink. `repo check` reports existing non-bare clone-root
 repositories as repairable; `repo check --repair` converts clean managed
 checkouts to bare repositories.
 
+Temporary refs use the `refs/tmp/` namespace. Run `repo refs gc --dry-run` to
+review old temporary refs. Run `repo refs gc` to remove refs older than the
+30-day grace period when a stable ref already reaches their target commit.
+The collector keeps newer refs and refs that hold otherwise unreachable
+commits. Pass `--prune-unreachable` after review to remove old refs that hold
+unique commits.
+
 ## Daemon API
 
 Repository lifecycle RPC is defined in `api/repo_manager/v1/rpc.proto` and

@@ -29,6 +29,7 @@ const CURRENT_CONFIG_VERSION: u32 = 1;
 const RPC_PROTOCOL_VERSION: u32 = 1;
 const BACKGROUND_FETCH_MIN_WAKE_SECONDS: u64 = 1;
 const BACKGROUND_FETCH_MAX_WAKE_SECONDS: u64 = 300;
+const DEFAULT_TMP_REF_GRACE_PERIOD_SECONDS: u64 = 30 * 24 * 60 * 60;
 const REPO_VIEW_METADATA_FILE: &str = ".repo-manager-view.json";
 const REPO_VIEW_METADATA_VERSION: u32 = 1;
 const CONFIG_SCHEMA_V1: &str = include_str!("../schemas/config/v1/schema.json");
@@ -281,6 +282,8 @@ enum RepositoryOperationCommands {
     Repair(DeprecatedRepairArgs),
     #[command(about = "Manage development worktrees under the managed dev-worktree root")]
     Worktree(WorktreeCommand),
+    #[command(about = "Inspect or clean temporary Git refs")]
+    Refs(RefsCommand),
     #[command(
         name = "repos",
         visible_alias = "repositories",
@@ -561,6 +564,41 @@ enum WorktreeSubcommand {
 struct WorktreeCommand {
     #[command(subcommand)]
     command: WorktreeSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum RefsSubcommand {
+    #[command(
+        name = "gc",
+        about = "Remove old temporary refs that stable refs already preserve"
+    )]
+    Gc(RefsGcArgs),
+}
+
+#[derive(Debug, Args)]
+struct RefsCommand {
+    #[command(subcommand)]
+    command: RefsSubcommand,
+}
+
+#[derive(Debug, Clone, Args)]
+struct RefsGcArgs {
+    #[arg(
+        long,
+        default_value_t = DEFAULT_TMP_REF_GRACE_PERIOD_SECONDS,
+        value_name = "SECONDS",
+        help = "Keep temporary refs newer than this grace period"
+    )]
+    grace_period_seconds: u64,
+
+    #[arg(long, help = "List removable refs without deleting them")]
+    dry_run: bool,
+
+    #[arg(
+        long,
+        help = "Delete old temporary refs whose commits are unreachable from stable refs"
+    )]
+    prune_unreachable: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1311,6 +1349,23 @@ struct FetchResult {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct RefGcRetained {
+    name: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RefGcResult {
+    action: &'static str,
+    path: PathBuf,
+    grace_period_seconds: u64,
+    dry_run: bool,
+    prune_unreachable: bool,
+    deleted: Vec<String>,
+    retained: Vec<RefGcRetained>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct BranchResult {
     action: &'static str,
     locator: Locator,
@@ -1622,6 +1677,14 @@ pub fn run() -> Result<()> {
                     clean_worktree_directories(&config, &db, &output)
                 }
             },
+            RepositoryOperationCommands::Refs(command) => {
+                let db = Store::open(&config.state)?;
+                match command.command {
+                    RefsSubcommand::Gc(args) => {
+                        refs_gc(&config, &db, &output, cli.dir.as_deref(), args)
+                    }
+                }
+            }
             RepositoryOperationCommands::Repos(command) => {
                 let db = Store::open(&config.state)?;
                 match command.command {
@@ -4811,6 +4874,109 @@ fn repo_context(config: &Config, db: &Store, dir: Option<&Path>) -> Result<RepoC
         "could not resolve repo context for {}; pass --dir pointing at a managed repo or repo-manager view",
         dir.display()
     )
+}
+
+fn refs_gc(
+    config: &Config,
+    db: &Store,
+    output: &Output,
+    dir: Option<&Path>,
+    args: RefsGcArgs,
+) -> Result<()> {
+    let context = repo_context(config, db, dir)?;
+    let path = match &context {
+        RepoContext::Managed(repo) => repo.path.as_path(),
+        RepoContext::View(view) => view.canonical_path.as_path(),
+    };
+    let result = gc_tmp_refs(path, &args)?;
+    output_ref_gc(output, &result)
+}
+
+fn gc_tmp_refs(path: &Path, args: &RefsGcArgs) -> Result<RefGcResult> {
+    let refs = git_output(
+        path,
+        [
+            "for-each-ref",
+            "--format=%(refname) %(objectname) %(creatordate:unix)",
+            "refs/tmp",
+        ],
+        "listing temporary refs",
+    )?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("reading current time")?
+        .as_secs();
+    let mut deleted = Vec::new();
+    let mut retained = Vec::new();
+
+    for line in refs.lines().filter(|line| !line.trim().is_empty()) {
+        let mut fields = line.split_whitespace();
+        let name = fields
+            .next()
+            .with_context(|| format!("parsing temporary ref listing: {line:?}"))?;
+        let object = fields
+            .next()
+            .with_context(|| format!("parsing temporary ref listing: {line:?}"))?;
+        let created_at = fields.next().and_then(|value| value.parse::<u64>().ok());
+
+        let Some(created_at) = created_at else {
+            retained.push(RefGcRetained {
+                name: name.to_string(),
+                reason: "missing target timestamp".to_string(),
+            });
+            continue;
+        };
+        let age = now.saturating_sub(created_at);
+        if age < args.grace_period_seconds {
+            retained.push(RefGcRetained {
+                name: name.to_string(),
+                reason: format!("younger than {} seconds", args.grace_period_seconds),
+            });
+            continue;
+        }
+
+        let stable_refs = git_output(
+            path,
+            ["for-each-ref", "--contains", object, "--format=%(refname)"],
+            "checking temporary ref reachability",
+        )?;
+        let reachable = stable_refs
+            .lines()
+            .any(|refname| !refname.starts_with("refs/tmp/"));
+        if !reachable && !args.prune_unreachable {
+            retained.push(RefGcRetained {
+                name: name.to_string(),
+                reason: "target is not reachable from a stable ref".to_string(),
+            });
+            continue;
+        }
+
+        if !args.dry_run {
+            delete_git_ref(path, name, object)?;
+        }
+        deleted.push(name.to_string());
+    }
+
+    Ok(RefGcResult {
+        action: "refs-gc",
+        path: path.to_path_buf(),
+        grace_period_seconds: args.grace_period_seconds,
+        dry_run: args.dry_run,
+        prune_unreachable: args.prune_unreachable,
+        deleted,
+        retained,
+    })
+}
+
+fn delete_git_ref(cwd: &Path, refname: &str, expected: &str) -> Result<()> {
+    let status = git_command(cwd)
+        .args(["update-ref", "-d", refname, expected])
+        .status()
+        .with_context(|| format!("deleting Git ref {refname} in {}", cwd.display()))?;
+    if !status.success() {
+        bail!("deleting Git ref {refname} failed with status {status}");
+    }
+    Ok(())
 }
 
 fn fetch_repo(
@@ -8766,6 +8932,29 @@ fn output_fetch(output: &Output, result: &FetchResult) -> Result<()> {
     Ok(())
 }
 
+fn output_ref_gc(output: &Output, result: &RefGcResult) -> Result<()> {
+    if output.json {
+        return print_json(result);
+    }
+    let action = if result.dry_run {
+        "would remove"
+    } else {
+        "removed"
+    };
+    println!(
+        "{action} {} temporary ref(s) in {}",
+        result.deleted.len(),
+        result.path.display()
+    );
+    for name in &result.deleted {
+        println!("  {name}");
+    }
+    for retained in &result.retained {
+        println!("kept {}: {}", retained.name, retained.reason);
+    }
+    Ok(())
+}
+
 fn output_branch(output: &Output, result: &BranchResult) -> Result<()> {
     if output.json {
         return print_json(result);
@@ -12220,6 +12409,69 @@ mod tests {
             rpc_rate_limit_per_second: 0,
             background_fetch_minimum_interval_seconds: None,
         }
+    }
+
+    #[test]
+    fn gc_tmp_refs_removes_redundant_old_refs_and_keeps_unique_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        run_git_in(&dir.path(), ["init"]).unwrap();
+        run_git_in(
+            &dir.path(),
+            [
+                "-c",
+                "user.name=repo-manager",
+                "-c",
+                "user.email=repo-manager@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "stable",
+            ],
+        )
+        .unwrap();
+        let stable = git_output(&dir.path(), ["rev-parse", "HEAD"], "reading stable HEAD")
+            .unwrap()
+            .trim()
+            .to_string();
+        run_git_in(&dir.path(), ["update-ref", "refs/tmp/redundant", &stable]).unwrap();
+        run_git_in(&dir.path(), ["checkout", "-b", "orphan-source"]).unwrap();
+        run_git_in(
+            &dir.path(),
+            [
+                "-c",
+                "user.name=repo-manager",
+                "-c",
+                "user.email=repo-manager@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "orphan",
+            ],
+        )
+        .unwrap();
+        let orphan = git_output(&dir.path(), ["rev-parse", "HEAD"], "reading orphan HEAD")
+            .unwrap()
+            .trim()
+            .to_string();
+        run_git_in(&dir.path(), ["checkout", "-"]).unwrap();
+        run_git_in(
+            &dir.path(),
+            ["update-ref", "-d", "refs/heads/orphan-source"],
+        )
+        .unwrap();
+        run_git_in(&dir.path(), ["update-ref", "refs/tmp/orphan", &orphan]).unwrap();
+
+        let args = RefsGcArgs {
+            grace_period_seconds: 0,
+            dry_run: false,
+            prune_unreachable: false,
+        };
+        let result = gc_tmp_refs(&dir.path(), &args).unwrap();
+        assert_eq!(result.deleted, vec!["refs/tmp/redundant"]);
+        assert_eq!(result.retained.len(), 1);
+        assert_eq!(result.retained[0].name, "refs/tmp/orphan");
+        assert!(!git_ref_exists(&dir.path(), "refs/tmp/redundant").unwrap());
+        assert!(git_ref_exists(&dir.path(), "refs/tmp/orphan").unwrap());
     }
 
     #[test]
