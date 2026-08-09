@@ -10192,6 +10192,10 @@ mod tests {
             "git@github.com:new-owner/new-name.git"
         );
         assert_eq!(
+            remote_url_for_locator(Some("git@github.com:/old-owner/old-name.git"), &locator),
+            "git@github.com:new-owner/new-name.git"
+        );
+        assert_eq!(
             remote_url_for_locator(
                 Some("ssh://git@github.com/old-owner/old-name.git"),
                 &locator
