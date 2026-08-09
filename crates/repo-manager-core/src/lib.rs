@@ -3215,6 +3215,8 @@ fn clone_repo_inner(config: &Config, db: &Store, url: &str) -> Result<CloneResul
         );
         return Err(error);
     }
+    let canonical_origin = remote_url_for_locator(Some(url), &locator);
+    ensure_remote(&path, "origin", &canonical_origin)?;
     db.upsert_repo(&locator, &path, None)?;
     send_rpc_event_best_effort(
         &config.rpc_url,
