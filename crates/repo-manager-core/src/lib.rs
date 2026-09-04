@@ -6826,7 +6826,7 @@ fn add_repo_view_worktree(
             ["rev-parse", &start_ref],
             "resolving worktree branch start point",
         )?;
-        let branch_ref = format!("{}/heads/{branch}", view.refs_prefix);
+        let branch_ref = format!("refs/heads/{branch}");
         git_dir_update_ref(&view.canonical_path, &branch_ref, target.trim())?;
         Some(branch_ref)
     } else if start_point.is_none() {
@@ -6890,8 +6890,9 @@ fn configure_repo_view_worktree_remote(
     branch_ref: &str,
 ) -> Result<()> {
     let branch = branch_ref
-        .strip_prefix(&format!("{}/heads/", view.refs_prefix))
-        .ok_or_else(|| anyhow!("branch ref `{branch_ref}` is outside the fork namespace"))?;
+        .strip_prefix("refs/heads/")
+        .or_else(|| branch_ref.strip_prefix(&format!("{}/heads/", view.refs_prefix)))
+        .ok_or_else(|| anyhow!("branch ref `{branch_ref}` is outside a branch namespace"))?;
     run_git_in(
         &view.canonical_path,
         ["config", "extensions.worktreeConfig", "true"],
@@ -10521,6 +10522,43 @@ mod tests {
             )
             .unwrap()
             .trim()
+        );
+
+        add_worktree(
+            &config,
+            &store,
+            &Output { json: true },
+            Some(&fork_path),
+            WorktreeAddArgs {
+                repo_or_name: "review-worktree".to_string(),
+                name_or_start_point: Some("origin/main".to_string()),
+                start_point: None,
+                branch: Some("review".to_string()),
+                detach: false,
+                force: false,
+                reset: false,
+            },
+        )
+        .unwrap();
+        let review_worktree_path =
+            locator_path(&config.dev_worktree_root, &fork_locator).join("review-worktree");
+        assert_eq!(
+            git_output(
+                &review_worktree_path,
+                ["symbolic-ref", "HEAD"],
+                "reading explicit worktree branch"
+            )
+            .unwrap()
+            .trim(),
+            "refs/heads/review"
+        );
+        assert!(
+            git_output(
+                &review_worktree_path,
+                ["rev-parse", "--verify", "refs/heads/review"],
+                "resolving explicit worktree branch"
+            )
+            .is_ok()
         );
 
         add_worktree(
