@@ -37,7 +37,7 @@ New remote repositories can be created and immediately cloned into the managed
 clone root:
 
 ```sh
-repo create https://github.com/me/new-project --private
+repo create github.com/me/new-project --private
 ```
 
 `repo create` infers GitHub and SourceHut from `github.com` and `git.sr.ht`.
@@ -62,6 +62,19 @@ repository already exists, and refuses to overwrite an existing local target
 path.
 
 ## Remotes
+
+When constructing a remote URL from a locator such as `github.com/me/project`,
+repo-manager uses `git@github.com:me/project`: SSH, with no added `.git` suffix.
+This policy is the same for every forge. Explicit URLs retain their transport,
+username, port, and `.git` suffix if supplied; use an explicit HTTPS URL when
+HTTPS is desired. SSH access requires credentials configured outside repo-manager.
+
+`repo create --no-auto-create-remote` initializes a local repository with `origin`
+and tracking configuration for its initial branch. Once the remote exists and
+the branch has a commit, a plain `git push` works with Git's default `simple`
+push policy, without a separate `--set-upstream` step. This also applies to the
+initial branch checked out in a worktree of a locally created bare repository.
+Existing repositories are not automatically migrated to this configuration.
 
 `repo move` updates `origin` to the new locator. `repo reconcile` does the
 same for detected moves, preserving the existing remote URL style when

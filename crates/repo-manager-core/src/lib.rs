@@ -3159,6 +3159,8 @@ fn clone_repo(config: &Config, db: &Store, output: &Output, url: &str) -> Result
 fn clone_repo_inner(config: &Config, db: &Store, url: &str) -> Result<CloneResult> {
     warn_pending_related(db)?;
     let locator = Locator::parse(url)?;
+    let remote_url = remote_url_for_locator(Some(url), &locator);
+    let url = remote_url.as_str();
     let path = locator_path(&config.clone_root, &locator);
     fs::create_dir_all(path.parent().context("clone path has no parent")?)?;
     send_rpc_event_best_effort(
@@ -3215,8 +3217,7 @@ fn clone_repo_inner(config: &Config, db: &Store, url: &str) -> Result<CloneResul
         );
         return Err(error);
     }
-    let canonical_origin = remote_url_for_locator(Some(url), &locator);
-    ensure_remote(&path, "origin", &canonical_origin)?;
+    ensure_remote(&path, "origin", url)?;
     db.upsert_repo(&locator, &path, None)?;
     send_rpc_event_best_effort(
         &config.rpc_url,
@@ -3250,7 +3251,7 @@ fn create_repo(config: &Config, db: &Store, output: &Output, args: CreateArgs) -
         let clone = clone_repo_inner(config, db, &args.url)?;
         (Some(forge.backend), Some(visibility), clone)
     } else {
-        let clone = create_local_repo_inner(config, db, &locator, &path)?;
+        let clone = create_local_repo_inner(config, db, &locator, &path, &args.url)?;
         (None, None, clone)
     };
     output_create(
@@ -3280,6 +3281,7 @@ fn create_local_repo_inner(
     db: &Store,
     locator: &Locator,
     path: &Path,
+    url: &str,
 ) -> Result<CloneResult> {
     warn_pending_related(db)?;
     fs::create_dir_all(path.parent().context("create path has no parent")?)?;
@@ -3289,8 +3291,28 @@ fn create_local_repo_inner(
     } else {
         run_git_in(path, ["init"])?;
     }
-    let remote_url = remote_url_for_locator(None, locator);
+    let remote_url = remote_url_for_locator(Some(url), locator);
     run_git_in(path, ["remote", "add", "origin", remote_url.as_str()])?;
+    // The remote branch need not exist yet, so --set-upstream-to cannot
+    // configure tracking for this unborn branch.
+    let branch = git_output(
+        path,
+        ["symbolic-ref", "--short", "HEAD"],
+        "reading initial branch",
+    )?;
+    let branch = branch.trim();
+    run_git_in(
+        path,
+        ["config", &format!("branch.{branch}.remote"), "origin"],
+    )?;
+    run_git_in(
+        path,
+        [
+            "config",
+            &format!("branch.{branch}.merge"),
+            &format!("refs/heads/{branch}"),
+        ],
+    )?;
     db.upsert_repo(locator, path, None)?;
     send_rpc_event_best_effort(
         &config.rpc_url,
@@ -8460,7 +8482,11 @@ fn remote_url_for_locator(existing_url: Option<&str>, locator: &Locator) -> Stri
         }
     }
 
-    format!("https://{}/{}.git", locator.authority, locator.remote_path)
+    if split_authority_port(&locator.authority).1.is_some() {
+        format!("ssh://git@{}/{}", locator.authority, locator.remote_path)
+    } else {
+        format!("git@{}:{}", locator.authority, locator.remote_path)
+    }
 }
 
 fn split_authority_port(authority: &str) -> (&str, Option<u16>) {
@@ -9842,9 +9868,117 @@ mod tests {
         assert!(path.join(".git").is_dir());
         assert_eq!(
             git_origin_url(&path).unwrap().as_deref(),
-            Some("https://example.test/me/tool.git")
+            Some("git@example.test:me/tool")
         );
         assert!(store.find_repo("example.test/me/tool").unwrap().is_some());
+    }
+
+    #[test]
+    fn locally_created_repositories_support_first_push_without_upstream_setup() {
+        for (input, expected_origin) in [
+            ("git.sr.ht/~alice/project", "git@git.sr.ht:~alice/project"),
+            (
+                "git.example.test/alice/project",
+                "git@git.example.test:alice/project",
+            ),
+            (
+                "ssh://git@git.example.test:2222/alice/project",
+                "ssh://git@git.example.test:2222/alice/project",
+            ),
+            (
+                "ssh://git@git.sr.ht/~alice/project",
+                "ssh://git@git.sr.ht/~alice/project",
+            ),
+            (
+                "https://example.test/alice/project",
+                "https://example.test/alice/project",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = test_config(dir.path());
+            let store = Store::open(&config.state).unwrap();
+            create_repo(
+                &config,
+                &store,
+                &Output { json: true },
+                CreateArgs {
+                    url: input.to_string(),
+                    private: false,
+                    public: false,
+                    auto_create_remote: None,
+                    no_auto_create_remote: true,
+                },
+            )
+            .unwrap();
+            let locator = Locator::parse(input).unwrap();
+            let path = locator_path(&config.clone_root, &locator);
+            assert_eq!(
+                git_origin_url(&path).unwrap().as_deref(),
+                Some(expected_origin)
+            );
+
+            let remote = dir.path().join("remote");
+            fs::create_dir_all(&remote).unwrap();
+            run_git_in(&remote, ["init", "--bare"]).unwrap();
+            run_git_in(
+                &path,
+                [
+                    "-c",
+                    "user.name=repo-manager",
+                    "-c",
+                    "user.email=repo-manager@example.com",
+                    "-c",
+                    "commit.gpgSign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "initial",
+                ],
+            )
+            .unwrap();
+            // Only the expected transport can reach the local stand-in. No network
+            // protocol is allowed, and automatic upstream setup cannot mask a bug.
+            let rewrite = format!(
+                "url.{}.insteadOf={expected_origin}",
+                file_url_for_path(&remote)
+            );
+            run_git_in(
+                &path,
+                [
+                    "-c",
+                    &rewrite,
+                    "-c",
+                    "protocol.allow=never",
+                    "-c",
+                    "protocol.file.allow=always",
+                    "-c",
+                    "push.default=simple",
+                    "-c",
+                    "push.autoSetupRemote=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "push",
+                ],
+            )
+            .unwrap();
+            let branch = git_output(&path, ["symbolic-ref", "HEAD"], "reading branch").unwrap();
+            let head = git_output(&path, ["rev-parse", "HEAD"], "reading commit").unwrap();
+            assert_eq!(
+                git_output(
+                    &remote,
+                    ["rev-parse", branch.trim()],
+                    "reading pushed commit"
+                )
+                .unwrap(),
+                head
+            );
+            assert_eq!(
+                git_output(&path, ["rev-parse", "@{upstream}"], "reading upstream").unwrap(),
+                head
+            );
+        }
     }
 
     #[test]
