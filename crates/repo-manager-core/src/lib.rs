@@ -1283,6 +1283,7 @@ struct CloneResult {
     action: &'static str,
     locator: Locator,
     path: PathBuf,
+    worktree_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3219,6 +3220,7 @@ fn clone_repo_inner(config: &Config, db: &Store, url: &str) -> Result<CloneResul
     }
     ensure_remote(&path, "origin", url)?;
     db.upsert_repo(&locator, &path, None)?;
+    let worktree_path = init_default_branch_worktree(config, &locator, &path, url)?;
     send_rpc_event_best_effort(
         &config.rpc_url,
         &RpcEvent::Finished(CloneFinishedEvent {
@@ -3234,6 +3236,7 @@ fn clone_repo_inner(config: &Config, db: &Store, url: &str) -> Result<CloneResul
         action: "clone",
         locator,
         path,
+        worktree_path,
     })
 }
 
@@ -3329,6 +3332,9 @@ fn create_local_repo_inner(
         action: "clone",
         locator: locator.clone(),
         path: path.to_path_buf(),
+        // A freshly initialized repository has an unborn branch, so there is
+        // nothing for a worktree to check out yet.
+        worktree_path: None,
     })
 }
 
@@ -7913,6 +7919,64 @@ fn fetch_remote_updating_refs(path: &Path, remote: &str) -> Result<()> {
     }
 }
 
+/// Initialize the default-branch worktree for a freshly cloned repository.
+///
+/// A bare clone has no working tree of its own, so without this a clone leaves
+/// nothing to edit and every repository needs a manual `repo worktree add`
+/// before it is usable. Non-bare clones already have a working tree, and an
+/// empty remote has no branch to check out; both return `None`.
+fn init_default_branch_worktree(
+    config: &Config,
+    locator: &Locator,
+    canonical_path: &Path,
+    url: &str,
+) -> Result<Option<PathBuf>> {
+    if !is_bare_repository(canonical_path)? {
+        return Ok(None);
+    }
+    let Some(branch) = default_branch_for_clone(canonical_path, url)? else {
+        return Ok(None);
+    };
+    let worktree_path = locator_path(&config.dev_worktree_root, locator).join(&branch);
+    if worktree_path.exists() {
+        return Ok(Some(worktree_path));
+    }
+    fs::create_dir_all(
+        worktree_path
+            .parent()
+            .context("worktree path has no parent")?,
+    )?;
+    let worktree_arg = worktree_path.display().to_string();
+    run_git_in(
+        canonical_path,
+        ["worktree", "add", worktree_arg.as_str(), branch.as_str()],
+    )?;
+    configure_linked_worktree(canonical_path, &worktree_path)?;
+    Ok(Some(worktree_path))
+}
+
+/// Resolve the branch a fresh clone should check out.
+///
+/// The clone's own HEAD is authoritative, but it can name a branch that does
+/// not exist locally, so fall back to the remote's advertised default and
+/// finally give up rather than failing the clone.
+fn default_branch_for_clone(path: &Path, url: &str) -> Result<Option<String>> {
+    let head = git_output_optional(path, ["symbolic-ref", "--short", "HEAD"], "reading clone HEAD")?
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if let Some(branch) = head {
+        if git_ref_exists(path, &format!("refs/heads/{branch}"))? {
+            return Ok(Some(branch));
+        }
+    }
+    if let Some(branch) = remote_default_branch_from_url(url)? {
+        if git_ref_exists(path, &format!("refs/heads/{branch}"))? {
+            return Ok(Some(branch));
+        }
+    }
+    Ok(None)
+}
+
 fn git_ref_fingerprint(path: &Path) -> Result<String> {
     git_output(
         path,
@@ -8847,6 +8911,13 @@ fn output_clone(output: &Output, result: &CloneResult) -> Result<()> {
         result.locator.key(),
         result.path.display()
     );
+    if let Some(worktree_path) = &result.worktree_path {
+        println!(
+            "initialized worktree {} -> {}",
+            result.locator.key(),
+            worktree_path.display()
+        );
+    }
     Ok(())
 }
 
