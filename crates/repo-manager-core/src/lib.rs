@@ -5027,7 +5027,7 @@ fn fetch_repo(
             )
         }
         RepoContext::Managed(repo) => {
-            run_git_in(&repo.path, ["fetch", "--prune", &args.remote])?;
+            fetch_remote_updating_refs(&repo.path, &args.remote)?;
             output_fetch(
                 output,
                 &FetchResult {
@@ -7875,38 +7875,42 @@ fn background_fetch_repo(path: &Path) -> Result<bool> {
 }
 
 fn background_fetch_bare_repo(path: &Path) -> Result<()> {
-    let remotes = git_remotes(path)?;
-    for remote in remotes {
-        if remote.name == "origin" {
-            run_git_in(
-                path,
-                [
-                    "fetch",
-                    "--prune",
-                    "origin",
-                    "+refs/heads/*:refs/heads/*",
-                    "+refs/tags/*:refs/tags/*",
-                ],
-            )?;
-        } else {
-            let heads_refspec = format!("+refs/heads/*:refs/remotes/{}/*", remote.name);
-            let tags_refspec = format!(
-                "+refs/tags/*:refs/repo-manager/remotes/{}/tags/*",
-                remote.name
-            );
-            run_git_in(
-                path,
-                [
-                    "fetch",
-                    "--prune",
-                    &remote.name,
-                    &heads_refspec,
-                    &tags_refspec,
-                ],
-            )?;
-        }
+    for remote in git_remotes(path)? {
+        fetch_remote_updating_refs(path, &remote.name)?;
     }
     Ok(())
+}
+
+/// Fetch `remote` into `path`, updating local refs when the repository is bare.
+///
+/// `git clone --bare` records no `remote.origin.fetch` refspec, unlike
+/// `--mirror`, so a plain `git fetch origin` in a bare repository advances only
+/// FETCH_HEAD and leaves `refs/heads/*` untouched. Without an explicit refspec a
+/// bare clone never learns about new upstream commits, and `repo worktree add`
+/// then finds no source branch and falls back to an orphan branch.
+fn fetch_remote_updating_refs(path: &Path, remote: &str) -> Result<()> {
+    if !is_bare_repository(path)? {
+        return run_git_in(path, ["fetch", "--prune", remote]);
+    }
+    if remote == "origin" {
+        run_git_in(
+            path,
+            [
+                "fetch",
+                "--prune",
+                remote,
+                "+refs/heads/*:refs/heads/*",
+                "+refs/tags/*:refs/tags/*",
+            ],
+        )
+    } else {
+        let heads_refspec = format!("+refs/heads/*:refs/remotes/{remote}/*");
+        let tags_refspec = format!("+refs/tags/*:refs/repo-manager/remotes/{remote}/tags/*");
+        run_git_in(
+            path,
+            ["fetch", "--prune", remote, &heads_refspec, &tags_refspec],
+        )
+    }
 }
 
 fn git_ref_fingerprint(path: &Path) -> Result<String> {
