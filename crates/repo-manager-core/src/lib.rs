@@ -1601,6 +1601,19 @@ pub struct MovePlan {
     pub new_path: PathBuf,
     pub flags: ChangeFlags,
     pub aliases: Vec<AliasPlan>,
+    /// Where this repository's development worktrees live, when the move relocates
+    /// them. `None` when the locator maps to the same worktree directory.
+    pub worktrees: Option<WorktreeMovePlan>,
+}
+
+/// The development-worktree directory a move relocates alongside the clone.
+///
+/// Worktrees are keyed by the same locator as the clone but live under a different
+/// root, so a locator change moves two directories, not one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorktreeMovePlan {
+    pub old_path: PathBuf,
+    pub new_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2710,12 +2723,15 @@ fn ensure_worktree_config_extension(worktree_path: &Path) -> Result<()> {
 
 pub fn plan_move(
     clone_root: &Path,
+    dev_worktree_root: &Path,
     old_locator: Locator,
     new_locator: Locator,
     historical_locators: &[Locator],
 ) -> MovePlan {
     let old_path = locator_path(clone_root, &old_locator);
     let new_path = locator_path(clone_root, &new_locator);
+    let old_worktree_path = locator_path(dev_worktree_root, &old_locator);
+    let new_worktree_path = locator_path(dev_worktree_root, &new_locator);
     let flags = ChangeFlags {
         authority_changed: old_locator.authority != new_locator.authority,
         remote_path_changed: old_locator.remote_path != new_locator.remote_path,
@@ -2738,6 +2754,11 @@ pub fn plan_move(
         })
         .collect();
 
+    let worktrees = (old_worktree_path != new_worktree_path).then_some(WorktreeMovePlan {
+        old_path: old_worktree_path,
+        new_path: new_worktree_path,
+    });
+
     MovePlan {
         old_locator,
         new_locator,
@@ -2745,6 +2766,7 @@ pub fn plan_move(
         new_path,
         flags,
         aliases,
+        worktrees,
     }
 }
 
@@ -7248,7 +7270,8 @@ fn configure_worktree_path_references(canonical_path: &Path, relative_paths: boo
     )
 }
 
-fn set_worktree_head(worktree_path: &Path, refname: &str) -> Result<()> {
+/// The admin directory a linked worktree's `.git` file points at.
+fn worktree_git_dir(worktree_path: &Path) -> Result<PathBuf> {
     let git_file = fs::read_to_string(worktree_path.join(".git"))
         .with_context(|| format!("reading {}", worktree_path.join(".git").display()))?;
     let git_dir = git_file
@@ -7256,11 +7279,15 @@ fn set_worktree_head(worktree_path: &Path, refname: &str) -> Result<()> {
         .strip_prefix("gitdir: ")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow!("worktree .git file is not a gitdir pointer"))?;
-    let git_dir = if git_dir.is_absolute() {
+    Ok(if git_dir.is_absolute() {
         git_dir
     } else {
         worktree_path.join(git_dir)
-    };
+    })
+}
+
+fn set_worktree_head(worktree_path: &Path, refname: &str) -> Result<()> {
+    let git_dir = worktree_git_dir(worktree_path)?;
     fs::write(git_dir.join("HEAD"), format!("ref: {refname}\n"))
         .with_context(|| format!("writing {}", git_dir.join("HEAD").display()))
 }
@@ -7286,7 +7313,13 @@ fn move_repo(
             (repo_id, old_locator.clone(), vec![old_locator])
         }
     };
-    let plan = plan_move(&config.clone_root, old_locator, new_locator, &historical);
+    let plan = plan_move(
+        &config.clone_root,
+        &config.dev_worktree_root,
+        old_locator,
+        new_locator,
+        &historical,
+    );
     apply_filesystem_move(&plan)?;
     ensure_remote(&plan.new_path, "origin", new_url)?;
     apply_identity_for_layout(&config.identities, &plan.new_locator, &plan.new_path)?;
@@ -7322,6 +7355,7 @@ fn reconcile_repos(config: &Config, db: &Store) -> Result<ReconcileReport> {
             let historical = db.historical_locators(repo.id)?;
             let plan = plan_move(
                 &config.clone_root,
+                &config.dev_worktree_root,
                 repo.current.clone(),
                 forge_locator,
                 &historical,
@@ -7368,6 +7402,7 @@ fn reconcile_repos(config: &Config, db: &Store) -> Result<ReconcileReport> {
         let historical = db.historical_locators(repo.id)?;
         let plan = plan_move(
             &config.clone_root,
+            &config.dev_worktree_root,
             repo.current.clone(),
             origin_locator,
             &historical,
@@ -8550,18 +8585,67 @@ fn notify_related_history(count: usize, locator: &Locator) {
 fn notify_related_history(_count: usize, _locator: &Locator) {}
 
 fn apply_filesystem_move(plan: &MovePlan) -> Result<()> {
-    if plan.old_path != plan.new_path {
-        fs::create_dir_all(plan.new_path.parent().context("new path has no parent")?)?;
-        if plan.old_path.exists() && !plan.new_path.exists() {
-            fs::rename(&plan.old_path, &plan.new_path).with_context(|| {
-                format!(
-                    "moving {} to {}",
-                    plan.old_path.display(),
-                    plan.new_path.display()
-                )
-            })?;
-        }
+    // Every precondition is checked before anything is renamed: a move touches
+    // two directories and a failure between them would leave a clone and its
+    // worktrees disagreeing about where they live.
+    if read_repo_view_metadata(&plan.old_path)?.is_some() {
+        bail!(
+            "{} is a fork or mirror view; moving views is not supported",
+            plan.old_path.display()
+        );
     }
+    let move_clone = plan.old_path != plan.new_path && plan.old_path.exists();
+    if move_clone && plan.new_path.exists() {
+        bail!(
+            "cannot move {} to {}: destination already exists",
+            plan.old_path.display(),
+            plan.new_path.display()
+        );
+    }
+    let move_worktrees = plan
+        .worktrees
+        .as_ref()
+        .filter(|worktrees| worktrees.old_path.exists());
+    if let Some(worktrees) = move_worktrees
+        && worktrees.new_path.exists()
+    {
+        bail!(
+            "cannot move worktrees {} to {}: destination already exists",
+            worktrees.old_path.display(),
+            worktrees.new_path.display()
+        );
+    }
+
+    if move_clone {
+        fs::create_dir_all(plan.new_path.parent().context("new path has no parent")?)?;
+        fs::rename(&plan.old_path, &plan.new_path).with_context(|| {
+            format!(
+                "moving {} to {}",
+                plan.old_path.display(),
+                plan.new_path.display()
+            )
+        })?;
+    }
+    if let Some(worktrees) = move_worktrees {
+        fs::create_dir_all(
+            worktrees
+                .new_path
+                .parent()
+                .context("new worktree path has no parent")?,
+        )?;
+        fs::rename(&worktrees.old_path, &worktrees.new_path).with_context(|| {
+            format!(
+                "moving worktrees {} to {}",
+                worktrees.old_path.display(),
+                worktrees.new_path.display()
+            )
+        })?;
+        // A linked worktree and its clone record each other by path, in both
+        // directions. Renaming either end leaves those pointers dangling, so Git has
+        // to be told: without this, `git status` inside a moved worktree fails outright.
+        repair_worktrees(&plan.new_path, &worktrees.new_path)?;
+    }
+
     for alias in &plan.aliases {
         if alias.alias_path == alias.target_path {
             continue;
@@ -8594,6 +8678,51 @@ fn symlink_dir(target: &Path, alias: &Path) -> Result<()> {
 fn symlink_dir(target: &Path, alias: &Path) -> Result<()> {
     std::os::windows::fs::symlink_dir(target, alias)
         .with_context(|| format!("symlinking {} -> {}", alias.display(), target.display()))
+}
+
+/// Re-point Git at every worktree beneath `worktree_root` after a move.
+///
+/// `git worktree repair` rewrites the gitdir pointers each end holds for the other,
+/// honoring `worktree.useRelativePaths`. A repository with no worktrees is the
+/// common case and does nothing.
+fn repair_worktrees(clone_path: &Path, worktree_root: &Path) -> Result<()> {
+    let Ok(entries) = fs::read_dir(worktree_root) else {
+        return Ok(());
+    };
+
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // A linked worktree always has a `.git` file pointing at its admin directory.
+        if path.join(".git").is_file() {
+            paths.push(path);
+        }
+    }
+
+    if paths.is_empty() {
+        return Ok(());
+    }
+
+    let mut args: Vec<std::ffi::OsString> = vec!["worktree".into(), "repair".into()];
+    args.extend(paths.iter().map(|path| path.clone().into_os_string()));
+    run_git_in(clone_path, args)?;
+
+    // Git derives a linked worktree's location from the gitdir pointer, so
+    // `core.worktree` in its per-worktree config is redundant at best. Left over
+    // from an older layout, it is an absolute path to the old location and every
+    // Git command inside the moved worktree fails with `Invalid path <old location>`
+    // even though both pointers are correct. Dropping it, rather than rewriting it,
+    // also keeps the tree free of host-specific absolute paths. It is edited through
+    // the config file because `git config --worktree` runs inside the worktree and
+    // is refused while the stale value is still there.
+    for path in &paths {
+        let worktree_config = worktree_git_dir(path)?.join("config.worktree");
+        if worktree_config.is_file() {
+            unset_git_config_value(&worktree_config, "core.worktree")?;
+        }
+    }
+
+    Ok(())
 }
 
 fn ensure_remote(cwd: &Path, name: &str, url: &str) -> Result<()> {
@@ -9137,6 +9266,13 @@ fn output_move(output: &Output, plan: &MovePlan) -> Result<()> {
         plan.new_locator.key()
     );
     println!("current path: {}", plan.new_path.display());
+    if let Some(worktrees) = &plan.worktrees {
+        println!(
+            "worktrees: {} -> {}",
+            worktrees.old_path.display(),
+            worktrees.new_path.display()
+        );
+    }
     for alias in &plan.aliases {
         println!(
             "alias: {} -> {}",
@@ -10346,7 +10482,13 @@ mod tests {
     fn move_flags_identify_authority_prefix_and_leaf_changes() {
         let old = Locator::parse("github.com/org/repo").unwrap();
         let new = Locator::parse("codeberg.org/new-org/new-repo").unwrap();
-        let plan = plan_move(Path::new("/tmp/clones"), old, new, &[]);
+        let plan = plan_move(
+            Path::new("/tmp/clones"),
+            Path::new("/tmp/dev-worktrees"),
+            old,
+            new,
+            &[],
+        );
         assert!(plan.flags.authority_changed);
         assert!(plan.flags.remote_path_changed);
         assert!(plan.flags.path_prefix_changed);
@@ -10360,6 +10502,7 @@ mod tests {
         let third = Locator::parse("git.example.com/newer/project").unwrap();
         let plan = plan_move(
             Path::new("/tmp/clones"),
+            Path::new("/tmp/dev-worktrees"),
             second.clone(),
             third.clone(),
             &[first.clone(), second],
@@ -10371,6 +10514,185 @@ mod tests {
             plan.aliases
                 .iter()
                 .any(|alias| alias.alias_path == Path::new("/tmp/clones/github.com/old/repo"))
+        );
+    }
+
+    #[test]
+    fn move_plan_relocates_the_worktree_directory() {
+        let old = Locator::parse("github.com/old-owner/old-name").unwrap();
+        let new = Locator::parse("github.com/new-owner/new-name").unwrap();
+        let plan = plan_move(
+            Path::new("/tmp/clones"),
+            Path::new("/tmp/dev-worktrees"),
+            old,
+            new,
+            &[],
+        );
+        let worktrees = plan
+            .worktrees
+            .expect("a locator change must relocate the worktree directory");
+        assert_eq!(
+            worktrees.old_path,
+            Path::new("/tmp/dev-worktrees/github.com/old-owner/old-name")
+        );
+        assert_eq!(
+            worktrees.new_path,
+            Path::new("/tmp/dev-worktrees/github.com/new-owner/new-name")
+        );
+    }
+
+    #[test]
+    fn move_plan_leaves_worktrees_alone_when_the_locator_does_not_move() {
+        let same = Locator::parse("github.com/owner/name").unwrap();
+        let plan = plan_move(
+            Path::new("/tmp/clones"),
+            Path::new("/tmp/dev-worktrees"),
+            same.clone(),
+            same,
+            &[],
+        );
+        assert!(plan.worktrees.is_none());
+    }
+
+    #[test]
+    fn move_relocates_worktrees_and_leaves_git_working_inside_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        // The production default: links must survive a move as relative paths.
+        config.worktree_use_relative_paths = true;
+        let store = Store::open(&config.state).unwrap();
+
+        let seed = dir.path().join("seed");
+        fs::create_dir_all(&seed).unwrap();
+        run_git_in(&seed, ["init"]).unwrap();
+        fs::write(seed.join("README.md"), "seed\n").unwrap();
+        run_git_in(&seed, ["add", "."]).unwrap();
+        run_git_in(
+            &seed,
+            [
+                "-c",
+                "user.name=repo-manager",
+                "-c",
+                "user.email=repo-manager@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        )
+        .unwrap();
+
+        let old_locator = Locator::parse("github.com/old-owner/old-name").unwrap();
+        let clone_path = locator_path(&config.clone_root, &old_locator);
+        clone_local_repo(&seed, &clone_path);
+        run_git_in(
+            &clone_path,
+            [
+                "remote",
+                "set-url",
+                "origin",
+                "ssh://git@github.com/old-owner/old-name",
+            ],
+        )
+        .unwrap();
+        store.upsert_repo(&old_locator, &clone_path, None).unwrap();
+
+        add_worktree(
+            &config,
+            &store,
+            &Output { json: true },
+            Some(&clone_path),
+            WorktreeAddArgs {
+                repo_or_name: "topic".to_string(),
+                name_or_start_point: None,
+                start_point: None,
+                branch: Some("topic".to_string()),
+                detach: false,
+                force: false,
+                reset: false,
+            },
+        )
+        .unwrap();
+
+        let old_worktree = locator_path(&config.dev_worktree_root, &old_locator).join("topic");
+        assert!(
+            old_worktree.is_dir(),
+            "worktree should exist before the move"
+        );
+        // An older layout left an absolute `core.worktree` in the worktree's own
+        // config; it must not survive the move pointing at the old location.
+        let worktree_config = worktree_git_dir(&old_worktree)
+            .unwrap()
+            .join("config.worktree");
+        set_git_config_value(
+            &worktree_config,
+            "core.worktree",
+            old_worktree.to_str().unwrap(),
+        )
+        .unwrap();
+
+        // A destination that is already occupied refuses the whole move before
+        // either directory is renamed.
+        let new_locator = Locator::parse("github.com/new-owner/new-name").unwrap();
+        let occupied = locator_path(&config.dev_worktree_root, &new_locator);
+        fs::create_dir_all(&occupied).unwrap();
+        let error = move_repo(
+            &config,
+            &store,
+            &Output { json: true },
+            "github.com/old-owner/old-name",
+            "ssh://git@github.com/new-owner/new-name",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("destination already exists"), "{error}");
+        assert!(clone_path.is_dir(), "clone must not have moved: {error}");
+        assert!(old_worktree.is_dir());
+        fs::remove_dir(&occupied).unwrap();
+
+        move_repo(
+            &config,
+            &store,
+            &Output { json: true },
+            "github.com/old-owner/old-name",
+            "ssh://git@github.com/new-owner/new-name",
+        )
+        .unwrap();
+
+        let new_worktree = locator_path(&config.dev_worktree_root, &new_locator).join("topic");
+        assert!(
+            new_worktree.is_dir(),
+            "the worktree should have followed the clone to the new locator"
+        );
+        assert!(
+            !old_worktree.exists(),
+            "the worktree should not be left behind at the old locator"
+        );
+
+        // The point of the repair: both ends of the gitdir pointer were rewritten, so
+        // ordinary Git commands still work inside the relocated worktree. Without it
+        // this call fails with a dangling gitdir.
+        let toplevel = git_output(
+            &new_worktree,
+            ["rev-parse", "--show-toplevel"],
+            "reading relocated worktree root",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::canonicalize(toplevel.trim()).unwrap(),
+            fs::canonicalize(&new_worktree).unwrap()
+        );
+        // Relative links stay relative, so the tree keeps resolving from a host
+        // that mounts it under another prefix.
+        let pointer = fs::read_to_string(new_worktree.join(".git")).unwrap();
+        assert!(
+            pointer.starts_with("gitdir: ../"),
+            "expected a relative gitdir pointer, got {pointer:?}"
+        );
+        assert!(
+            read_git_config(&new_worktree, IdentityScope::Worktree, "core.worktree")
+                .unwrap()
+                .is_none(),
+            "stale core.worktree must be dropped"
         );
     }
 
