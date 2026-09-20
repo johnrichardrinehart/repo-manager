@@ -6751,7 +6751,7 @@ fn add_worktree(
     )?;
     let arg_refs: Vec<&str> = plan.git_args.iter().map(String::as_str).collect();
     run_git_in(&plan.canonical_path, arg_refs)?;
-    configure_linked_worktree(&plan.canonical_path, &plan.worktree_path)?;
+    configure_worktree_config(&plan.canonical_path)?;
     if args.reset {
         let start = args
             .start_point
@@ -6816,7 +6816,7 @@ fn add_managed_context_worktree(
     }
     let arg_refs: Vec<&str> = git_args.iter().map(String::as_str).collect();
     run_git_in(&repo.path, arg_refs)?;
-    configure_linked_worktree(&repo.path, &worktree_path)?;
+    configure_worktree_config(&repo.path)?;
     if args.reset {
         let start = start_point.ok_or_else(|| anyhow!("--reset requires a start point"))?;
         run_git_in(&worktree_path, ["reset", "--hard", start])?;
@@ -6885,7 +6885,7 @@ fn add_repo_view_worktree(
     if !status.success() {
         bail!("git worktree add failed with status {status}");
     }
-    configure_linked_worktree(&view.canonical_path, &worktree_path)?;
+    configure_worktree_config(&view.canonical_path)?;
     if let Some(branch_ref) = branch_ref {
         set_worktree_head(&worktree_path, &branch_ref)?;
         configure_repo_view_worktree_remote(view, &worktree_path, &branch_ref)?;
@@ -6940,28 +6940,23 @@ fn configure_repo_view_worktree_remote(
     )
 }
 
-fn configure_linked_worktree(canonical_path: &Path, worktree_path: &Path) -> Result<()> {
+fn configure_worktree_config(canonical_path: &Path) -> Result<()> {
+    let bare = is_bare_repository(canonical_path)?;
+    let common_config = canonical_path.join("config");
+    let main_worktree_config = canonical_path.join("config.worktree");
+    if bare {
+        set_git_config_value(&main_worktree_config, "core.bare", "true")?;
+        unset_git_config_value(&main_worktree_config, "core.worktree")?;
+    }
     run_git_in(
         canonical_path,
         ["config", "extensions.worktreeConfig", "true"],
     )?;
-    // The canonical repository can be bare. Once worktreeConfig is enabled,
-    // each linked worktree must override the common core settings.
-    run_git_in(
-        worktree_path,
-        ["config", "--worktree", "core.bare", "false"],
-    )?;
-    run_git_in(
-        worktree_path,
-        [
-            "config",
-            "--worktree",
-            "core.worktree",
-            worktree_path
-                .to_str()
-                .ok_or_else(|| anyhow!("worktree path is not valid UTF-8"))?,
-        ],
-    )
+    if bare {
+        unset_git_config_value(&common_config, "core.bare")?;
+        unset_git_config_value(&common_config, "core.worktree")?;
+    }
+    Ok(())
 }
 
 fn set_worktree_head(worktree_path: &Path, refname: &str) -> Result<()> {
@@ -12320,7 +12315,7 @@ mod tests {
     }
 
     #[test]
-    fn repo_worktree_add_configures_bare_canonical_worktree() {
+    fn repo_worktree_add_preserves_bare_canonical_repository() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
         let store = Store::open(&config.state).unwrap();
@@ -12347,7 +12342,6 @@ mod tests {
         let repo_path = locator_path(&config.clone_root, &locator);
         fs::create_dir_all(repo_path.parent().unwrap()).unwrap();
         run_git_clone(seed.to_str().unwrap(), &repo_path, true).unwrap();
-        run_git_in(&repo_path, ["config", "extensions.worktreeConfig", "true"]).unwrap();
 
         add_worktree(
             &config,
@@ -12356,9 +12350,9 @@ mod tests {
             None,
             WorktreeAddArgs {
                 repo_or_name: "example.com/bare/repo".to_string(),
-                name_or_start_point: Some("main".to_string()),
+                name_or_start_point: Some("topic".to_string()),
                 start_point: Some("main".to_string()),
-                branch: None,
+                branch: Some("topic".to_string()),
                 detach: false,
                 force: false,
                 reset: false,
@@ -12366,7 +12360,7 @@ mod tests {
         )
         .unwrap();
 
-        let worktree_path = locator_path(&config.dev_worktree_root, &locator).join("main");
+        let worktree_path = locator_path(&config.dev_worktree_root, &locator).join("topic");
         assert_eq!(
             git_output(
                 &worktree_path,
@@ -12386,6 +12380,25 @@ mod tests {
             .unwrap()
             .trim(),
             worktree_path.to_str().unwrap()
+        );
+        let worktrees = git_output(
+            &worktree_path,
+            ["worktree", "list", "--porcelain"],
+            "listing worktrees from the linked worktree",
+        )
+        .unwrap();
+        let canonical = worktrees.split("\n\n").next().unwrap();
+        assert!(canonical.lines().any(|line| line == "bare"));
+        run_git_in(&worktree_path, ["switch", "main"]).unwrap();
+        assert_eq!(
+            git_output(
+                &worktree_path,
+                ["branch", "--show-current"],
+                "reading switched branch",
+            )
+            .unwrap()
+            .trim(),
+            "main"
         );
     }
 
