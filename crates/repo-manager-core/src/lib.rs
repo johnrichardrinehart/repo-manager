@@ -1544,6 +1544,27 @@ pub struct WorktreePlan {
     pub git_args: Vec<String>,
 }
 
+/// How the branch checked out in a new canonical worktree relates to origin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum WorktreeUpstream {
+    /// `origin/<branch>` exists and the local branch now tracks it.
+    Tracking { branch: String, upstream: String },
+    /// Origin has no such branch; no upstream was configured, so nothing
+    /// is published until the user pushes explicitly.
+    LocalOnly { branch: String },
+    /// No branch is checked out.
+    Detached,
+}
+
+#[derive(Debug, Serialize)]
+struct WorktreeAddResult<'a> {
+    #[serde(flatten)]
+    plan: &'a WorktreePlan,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upstream: Option<&'a WorktreeUpstream>,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WorktreeAddOptions<'a> {
     pub start_point: Option<&'a str>,
@@ -3219,6 +3240,7 @@ fn clone_repo_inner(config: &Config, db: &Store, url: &str) -> Result<CloneResul
         return Err(error);
     }
     ensure_remote(&path, "origin", url)?;
+    ensure_origin_tracking_refs(&path)?;
     db.upsert_repo(&locator, &path, None)?;
     let worktree_path = init_default_branch_worktree(config, &locator, &path, url)?;
     send_rpc_event_best_effort(
@@ -3296,26 +3318,12 @@ fn create_local_repo_inner(
     }
     let remote_url = remote_url_for_locator(Some(url), locator);
     run_git_in(path, ["remote", "add", "origin", remote_url.as_str()])?;
-    // The remote branch need not exist yet, so --set-upstream-to cannot
-    // configure tracking for this unborn branch.
     let branch = git_output(
         path,
         ["symbolic-ref", "--short", "HEAD"],
         "reading initial branch",
     )?;
-    let branch = branch.trim();
-    run_git_in(
-        path,
-        ["config", &format!("branch.{branch}.remote"), "origin"],
-    )?;
-    run_git_in(
-        path,
-        [
-            "config",
-            &format!("branch.{branch}.merge"),
-            &format!("refs/heads/{branch}"),
-        ],
-    )?;
+    configure_branch_upstream(path, branch.trim(), "origin")?;
     db.upsert_repo(locator, path, None)?;
     send_rpc_event_best_effort(
         &config.rpc_url,
@@ -6755,9 +6763,11 @@ fn add_worktree(
             .parent()
             .context("worktree path has no parent")?,
     )?;
+    ensure_origin_tracking_refs(&plan.canonical_path)?;
     let arg_refs: Vec<&str> = plan.git_args.iter().map(String::as_str).collect();
     run_git_in(&plan.canonical_path, arg_refs)?;
     configure_worktree_config(&plan.canonical_path)?;
+    let upstream = configure_worktree_upstream(&plan.worktree_path)?;
     if args.reset {
         let start = args
             .start_point
@@ -6766,7 +6776,7 @@ fn add_worktree(
         run_git_in(&plan.worktree_path, ["reset", "--hard", start])?;
     }
     db.upsert_repo(&plan.canonical_locator, &plan.canonical_path, None)?;
-    output_worktree(output, &plan)
+    output_worktree(output, &plan, Some(&upstream))
 }
 
 fn worktree_context(
@@ -6820,9 +6830,11 @@ fn add_managed_context_worktree(
     if let Some(start_point) = start_point {
         git_args.push(start_point.to_string());
     }
+    ensure_origin_tracking_refs(&repo.path)?;
     let arg_refs: Vec<&str> = git_args.iter().map(String::as_str).collect();
     run_git_in(&repo.path, arg_refs)?;
     configure_worktree_config(&repo.path)?;
+    let upstream = configure_worktree_upstream(&worktree_path)?;
     if args.reset {
         let start = start_point.ok_or_else(|| anyhow!("--reset requires a start point"))?;
         run_git_in(&worktree_path, ["reset", "--hard", start])?;
@@ -6835,6 +6847,7 @@ fn add_managed_context_worktree(
             worktree_path,
             git_args,
         },
+        Some(&upstream),
     )
 }
 
@@ -6912,6 +6925,7 @@ fn add_repo_view_worktree(
                 checkout_ref,
             ],
         },
+        None,
     )
 }
 
@@ -7887,28 +7901,23 @@ fn background_fetch_bare_repo(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Fetch `remote` into `path`, updating local refs when the repository is bare.
+/// Fetch `remote` into `path`, updating remote-tracking refs when the repository is bare.
 ///
 /// `git clone --bare` records no `remote.origin.fetch` refspec, unlike
 /// `--mirror`, so a plain `git fetch origin` in a bare repository advances only
-/// FETCH_HEAD and leaves `refs/heads/*` untouched. Without an explicit refspec a
-/// bare clone never learns about new upstream commits, and `repo worktree add`
-/// then finds no source branch and falls back to an orphan branch.
+/// FETCH_HEAD and no `refs/remotes/origin/*` ever exists. Ensure the standard
+/// refspec before fetching so `origin` behaves as in a non-bare clone:
+/// `refs/remotes/origin/*` tracks upstream and `refs/heads/*` stay local
+/// branches owned by the worktrees. Fetching straight into `refs/heads/*`
+/// would be refused for any branch checked out in a worktree and would clobber
+/// unpushed local commits elsewhere.
 fn fetch_remote_updating_refs(path: &Path, remote: &str) -> Result<()> {
     if !is_bare_repository(path)? {
         return run_git_in(path, ["fetch", "--prune", remote]);
     }
     if remote == "origin" {
-        run_git_in(
-            path,
-            [
-                "fetch",
-                "--prune",
-                remote,
-                "+refs/heads/*:refs/heads/*",
-                "+refs/tags/*:refs/tags/*",
-            ],
-        )
+        ensure_tracking_refspec(path, remote)?;
+        run_git_in(path, ["fetch", "--prune", remote])
     } else {
         let heads_refspec = format!("+refs/heads/*:refs/remotes/{remote}/*");
         let tags_refspec = format!("+refs/tags/*:refs/repo-manager/remotes/{remote}/tags/*");
@@ -7917,6 +7926,86 @@ fn fetch_remote_updating_refs(path: &Path, remote: &str) -> Result<()> {
             ["fetch", "--prune", remote, &heads_refspec, &tags_refspec],
         )
     }
+}
+
+/// Ensure `remote` fetches into `refs/remotes/<remote>/*`.
+///
+/// Writes the refspec a non-bare clone records for its origin. Returns whether
+/// it was added; a repository without that remote is left untouched, since a
+/// refspec with no URL would only break the next fetch.
+fn ensure_tracking_refspec(cwd: &Path, remote: &str) -> Result<bool> {
+    if git_remote_url(cwd, remote)?.is_none() {
+        return Ok(false);
+    }
+    let key = format!("remote.{remote}.fetch");
+    if git_output_optional(
+        cwd,
+        ["config", "--get-all", key.as_str()],
+        "reading fetch refspec",
+    )?
+    .is_some()
+    {
+        return Ok(false);
+    }
+    let refspec = format!("+refs/heads/*:refs/remotes/{remote}/*");
+    run_git_in(cwd, ["config", "--add", key.as_str(), refspec.as_str()])?;
+    Ok(true)
+}
+
+/// Ensure `origin` has remote-tracking branches before a worktree is created.
+///
+/// A bare clone made without the refspec has no `refs/remotes/origin/*`, so
+/// fetch once after adding it. This lets `git worktree add <path> <branch>`
+/// resolve a branch that exists only upstream to `origin/<branch>` instead of
+/// failing, and gives the checked-out branch an upstream to track.
+fn ensure_origin_tracking_refs(canonical_path: &Path) -> Result<()> {
+    if ensure_tracking_refspec(canonical_path, "origin")? {
+        run_git_in(canonical_path, ["fetch", "--prune", "origin"])?;
+    }
+    Ok(())
+}
+
+/// Point `branch` at `remote`'s branch of the same name.
+///
+/// Written as config rather than `branch --set-upstream-to` because the remote
+/// branch need not exist yet: a branch created locally gains its tracking ref
+/// on first push, and `push.default=simple` then pushes to this upstream.
+fn configure_branch_upstream(cwd: &Path, branch: &str, remote: &str) -> Result<()> {
+    run_git_in(cwd, ["config", &format!("branch.{branch}.remote"), remote])?;
+    run_git_in(
+        cwd,
+        [
+            "config",
+            &format!("branch.{branch}.merge"),
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+}
+
+/// Track `origin/<branch>` from the branch checked out in a canonical worktree.
+///
+/// Git sets an upstream itself only when the branch is created from a
+/// remote-tracking start point. A pre-existing local branch (every branch of a
+/// bare clone) gets none, so set it explicitly when the same-named branch
+/// exists on origin. A branch origin does not have is left without an
+/// upstream on purpose: configuring one would make a plain `git push` create
+/// the remote branch, and publishing is the user's call (`git push -u`).
+fn configure_worktree_upstream(worktree_path: &Path) -> Result<WorktreeUpstream> {
+    let Some(branch) = git_output_optional(
+        worktree_path,
+        ["symbolic-ref", "--quiet", "--short", "HEAD"],
+        "reading worktree branch",
+    )?
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty()) else {
+        return Ok(WorktreeUpstream::Detached);
+    };
+    if !git_ref_exists(worktree_path, &format!("refs/remotes/origin/{branch}"))? {
+        return Ok(WorktreeUpstream::LocalOnly { branch });
+    }
+    configure_branch_upstream(worktree_path, &branch, "origin")?;
+    let upstream = format!("origin/{branch}");
+    Ok(WorktreeUpstream::Tracking { branch, upstream })
 }
 
 /// Initialize the default-branch worktree for a freshly cloned repository.
@@ -7951,7 +8040,8 @@ fn init_default_branch_worktree(
         canonical_path,
         ["worktree", "add", worktree_arg.as_str(), branch.as_str()],
     )?;
-    configure_linked_worktree(canonical_path, &worktree_path)?;
+    configure_worktree_config(canonical_path)?;
+    configure_worktree_upstream(&worktree_path)?;
     Ok(Some(worktree_path))
 }
 
@@ -7961,9 +8051,13 @@ fn init_default_branch_worktree(
 /// not exist locally, so fall back to the remote's advertised default and
 /// finally give up rather than failing the clone.
 fn default_branch_for_clone(path: &Path, url: &str) -> Result<Option<String>> {
-    let head = git_output_optional(path, ["symbolic-ref", "--short", "HEAD"], "reading clone HEAD")?
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+    let head = git_output_optional(
+        path,
+        ["symbolic-ref", "--short", "HEAD"],
+        "reading clone HEAD",
+    )?
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty());
     if let Some(branch) = head {
         if git_ref_exists(path, &format!("refs/heads/{branch}"))? {
             return Ok(Some(branch));
@@ -8993,15 +9087,31 @@ fn output_fork(output: &Output, result: &ForkResult) -> Result<()> {
     Ok(())
 }
 
-fn output_worktree(output: &Output, plan: &WorktreePlan) -> Result<()> {
+fn output_worktree(
+    output: &Output,
+    plan: &WorktreePlan,
+    upstream: Option<&WorktreeUpstream>,
+) -> Result<()> {
     if output.json {
-        return print_json(plan);
+        return print_json(&WorktreeAddResult { plan, upstream });
     }
     println!(
         "created worktree {} -> {}",
         plan.canonical_locator.key(),
         plan.worktree_path.display()
     );
+    match upstream {
+        Some(WorktreeUpstream::Tracking { branch, upstream }) => {
+            println!("branch {branch} tracks {upstream}");
+        }
+        Some(WorktreeUpstream::LocalOnly { branch }) => {
+            println!(
+                "branch {branch} is local only: origin has no {branch}; publish with `git push -u origin {branch}`"
+            );
+        }
+        Some(WorktreeUpstream::Detached) => println!("detached HEAD; no branch to track"),
+        None => {}
+    }
     Ok(())
 }
 
@@ -12474,6 +12584,170 @@ mod tests {
             .unwrap()
             .trim(),
             "main"
+        );
+    }
+
+    fn seed_commit(seed: &Path, file: &str, content: &str, message: &str) {
+        fs::write(seed.join(file), content).unwrap();
+        run_git_in(seed, ["add", "."]).unwrap();
+        run_git_in(
+            seed,
+            [
+                "-c",
+                "user.name=repo-manager",
+                "-c",
+                "user.email=repo-manager@example.com",
+                "commit",
+                "-m",
+                message,
+            ],
+        )
+        .unwrap();
+    }
+
+    fn upstream_of(worktree: &Path, branch: &str) -> Option<String> {
+        git_output_optional(
+            worktree,
+            [
+                "rev-parse",
+                "--abbrev-ref",
+                &format!("{branch}@{{upstream}}"),
+            ],
+            "reading upstream",
+        )
+        .unwrap()
+        .map(|value| value.trim().to_string())
+    }
+
+    #[test]
+    fn bare_clone_default_worktree_tracks_origin_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.clone_as_bare = true;
+        let store = Store::open(&config.state).unwrap();
+        let seed = dir.path().join("seed");
+        fs::create_dir_all(&seed).unwrap();
+        run_git_in(&seed, ["init"]).unwrap();
+        run_git_in(&seed, ["checkout", "-b", "main"]).unwrap();
+        seed_commit(&seed, "README.md", "tracking\n", "initial");
+        let url = file_url_for_path(&seed);
+        let locator = Locator::parse(&url).unwrap();
+
+        clone_repo(&config, &store, &Output { json: true }, &url).unwrap();
+
+        let clone_path = locator_path(&config.clone_root, &locator);
+        let worktree_path = locator_path(&config.dev_worktree_root, &locator).join("main");
+        assert!(git_ref_exists(&clone_path, "refs/remotes/origin/main").unwrap());
+        assert_eq!(
+            upstream_of(&worktree_path, "main").as_deref(),
+            Some("origin/main")
+        );
+        run_git_in(&worktree_path, ["reset", "--hard", "origin/main"]).unwrap();
+    }
+
+    #[test]
+    fn worktree_add_tracks_origin_only_for_branches_origin_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let seed = dir.path().join("seed");
+        fs::create_dir_all(&seed).unwrap();
+        run_git_in(&seed, ["init"]).unwrap();
+        run_git_in(&seed, ["checkout", "-b", "main"]).unwrap();
+        seed_commit(&seed, "README.md", "worktree\n", "initial");
+        let locator = Locator::parse("example.com/bare/repo").unwrap();
+        let repo_path = locator_path(&config.clone_root, &locator);
+        fs::create_dir_all(repo_path.parent().unwrap()).unwrap();
+        // A bare clone made before repo-manager wrote fetch refspecs: no
+        // remote-tracking refs at all.
+        run_git_clone(seed.to_str().unwrap(), &repo_path, true).unwrap();
+        assert!(!git_ref_exists(&repo_path, "refs/remotes/origin/main").unwrap());
+        // A branch that exists only upstream, pushed after the clone.
+        run_git_in(&seed, ["checkout", "-b", "feature"]).unwrap();
+        seed_commit(&seed, "feature.txt", "feature\n", "feature");
+        let add = |name: &str, branch: Option<&str>, start: Option<&str>| {
+            add_worktree(
+                &config,
+                &store,
+                &Output { json: true },
+                None,
+                WorktreeAddArgs {
+                    repo_or_name: "example.com/bare/repo".to_string(),
+                    name_or_start_point: Some(name.to_string()),
+                    start_point: start.map(str::to_string),
+                    branch: branch.map(str::to_string),
+                    detach: false,
+                    force: false,
+                    reset: false,
+                },
+            )
+            .unwrap();
+            locator_path(&config.dev_worktree_root, &locator).join(name)
+        };
+
+        let feature = add("feature", None, Some("feature"));
+        let local = add("local", Some("local"), Some("main"));
+
+        assert_eq!(
+            upstream_of(&feature, "feature").as_deref(),
+            Some("origin/feature")
+        );
+        assert_eq!(
+            configure_worktree_upstream(&feature).unwrap(),
+            WorktreeUpstream::Tracking {
+                branch: "feature".to_string(),
+                upstream: "origin/feature".to_string(),
+            }
+        );
+        assert_eq!(upstream_of(&local, "local"), None);
+        assert!(
+            git_output_optional(&local, ["config", "branch.local.remote"], "reading remote")
+                .unwrap()
+                .is_none(),
+            "a branch origin lacks must not be pre-wired to push there"
+        );
+        assert_eq!(
+            configure_worktree_upstream(&local).unwrap(),
+            WorktreeUpstream::LocalOnly {
+                branch: "local".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn bare_fetch_advances_tracking_ref_not_checked_out_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.clone_as_bare = true;
+        let store = Store::open(&config.state).unwrap();
+        let seed = dir.path().join("seed");
+        fs::create_dir_all(&seed).unwrap();
+        run_git_in(&seed, ["init"]).unwrap();
+        run_git_in(&seed, ["checkout", "-b", "main"]).unwrap();
+        seed_commit(&seed, "README.md", "one\n", "one");
+        let url = file_url_for_path(&seed);
+        let locator = Locator::parse(&url).unwrap();
+        clone_repo(&config, &store, &Output { json: true }, &url).unwrap();
+        let clone_path = locator_path(&config.clone_root, &locator);
+        let before = git_output(&clone_path, ["rev-parse", "refs/heads/main"], "main").unwrap();
+        seed_commit(&seed, "README.md", "two\n", "two");
+        let upstream_tip = git_output(&seed, ["rev-parse", "HEAD"], "seed tip").unwrap();
+
+        fetch_remote_updating_refs(&clone_path, "origin").unwrap();
+
+        assert_eq!(
+            git_output(
+                &clone_path,
+                ["rev-parse", "refs/remotes/origin/main"],
+                "origin/main"
+            )
+            .unwrap(),
+            upstream_tip
+        );
+        assert_eq!(
+            git_output(&clone_path, ["rev-parse", "refs/heads/main"], "main").unwrap(),
+            before,
+            "local main is owned by its worktree and must not be force-updated"
         );
     }
 
