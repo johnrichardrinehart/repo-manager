@@ -36,9 +36,11 @@
       "type": ["boolean", "null"]
     },
     "clone_as_bare": {
+      "description": "Deprecated: clone-root repositories are always bare. Accepted so existing v1 files keep loading; false is rejected at load time.",
       "type": ["boolean", "null"]
     },
     "clone-as-bare": {
+      "description": "Deprecated: clone-root repositories are always bare. Accepted so existing v1 files keep loading; false is rejected at load time.",
       "type": ["boolean", "null"]
     },
     "worktree_use_relative_paths": {

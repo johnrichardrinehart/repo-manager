@@ -18,9 +18,13 @@ git.sr.ht/~sircmpwn/scdoc
 git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux
 ```
 
-Canonical repositories and forks live under `~/code/clones`. Development
-worktrees live under `~/code/dev-worktrees`. Historical locator paths become
-symlinks to the latest real path when a move is applied.
+Canonical repositories live under `~/code/clones` as bare repositories. Forks
+and mirrors live there too, as namespace views: a small JSON file at the
+dependent's locator path whose refs are stored inside the canonical bare
+repository under `refs/repo-manager/<forks|mirrors>/<locator>/`. Nothing under
+the clone root has a working tree. Development worktrees live under
+`~/code/dev-worktrees`. Historical locator paths become symlinks to the latest
+real path when a move is applied.
 
 Existing checkouts can be registered without recloning:
 
@@ -28,10 +32,13 @@ Existing checkouts can be registered without recloning:
 repo manage ~/src/linux
 ```
 
-`repo manage` accepts any subdirectory inside the checkout, moves the Git
-worktree root into its managed locator path when needed, records it in
-repo-manager metadata, and asks `repod` to review repositories under the clone
-root for shared Git history.
+`repo manage` accepts any subdirectory inside the checkout. The checkout must
+be clean: its Git directory moves to the managed locator path and becomes the
+bare repository (canonical) or is folded into its canonical repository's
+namespace as a view (fork or mirror, cloning the canonical first if needed),
+and the branch that was checked out becomes a development worktree under the
+dev-worktree root. Canonical checkouts are then handed to `repod` to review
+repositories under the clone root for shared Git history.
 
 New remote repositories can be created and immediately cloned into the managed
 clone root:
@@ -80,17 +87,10 @@ Existing repositories are not automatically migrated to this configuration.
 same for detected moves, preserving the existing remote URL style when
 possible.
 
-By default, forks and mirrors are Git worktrees under the clone root, not
-development worktrees under the dev-worktree root. Each fork or mirror gets a
-stable remote name derived from its locator, so the canonical checkout and
-every dependent checkout share the same `git remote -v` view: `origin` plus all
-dependent remotes.
-
-Set `clone-as-bare` to `true` in the config file to keep clone-root repositories
-bare. In that mode, `repo clone` creates bare repositories, `repo fork` records
-bare fork repositories instead of fork worktrees, and fork/mirror repair avoids
-creating checked-out dependent trees. Checked-out working trees should be
-created under the dev-worktree root. `repo worktree add` delegates their
+Forks and mirrors are namespace views of their canonical bare repository, not
+separate clones: `repo fork` fetches the fork's refs into the canonical Git dir
+and writes the view file at the fork's locator path. Checked-out working trees
+are created under the dev-worktree root. `repo worktree add` delegates their
 lifecycle to Git while supplying the managed path and, for fork views, mapping
 namespaced refs and configuring fork-safe pushes. Worktrees are not persisted
 in repo-manager's database, so direct `git worktree add`, `git worktree remove`,
@@ -98,9 +98,14 @@ and `git worktree prune` remain authoritative. After removing worktrees,
 `repo worktree clean` removes empty repository and owner directories while
 preserving each authority directory. It leaves active worktrees intact and
 exits nonzero with a list of stale subtrees that contain any file, hidden
-entry, or symlink. `repo check` reports existing non-bare clone-root
-repositories as repairable; `repo check --repair` converts clean managed
-checkouts to bare repositories.
+entry, or symlink.
+
+`repo check` fails on any managed clone-root repository that is neither bare
+nor a view, and on fork or mirror checkouts from before views existed;
+`repo check --repair` converts clean checkouts to bare repositories and
+replaces legacy dependent checkouts with views. The `clone-as-bare` config key
+is accepted for compatibility with existing files and ignored; setting it to
+`false` is an error.
 
 Temporary refs use the `refs/tmp/` namespace. Run `repo refs gc --dry-run` to
 review old temporary refs. Run `repo refs gc` to remove refs older than the
