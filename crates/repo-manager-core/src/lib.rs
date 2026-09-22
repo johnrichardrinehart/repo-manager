@@ -143,6 +143,16 @@ struct ConfigArgs {
         help = "Create remote repositories during `repo create` by default"
     )]
     auto_create_remote: Option<bool>,
+
+    #[arg(
+        long,
+        env = "REPO_MANAGER_WORKTREE_USE_RELATIVE_PATHS",
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        help = "Link Git worktrees with relative paths for portable shared filesystems"
+    )]
+    worktree_use_relative_paths: Option<bool>,
 }
 
 #[derive(Debug, Parser)]
@@ -400,6 +410,15 @@ struct SetupArgs {
         help = "Persist whether `repo create` creates a remote before cloning"
     )]
     auto_create_remote: Option<bool>,
+
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        help = "Persist whether Git worktrees use relative path references"
+    )]
+    worktree_use_relative_paths: Option<bool>,
 }
 
 #[derive(Debug, Args)]
@@ -785,6 +804,7 @@ struct Config {
     assume_origin_as_canonical: bool,
     auto_create_remote: bool,
     clone_as_bare: bool,
+    worktree_use_relative_paths: bool,
     create_default_visibility: RepoVisibility,
     forges: HashMap<String, ForgeConfig>,
 }
@@ -817,6 +837,8 @@ struct FileConfig {
     auto_create_remote: Option<bool>,
     #[serde(alias = "clone-as-bare")]
     clone_as_bare: Option<bool>,
+    #[serde(alias = "worktree-use-relative-paths")]
+    worktree_use_relative_paths: Option<bool>,
     detect_related: Option<bool>,
     clone_start_ttl_minutes: Option<u64>,
     rpc_rate_limit_per_second: Option<u32>,
@@ -1571,6 +1593,7 @@ pub struct WorktreeAddOptions<'a> {
     pub branch: Option<&'a str>,
     pub detach: bool,
     pub force: bool,
+    pub relative_paths: bool,
 }
 
 pub struct HelpCommand {
@@ -1830,6 +1853,10 @@ impl Config {
             .or(file_config.auto_create_remote)
             .unwrap_or(true);
         let clone_as_bare = file_config.clone_as_bare.unwrap_or(false);
+        let worktree_use_relative_paths = args
+            .worktree_use_relative_paths
+            .or(file_config.worktree_use_relative_paths)
+            .unwrap_or(false);
         let create_default_visibility = file_config.create_default_visibility.unwrap_or_default();
         let forges = file_config.forges.unwrap_or_default();
         Ok(Self {
@@ -1844,6 +1871,7 @@ impl Config {
             assume_origin_as_canonical,
             auto_create_remote,
             clone_as_bare,
+            worktree_use_relative_paths,
             create_default_visibility,
             forges,
         })
@@ -1885,6 +1913,9 @@ impl FileConfig {
             .or(self.assume_origin_as_canonical);
         self.auto_create_remote = other.auto_create_remote.or(self.auto_create_remote);
         self.clone_as_bare = other.clone_as_bare.or(self.clone_as_bare);
+        self.worktree_use_relative_paths = other
+            .worktree_use_relative_paths
+            .or(self.worktree_use_relative_paths);
         self.detect_related = other.detect_related.or(self.detect_related);
         self.clone_start_ttl_minutes = other
             .clone_start_ttl_minutes
@@ -2008,6 +2039,9 @@ fn setup_config(config: &Config, output: &Output, args: SetupArgs) -> Result<()>
             .or(Some(config.assume_origin_as_canonical)),
         auto_create_remote: args.auto_create_remote.or(Some(config.auto_create_remote)),
         clone_as_bare: Some(config.clone_as_bare),
+        worktree_use_relative_paths: args
+            .worktree_use_relative_paths
+            .or(Some(config.worktree_use_relative_paths)),
         detect_related: None,
         clone_start_ttl_minutes: None,
         rpc_rate_limit_per_second: None,
@@ -2291,6 +2325,20 @@ fn path_leaf(remote_path: &str) -> String {
         .map_or(remote_path.to_string(), |(_, leaf)| leaf.to_string())
 }
 
+fn git_worktree_add_args(relative_paths: bool) -> Vec<String> {
+    let relative_paths_value = if relative_paths { "true" } else { "false" };
+    let mut args = vec![
+        "-c".to_string(),
+        format!("worktree.useRelativePaths={relative_paths_value}"),
+        "worktree".to_string(),
+        "add".to_string(),
+    ];
+    if relative_paths {
+        args.push("--relative-paths".to_string());
+    }
+    args
+}
+
 pub fn plan_worktree_add(
     clone_root: &Path,
     worktree_root: &Path,
@@ -2301,7 +2349,7 @@ pub fn plan_worktree_add(
     validate_worktree_name(name)?;
     let canonical_path = locator_path(clone_root, &canonical_locator);
     let worktree_path = locator_path(worktree_root, &canonical_locator).join(name);
-    let mut git_args = vec!["worktree".to_string(), "add".to_string()];
+    let mut git_args = git_worktree_add_args(options.relative_paths);
     if options.force {
         git_args.push("--force".to_string());
     }
@@ -2411,6 +2459,7 @@ struct SeedCanonicalPlan<'a> {
     controlling_path: &'a Path,
     controlling_url: &'a str,
     relationship: &'a str,
+    relative_paths: bool,
 }
 
 impl Store {
@@ -4089,6 +4138,7 @@ fn record_manage_remote_relationships(
                         controlling_path: &canonical_path,
                         controlling_url: plan.canonical_url,
                         relationship: plan.relationship.as_str(),
+                        relative_paths: config.worktree_use_relative_paths,
                     },
                 )
                 .map(|_| ());
@@ -4102,6 +4152,7 @@ fn record_manage_remote_relationships(
                 &canonical_path,
                 plan.relationship.as_str(),
                 config.clone_as_bare,
+                config.worktree_use_relative_paths,
             )?;
             return Ok(());
         }
@@ -4203,15 +4254,12 @@ fn seed_canonical_from_dependent_checkout(
             plan.controlling_url,
         )?;
         ensure_tracking_branch(plan.controlling_path, &local_branch, &remote_branch)?;
-        run_git_in(
-            plan.controlling_path,
-            [
-                "worktree",
-                "add",
-                &plan.dependent_path.display().to_string(),
-                &local_branch,
-            ],
-        )?;
+        let mut worktree_args = git_worktree_add_args(plan.relative_paths);
+        worktree_args.push(plan.dependent_path.display().to_string());
+        worktree_args.push(local_branch.clone());
+        let worktree_arg_refs = worktree_args.iter().map(String::as_str);
+        run_git_in(plan.controlling_path, worktree_arg_refs)?;
+        configure_worktree_path_references(plan.controlling_path, plan.relative_paths)?;
         restore_dependent_worktree_state(plan.controlling_path, plan.dependent_path)?;
         checkout_controlling_default_branch(plan.controlling_path, &default_branch)?;
 
@@ -4701,15 +4749,12 @@ fn fork_repo(
         eprintln!("warning: could not determine fork default branch; using {fork_remote}/HEAD");
     }
     let fork_head = format!("{fork_remote}/HEAD");
-    run_git_in(
-        &canonical_path,
-        [
-            "worktree",
-            "add",
-            &fork_path.display().to_string(),
-            &fork_head,
-        ],
-    )?;
+    let mut worktree_args = git_worktree_add_args(config.worktree_use_relative_paths);
+    worktree_args.push(fork_path.display().to_string());
+    worktree_args.push(fork_head);
+    let worktree_arg_refs = worktree_args.iter().map(String::as_str);
+    run_git_in(&canonical_path, worktree_arg_refs)?;
+    configure_worktree_path_references(&canonical_path, config.worktree_use_relative_paths)?;
     db.upsert_repo(&canonical_locator, &canonical_path, None)?;
     let fork_id = db.upsert_repo(&fork_locator, &fork_path, Some(&canonical_locator.key()))?;
     db.record_dependent_relationship(fork_id, parent.parent.id, "fork")?;
@@ -5620,6 +5665,7 @@ fn repos_set_type(
                 &parent.storage.path,
                 &repo_type,
                 true,
+                config.worktree_use_relative_paths,
             )?;
             if parent.parent.id != parent.storage.id {
                 let repo_id = db.upsert_repo(
@@ -6100,6 +6146,7 @@ fn apply_repair_operations(
                     &relationship.controlling_path,
                     &relationship.relationship,
                     config.clone_as_bare,
+                    config.worktree_use_relative_paths,
                 ) {
                     Ok(shared_git_dir) => report.relationships.push(RepairRelationship {
                         relationship: relationship.relationship.clone(),
@@ -6392,6 +6439,7 @@ fn build_repair_report(config: &Config, db: &Store, check: bool) -> Result<Repai
             &relationship.controlling_path,
             &relationship.relationship,
             config.clone_as_bare,
+            config.worktree_use_relative_paths,
         ) {
             Ok(shared_git_dir) => relationships.push(RepairRelationship {
                 relationship: relationship.relationship,
@@ -6756,6 +6804,7 @@ fn add_worktree(
             branch: args.branch.as_deref(),
             detach: args.detach,
             force: args.force,
+            relative_paths: config.worktree_use_relative_paths,
         },
     )?;
     fs::create_dir_all(
@@ -6766,7 +6815,7 @@ fn add_worktree(
     ensure_origin_tracking_refs(&plan.canonical_path)?;
     let arg_refs: Vec<&str> = plan.git_args.iter().map(String::as_str).collect();
     run_git_in(&plan.canonical_path, arg_refs)?;
-    configure_worktree_config(&plan.canonical_path)?;
+    configure_worktree_config(&plan.canonical_path, config.worktree_use_relative_paths)?;
     let upstream = configure_worktree_upstream(&plan.worktree_path)?;
     if args.reset {
         let start = args
@@ -6815,7 +6864,7 @@ fn add_managed_context_worktree(
             .parent()
             .context("worktree path has no parent")?,
     )?;
-    let mut git_args = vec!["worktree".to_string(), "add".to_string()];
+    let mut git_args = git_worktree_add_args(config.worktree_use_relative_paths);
     if args.force {
         git_args.push("--force".to_string());
     }
@@ -6833,7 +6882,7 @@ fn add_managed_context_worktree(
     ensure_origin_tracking_refs(&repo.path)?;
     let arg_refs: Vec<&str> = git_args.iter().map(String::as_str).collect();
     run_git_in(&repo.path, arg_refs)?;
-    configure_worktree_config(&repo.path)?;
+    configure_worktree_config(&repo.path, config.worktree_use_relative_paths)?;
     let upstream = configure_worktree_upstream(&worktree_path)?;
     if args.reset {
         let start = start_point.ok_or_else(|| anyhow!("--reset requires a start point"))?;
@@ -6889,22 +6938,22 @@ fn add_repo_view_worktree(
             .parent()
             .context("worktree path has no parent")?,
     )?;
-    let mut command = git_dir_command(&view.canonical_path);
-    command.args(["worktree", "add"]);
+    let mut git_args = git_worktree_add_args(config.worktree_use_relative_paths);
     if args.force {
-        command.arg("--force");
+        git_args.push("--force".to_string());
     }
-    command
-        .arg("--detach")
-        .arg(&worktree_path)
-        .arg(&checkout_ref);
+    git_args.push("--detach".to_string());
+    git_args.push(worktree_path.display().to_string());
+    git_args.push(checkout_ref.clone());
+    let mut command = git_dir_command(&view.canonical_path);
+    command.args(&git_args);
     let status = command
         .status()
         .with_context(|| format!("creating worktree {}", worktree_path.display()))?;
     if !status.success() {
         bail!("git worktree add failed with status {status}");
     }
-    configure_worktree_config(&view.canonical_path)?;
+    configure_worktree_config(&view.canonical_path, config.worktree_use_relative_paths)?;
     if let Some(branch_ref) = branch_ref {
         set_worktree_head(&worktree_path, &branch_ref)?;
         configure_repo_view_worktree_remote(view, &worktree_path, &branch_ref)?;
@@ -6918,12 +6967,7 @@ fn add_repo_view_worktree(
             canonical_locator: view.locator.clone(),
             canonical_path: view.canonical_path.clone(),
             worktree_path,
-            git_args: vec![
-                "worktree".to_string(),
-                "add".to_string(),
-                "--detach".to_string(),
-                checkout_ref,
-            ],
+            git_args,
         },
         None,
     )
@@ -6960,7 +7004,7 @@ fn configure_repo_view_worktree_remote(
     )
 }
 
-fn configure_worktree_config(canonical_path: &Path) -> Result<()> {
+fn configure_worktree_config(canonical_path: &Path, relative_paths: bool) -> Result<()> {
     let bare = is_bare_repository(canonical_path)?;
     let common_config = canonical_path.join("config");
     let main_worktree_config = canonical_path.join("config.worktree");
@@ -6976,7 +7020,19 @@ fn configure_worktree_config(canonical_path: &Path) -> Result<()> {
         unset_git_config_value(&common_config, "core.bare")?;
         unset_git_config_value(&common_config, "core.worktree")?;
     }
+    configure_worktree_path_references(canonical_path, relative_paths)?;
     Ok(())
+}
+
+fn configure_worktree_path_references(canonical_path: &Path, relative_paths: bool) -> Result<()> {
+    run_git_in(
+        canonical_path,
+        [
+            "config",
+            "worktree.useRelativePaths",
+            if relative_paths { "true" } else { "false" },
+        ],
+    )
 }
 
 fn set_worktree_head(worktree_path: &Path, refname: &str) -> Result<()> {
@@ -7189,6 +7245,7 @@ fn resolve_related_shared_git_dir(
         &suggestion.related_path,
         relationship,
         config.clone_as_bare,
+        config.worktree_use_relative_paths,
     )
 }
 
@@ -7200,6 +7257,7 @@ fn materialize_related_shared_git_dir(
     controlling_path: &Path,
     relationship: &str,
     clone_as_bare: bool,
+    relative_paths: bool,
 ) -> Result<SharedGitDirResolution> {
     if !dependent_path.exists() {
         bail!(
@@ -7254,8 +7312,22 @@ fn materialize_related_shared_git_dir(
             &dependent_remote,
             &local_branch,
             &remote_branch,
+            relative_paths,
         )?
     };
+    if already_shared && relative_paths {
+        let dependent_path_arg = dependent_path.display().to_string();
+        run_git_in(
+            controlling_path,
+            [
+                "worktree",
+                "repair",
+                "--relative-paths",
+                dependent_path_arg.as_str(),
+            ],
+        )?;
+    }
+    configure_worktree_path_references(controlling_path, relative_paths)?;
 
     let controlling_id = db.upsert_repo(controlling_locator, controlling_path, None)?;
     let dependent_id = db.upsert_repo(
@@ -7384,6 +7456,7 @@ fn convert_checkout_to_worktree(
     dependent_remote: &str,
     local_branch: &str,
     remote_branch: &str,
+    relative_paths: bool,
 ) -> Result<bool> {
     ensure_clean_checkout(dependent_path)?;
     fetch_local_dependent_refs(controlling_path, dependent_path, dependent_remote)?;
@@ -7397,15 +7470,11 @@ fn convert_checkout_to_worktree(
         )
     })?;
 
-    let add_result = run_git_in(
-        controlling_path,
-        [
-            "worktree",
-            "add",
-            &dependent_path.display().to_string(),
-            local_branch,
-        ],
-    );
+    let mut worktree_args = git_worktree_add_args(relative_paths);
+    worktree_args.push(dependent_path.display().to_string());
+    worktree_args.push(local_branch.to_string());
+    let worktree_arg_refs = worktree_args.iter().map(String::as_str);
+    let add_result = run_git_in(controlling_path, worktree_arg_refs);
     if let Err(error) = add_result {
         if !dependent_path.exists() {
             let _ = fs::rename(&backup_path, dependent_path);
@@ -7418,6 +7487,7 @@ fn convert_checkout_to_worktree(
             )
         });
     }
+    configure_worktree_path_references(controlling_path, relative_paths)?;
 
     fs::remove_dir_all(&backup_path)
         .with_context(|| format!("removing replaced checkout {}", backup_path.display()))?;
@@ -8035,12 +8105,12 @@ fn init_default_branch_worktree(
             .parent()
             .context("worktree path has no parent")?,
     )?;
-    let worktree_arg = worktree_path.display().to_string();
-    run_git_in(
-        canonical_path,
-        ["worktree", "add", worktree_arg.as_str(), branch.as_str()],
-    )?;
-    configure_worktree_config(canonical_path)?;
+    let mut worktree_args = git_worktree_add_args(config.worktree_use_relative_paths);
+    worktree_args.push(worktree_path.display().to_string());
+    worktree_args.push(branch.clone());
+    let worktree_arg_refs = worktree_args.iter().map(String::as_str);
+    run_git_in(canonical_path, worktree_arg_refs)?;
+    configure_worktree_config(canonical_path, config.worktree_use_relative_paths)?;
     configure_worktree_upstream(&worktree_path)?;
     Ok(Some(worktree_path))
 }
@@ -10321,14 +10391,18 @@ mod tests {
                 branch: Some("topic-branch"),
                 detach: false,
                 force: true,
+                relative_paths: true,
             },
         )
         .unwrap();
         assert_eq!(
             plan.git_args,
             vec![
+                "-c",
+                "worktree.useRelativePaths=true",
                 "worktree",
                 "add",
+                "--relative-paths",
                 "--force",
                 "-b",
                 "topic-branch",
@@ -11273,6 +11347,7 @@ mod tests {
                 controlling_path: &canonical_path,
                 controlling_url: &canonical_url,
                 relationship: "fork",
+                relative_paths: false,
             },
         )
         .unwrap();
@@ -11408,6 +11483,7 @@ mod tests {
             &canonical_path,
             "fork",
             false,
+            false,
         )
         .unwrap();
 
@@ -11502,6 +11578,7 @@ mod tests {
             assume_origin_as_canonical: false,
             auto_create_remote: true,
             clone_as_bare: false,
+            worktree_use_relative_paths: false,
             create_default_visibility: RepoVisibility::Private,
             forges: HashMap::new(),
         };
@@ -11571,6 +11648,7 @@ mod tests {
             assume_origin_as_canonical: false,
             auto_create_remote: true,
             clone_as_bare: false,
+            worktree_use_relative_paths: false,
             create_default_visibility: RepoVisibility::Private,
             forges: HashMap::new(),
         };
@@ -11609,6 +11687,7 @@ mod tests {
             "assume_origin_as_canonical": false,
             "auto-create-remote": false,
             "clone-as-bare": true,
+            "worktree-use-relative-paths": true,
             "detect_related": true,
             "clone_start_ttl_minutes": 45,
             "rpc_rate_limit_per_second": 7,
@@ -11634,6 +11713,7 @@ mod tests {
             assume_origin_as_canonical: Some(false),
             auto_create_remote: Some(false),
             clone_as_bare: None,
+            worktree_use_relative_paths: Some(true),
             detect_related: Some(true),
             clone_start_ttl_minutes: Some(45),
             rpc_rate_limit_per_second: Some(7),
@@ -11659,6 +11739,7 @@ mod tests {
                 client_id: Some("00000000-0000-4000-8000-000000000002".to_string()),
                 assume_origin_as_canonical: Some(true),
                 auto_create_remote: Some(true),
+                worktree_use_relative_paths: Some(false),
             },
             dir: None,
             json: false,
@@ -11671,6 +11752,7 @@ mod tests {
                 client_id: None,
                 assume_origin_as_canonical: None,
                 auto_create_remote: None,
+                worktree_use_relative_paths: None,
             })),
         };
         let config = Config::from_cli(&cli).unwrap();
@@ -11689,6 +11771,7 @@ mod tests {
         assert!(config.assume_origin_as_canonical);
         assert!(config.auto_create_remote);
         assert!(config.clone_as_bare);
+        assert!(!config.worktree_use_relative_paths);
         assert_eq!(config.create_default_visibility, RepoVisibility::Public);
         assert_eq!(
             config
@@ -11728,17 +11811,20 @@ mod tests {
             serde_json::json!({
                 "config_version": 1,
                 "clone_as_bare": true,
-                "background_fetch_minimum_interval_seconds": 3600
+                "background_fetch_minimum_interval_seconds": 3600,
+                "worktree_use_relative_paths": true
             }),
             serde_json::json!({
                 "config-version": 1,
                 "clone-as-bare": true,
-                "background-fetch-minimum-interval-seconds": 3600
+                "background-fetch-minimum-interval-seconds": 3600,
+                "worktree-use-relative-paths": true
             }),
             serde_json::json!({
                 "config_version": null,
                 "clone_as_bare": null,
-                "background_fetch_minimum_interval_seconds": null
+                "background_fetch_minimum_interval_seconds": null,
+                "worktree_use_relative_paths": null
             }),
             serde_json::json!({
                 "config_version": 1,
@@ -11837,6 +11923,7 @@ mod tests {
             assume_origin_as_canonical: false,
             auto_create_remote: true,
             clone_as_bare: false,
+            worktree_use_relative_paths: false,
             create_default_visibility: RepoVisibility::Private,
             forges: HashMap::new(),
         };
@@ -11854,6 +11941,7 @@ mod tests {
                 client_id: Some("00000000-0000-4000-8000-000000000004".to_string()),
                 assume_origin_as_canonical: Some(true),
                 auto_create_remote: Some(false),
+                worktree_use_relative_paths: Some(true),
             },
         )
         .unwrap();
@@ -11874,6 +11962,7 @@ mod tests {
         );
         assert_eq!(saved.assume_origin_as_canonical, Some(true));
         assert_eq!(saved.auto_create_remote, Some(false));
+        assert_eq!(saved.worktree_use_relative_paths, Some(true));
         assert_eq!(saved.detect_related, None);
         assert_eq!(saved.clone_start_ttl_minutes, None);
         assert_eq!(saved.rpc_rate_limit_per_second, None);
@@ -11897,6 +11986,7 @@ mod tests {
             assume_origin_as_canonical: Some(false),
             auto_create_remote: Some(true),
             clone_as_bare: None,
+            worktree_use_relative_paths: Some(false),
             detect_related: Some(false),
             clone_start_ttl_minutes: Some(60),
             rpc_rate_limit_per_second: Some(1),
@@ -11915,6 +12005,7 @@ mod tests {
             assume_origin_as_canonical: Some(true),
             auto_create_remote: Some(false),
             clone_as_bare: None,
+            worktree_use_relative_paths: Some(true),
             detect_related: Some(true),
             clone_start_ttl_minutes: Some(10),
             rpc_rate_limit_per_second: Some(9),
@@ -11928,6 +12019,7 @@ mod tests {
         assert_eq!(base.root, Some(dir.path().join("code/user")));
         assert_eq!(base.rpc_url, Some("unix:///run/base.sock".to_string()));
         assert_eq!(base.auto_create_remote, Some(false));
+        assert_eq!(base.worktree_use_relative_paths, Some(true));
         assert_eq!(base.clone_start_ttl_minutes, Some(10));
         assert_eq!(
             base.client_id,
@@ -12500,6 +12592,89 @@ mod tests {
     }
 
     #[test]
+    fn relative_worktree_paths_survive_shared_root_prefix_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let host_prefix = dir.path().join("host");
+        let guest_prefix = dir.path().join("guest");
+        let mut config = test_config(&host_prefix);
+        config.worktree_use_relative_paths = true;
+        let store = Store::open(&config.state).unwrap();
+        let seed = dir.path().join("seed");
+        fs::create_dir_all(&seed).unwrap();
+        run_git_in(&seed, ["init"]).unwrap();
+        run_git_in(&seed, ["checkout", "-b", "main"]).unwrap();
+        fs::write(seed.join("README.md"), "portable worktree\n").unwrap();
+        run_git_in(&seed, ["add", "."]).unwrap();
+        run_git_in(
+            &seed,
+            [
+                "-c",
+                "user.name=repo-manager",
+                "-c",
+                "user.email=repo-manager@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        )
+        .unwrap();
+        let locator = Locator::parse("example.com/portable/repo").unwrap();
+        let repo_path = locator_path(&config.clone_root, &locator);
+        clone_local_repo(&seed, &repo_path);
+        store.upsert_repo(&locator, &repo_path, None).unwrap();
+
+        add_worktree(
+            &config,
+            &store,
+            &Output { json: true },
+            Some(&repo_path),
+            WorktreeAddArgs {
+                repo_or_name: "portable-topic".to_string(),
+                name_or_start_point: None,
+                start_point: None,
+                branch: Some("portable-topic".to_string()),
+                detach: false,
+                force: false,
+                reset: false,
+            },
+        )
+        .unwrap();
+
+        let worktree_path =
+            locator_path(&config.dev_worktree_root, &locator).join("portable-topic");
+        let git_dir_reference = fs::read_to_string(worktree_path.join(".git")).unwrap();
+        let git_dir_reference = git_dir_reference
+            .trim()
+            .strip_prefix("gitdir: ")
+            .map(Path::new)
+            .unwrap();
+        assert!(git_dir_reference.is_relative());
+        assert_eq!(
+            git_output(
+                &repo_path,
+                ["config", "--bool", "worktree.useRelativePaths"],
+                "reading relative worktree configuration"
+            )
+            .unwrap()
+            .trim(),
+            "true"
+        );
+
+        drop(store);
+        fs::rename(&host_prefix, &guest_prefix).unwrap();
+        let guest_worktree = guest_prefix.join(worktree_path.strip_prefix(&host_prefix).unwrap());
+        assert_eq!(
+            git_output(
+                &guest_worktree,
+                ["status", "--porcelain"],
+                "using worktree after shared root prefix change"
+            )
+            .unwrap(),
+            ""
+        );
+    }
+
+    #[test]
     fn repo_worktree_add_preserves_bare_canonical_repository() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
@@ -13011,6 +13186,7 @@ mod tests {
             assume_origin_as_canonical: false,
             auto_create_remote: true,
             clone_as_bare: false,
+            worktree_use_relative_paths: false,
             create_default_visibility: RepoVisibility::Private,
             forges: HashMap::new(),
         }

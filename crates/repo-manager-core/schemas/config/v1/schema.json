@@ -41,6 +41,12 @@
     "clone-as-bare": {
       "type": ["boolean", "null"]
     },
+    "worktree_use_relative_paths": {
+      "type": ["boolean", "null"]
+    },
+    "worktree-use-relative-paths": {
+      "type": ["boolean", "null"]
+    },
     "detect_related": {
       "type": ["boolean", "null"]
     },
