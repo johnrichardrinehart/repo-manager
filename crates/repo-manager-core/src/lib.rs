@@ -807,6 +807,7 @@ struct Config {
     worktree_use_relative_paths: bool,
     create_default_visibility: RepoVisibility,
     forges: HashMap<String, ForgeConfig>,
+    identities: IdentityMap,
 }
 
 #[derive(Debug, Clone)]
@@ -847,6 +848,7 @@ struct FileConfig {
     #[serde(alias = "create-default-visibility")]
     create_default_visibility: Option<RepoVisibility>,
     forges: Option<HashMap<String, ForgeConfig>>,
+    identities: Option<IdentityMap>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -888,6 +890,53 @@ enum ForgeBackend {
     Forgejo,
 }
 
+/// Git identity settings keyed by locator prefix.
+///
+/// Keys are `<authority>`, `<authority>/<owner>`, `<authority>/<owner>/<repo>`,
+/// or any deeper `/`-separated prefix of a locator key. Resolution walks the
+/// prefixes of a locator from least to most specific; every field set on a
+/// more specific entry overrides the same field from a less specific one, so
+/// an owner entry that only sets `signing-key` still inherits the authority's
+/// `ssh-identity-file`.
+type IdentityMap = BTreeMap<String, IdentityConfig>;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct IdentityConfig {
+    #[serde(alias = "ssh_identity_file", skip_serializing_if = "Option::is_none")]
+    ssh_identity_file: Option<PathBuf>,
+    #[serde(alias = "signing_key", skip_serializing_if = "Option::is_none")]
+    signing_key: Option<String>,
+    #[serde(alias = "signing_format", skip_serializing_if = "Option::is_none")]
+    signing_format: Option<SigningFormat>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum SigningFormat {
+    Openpgp,
+    Ssh,
+    X509,
+}
+
+impl SigningFormat {
+    fn git_value(self) -> &'static str {
+        match self {
+            Self::Openpgp => "openpgp",
+            Self::Ssh => "ssh",
+            Self::X509 => "x509",
+        }
+    }
+}
+
+/// The identity a locator resolves to after layering every matching prefix.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RepoIdentity {
+    ssh_identity_file: Option<PathBuf>,
+    signing_key: Option<String>,
+    signing_format: Option<SigningFormat>,
+}
+
 #[derive(Debug, Serialize)]
 struct ReconcileReport {
     action: &'static str,
@@ -918,6 +967,7 @@ struct RepairReport {
     stale_paths: Vec<RepairStalePath>,
     untracked_checkouts: Vec<RepairUntrackedCheckout>,
     relationships: Vec<RepairRelationship>,
+    identities: Vec<RepairIdentity>,
     skipped: Vec<RepairSkip>,
 }
 
@@ -1078,6 +1128,24 @@ enum RepairRepositoryFormatStatus {
 enum RepairUntrackedCheckoutStatus {
     NeedsTracking,
     Tracked,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RepairIdentity {
+    repo_id: i64,
+    locator: Locator,
+    path: PathBuf,
+    scope: IdentityScope,
+    status: RepairIdentityStatus,
+    reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum RepairIdentityStatus {
+    NeedsUpdate,
+    Updated,
     Skipped,
 }
 
@@ -1866,6 +1934,7 @@ impl Config {
             .unwrap_or(true);
         let create_default_visibility = file_config.create_default_visibility.unwrap_or_default();
         let forges = file_config.forges.unwrap_or_default();
+        let identities = normalize_identities(file_config.identities.unwrap_or_default())?;
         Ok(Self {
             config_path,
             state,
@@ -1881,6 +1950,7 @@ impl Config {
             worktree_use_relative_paths,
             create_default_visibility,
             forges,
+            identities,
         })
     }
 }
@@ -1939,6 +2009,10 @@ impl FileConfig {
         if let Some(other_forges) = other.forges {
             let forges = self.forges.get_or_insert_with(HashMap::new);
             forges.extend(other_forges);
+        }
+        if let Some(other_identities) = other.identities {
+            let identities = self.identities.get_or_insert_with(BTreeMap::new);
+            identities.extend(other_identities);
         }
     }
 
@@ -2055,6 +2129,7 @@ fn setup_config(config: &Config, output: &Output, args: SetupArgs) -> Result<()>
         background_fetch_minimum_interval_seconds: None,
         create_default_visibility: Some(config.create_default_visibility),
         forges: (!config.forges.is_empty()).then(|| config.forges.clone()),
+        identities: (!config.identities.is_empty()).then(|| config.identities.clone()),
     };
     file_config.save(&config_path)?;
     let result = SetupResult {
@@ -2280,6 +2355,351 @@ pub fn locator_path(root: &Path, locator: &Locator) -> PathBuf {
         .fold(root.join(&locator.authority), |path, part| path.join(part))
 }
 
+/// Lowercase the authority segment of every identity prefix so keys compare
+/// equal to `Locator::key()`, which always lowercases the authority.
+fn normalize_identities(identities: IdentityMap) -> Result<IdentityMap> {
+    let mut normalized = BTreeMap::new();
+    for (key, identity) in identities {
+        let normalized_key = match key.split_once('/') {
+            Some((authority, remote_path)) => {
+                format!("{}/{remote_path}", authority.to_ascii_lowercase())
+            }
+            None => key.to_ascii_lowercase(),
+        };
+        if normalized
+            .insert(normalized_key.clone(), identity)
+            .is_some()
+        {
+            bail!("identity prefix {normalized_key:?} is configured more than once");
+        }
+    }
+    Ok(normalized)
+}
+
+/// Layer every identity prefix that matches `locator`, least specific first.
+fn resolve_identity(identities: &IdentityMap, locator: &Locator) -> RepoIdentity {
+    let mut identity = RepoIdentity::default();
+    if identities.is_empty() {
+        return identity;
+    }
+    let key = locator.key();
+    let boundaries = key
+        .match_indices('/')
+        .map(|(index, _)| index)
+        .chain(std::iter::once(key.len()));
+    for end in boundaries {
+        let Some(layer) = identities.get(&key[..end]) else {
+            continue;
+        };
+        if layer.ssh_identity_file.is_some() {
+            identity.ssh_identity_file = layer.ssh_identity_file.clone();
+        }
+        if layer.signing_key.is_some() {
+            identity.signing_key = layer.signing_key.clone();
+        }
+        if layer.signing_format.is_some() {
+            identity.signing_format = layer.signing_format;
+        }
+    }
+    identity
+}
+
+const IDENTITY_SIGNING_GIT_KEYS: [&str; 4] = [
+    "user.signingKey",
+    "gpg.format",
+    "commit.gpgsign",
+    "tag.gpgsign",
+];
+
+/// Repository Git configuration a locator's identity requires.
+///
+/// Returns `(key, value)` pairs; `None` means the key must be absent at this
+/// scope so Git falls back to the next one. A key group is only owned, and so
+/// only ever written or removed, when at least one identity entry configures
+/// it: users who only configure SSH identities keep their signing setup, and
+/// an empty `identities` map never touches repositories at all.
+fn identity_git_settings(
+    identities: &IdentityMap,
+    locator: &Locator,
+) -> Result<Vec<(&'static str, Option<String>)>> {
+    let owns_ssh = identities
+        .values()
+        .any(|identity| identity.ssh_identity_file.is_some());
+    let owns_signing = identities
+        .values()
+        .any(|identity| identity.signing_key.is_some());
+    let identity = resolve_identity(identities, locator);
+    let mut settings = Vec::new();
+    if owns_ssh {
+        let command = identity
+            .ssh_identity_file
+            .as_deref()
+            .map(ssh_command_for_identity_file)
+            .transpose()?;
+        settings.push(("core.sshCommand", command));
+    }
+    if owns_signing {
+        match identity.signing_key.as_deref() {
+            Some(key) => {
+                let format = identity
+                    .signing_format
+                    .or_else(|| infer_signing_format(key));
+                settings.push(("user.signingKey", Some(key.to_string())));
+                settings.push((
+                    "gpg.format",
+                    format.map(|format| format.git_value().to_string()),
+                ));
+                settings.push(("commit.gpgsign", Some("true".to_string())));
+                settings.push(("tag.gpgsign", Some("true".to_string())));
+            }
+            None => settings.extend(IDENTITY_SIGNING_GIT_KEYS.into_iter().map(|key| (key, None))),
+        }
+    }
+    Ok(settings)
+}
+
+/// SSH command Git should use for network operations against `locator`
+/// before a repository exists locally (`GIT_SSH_COMMAND`).
+fn identity_ssh_command(identities: &IdentityMap, locator: &Locator) -> Result<Option<String>> {
+    resolve_identity(identities, locator)
+        .ssh_identity_file
+        .as_deref()
+        .map(ssh_command_for_identity_file)
+        .transpose()
+}
+
+/// Paths are written as configured, `~` included: the managed tree can be
+/// shared between hosts whose home directories differ, and both ssh (`-i`)
+/// and Git (`user.signingKey`) expand `~` themselves.
+fn ssh_command_for_identity_file(identity_file: &Path) -> Result<String> {
+    let path = identity_file.to_str().ok_or_else(|| {
+        anyhow!(
+            "SSH identity file path is not valid UTF-8: {}",
+            identity_file.display()
+        )
+    })?;
+    // IdentitiesOnly stops the agent from offering other keys first, which
+    // otherwise authenticates as whichever account owns the agent's first key.
+    Ok(format!(
+        "ssh -o IdentitiesOnly=yes -i {}",
+        shell_quote_path(path)
+    ))
+}
+
+/// Quote only when the shell would otherwise split or interpret the path;
+/// quoting a `~` path would stop ssh from expanding it.
+fn shell_quote_path(path: &str) -> String {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "~/._-+@%:,".contains(c);
+    if !path.is_empty() && path.chars().all(safe) {
+        path.to_string()
+    } else {
+        format!("'{}'", path.replace('\'', "'\\''"))
+    }
+}
+
+/// SSH signing keys are file paths or literal `key::ssh-… AAAA…` values;
+/// OpenPGP key ids and X.509 identities look like neither.
+fn infer_signing_format(signing_key: &str) -> Option<SigningFormat> {
+    let ssh_like = signing_key.starts_with("key::")
+        || signing_key.starts_with("ssh-")
+        || signing_key.starts_with("sk-ssh-")
+        || signing_key.starts_with("sk-ecdsa-")
+        || signing_key.starts_with("ecdsa-sha2-")
+        || signing_key.ends_with(".pub")
+        || signing_key.starts_with("~/")
+        || signing_key.starts_with('/')
+        || signing_key.starts_with("./");
+    ssh_like.then_some(SigningFormat::Ssh)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum IdentityScope {
+    /// The repository's own config, shared by every worktree of its Git dir.
+    Repository,
+    /// `config.worktree` of one linked worktree, for dependents such as
+    /// forks that share a canonical Git dir but push somewhere else.
+    Worktree,
+}
+
+impl IdentityScope {
+    /// Scope selector for both reads and writes. Reads must be scoped too:
+    /// an unscoped `git config --get` also sees global includes, which would
+    /// report identity config Git already resolves the same way as drift.
+    fn git_args(self) -> &'static [&'static str] {
+        match self {
+            Self::Repository => &["--local"],
+            Self::Worktree => &["--worktree"],
+        }
+    }
+}
+
+/// Pick the scope identity config belongs in for a managed path, or `None`
+/// for namespace views, which are not Git directories (their worktrees get
+/// worktree-scoped config when created).
+fn identity_scope_for_path(path: &Path) -> Result<Option<IdentityScope>> {
+    if read_repo_view_metadata(path)?.is_some() {
+        return Ok(None);
+    }
+    let git_dir = comparable_path(&git_dir(path)?);
+    let common_dir = comparable_path(&git_common_dir(path)?);
+    Ok(Some(if git_dir == common_dir {
+        IdentityScope::Repository
+    } else {
+        IdentityScope::Worktree
+    }))
+}
+
+fn apply_repo_identity(
+    identities: &IdentityMap,
+    locator: &Locator,
+    repo_path: &Path,
+) -> Result<()> {
+    apply_identity(identities, locator, repo_path, IdentityScope::Repository)
+}
+
+fn apply_worktree_identity(
+    identities: &IdentityMap,
+    locator: &Locator,
+    worktree_path: &Path,
+) -> Result<()> {
+    apply_identity(identities, locator, worktree_path, IdentityScope::Worktree)
+}
+
+/// Apply identity config to a managed path whose layout is only known at
+/// runtime: a standalone repository, a linked worktree, or a view. Paths that
+/// do not exist yet (deferred canonical repositories) have nothing to hold it.
+fn apply_identity_for_layout(
+    identities: &IdentityMap,
+    locator: &Locator,
+    path: &Path,
+) -> Result<()> {
+    if identities.is_empty() || !path.exists() {
+        return Ok(());
+    }
+    match identity_scope_for_path(path)? {
+        Some(scope) => apply_identity(identities, locator, path, scope),
+        None => Ok(()),
+    }
+}
+
+fn apply_identity(
+    identities: &IdentityMap,
+    locator: &Locator,
+    path: &Path,
+    scope: IdentityScope,
+) -> Result<()> {
+    let settings = identity_git_settings(identities, locator)?;
+    if settings.is_empty() {
+        return Ok(());
+    }
+    if scope == IdentityScope::Worktree {
+        ensure_worktree_config_extension(path)?;
+    }
+    for (key, value) in settings {
+        set_or_unset_git_config(path, scope, key, value.as_deref())?;
+    }
+    Ok(())
+}
+
+/// Reasons a managed path's Git config differs from its identity.
+fn identity_drift(
+    identities: &IdentityMap,
+    locator: &Locator,
+    path: &Path,
+    scope: IdentityScope,
+) -> Result<Vec<String>> {
+    let mut reasons = Vec::new();
+    for (key, expected) in identity_git_settings(identities, locator)? {
+        let actual = read_git_config(path, scope, key)?;
+        if actual == expected {
+            continue;
+        }
+        reasons.push(match (actual, expected) {
+            (None, Some(expected)) => format!("{key} is unset; identity config sets `{expected}`"),
+            (Some(actual), None) => format!("{key} is `{actual}`; identity config leaves it unset"),
+            (Some(actual), Some(expected)) => {
+                format!("{key} is `{actual}`; identity config sets `{expected}`")
+            }
+            (None, None) => unreachable!("equal values were skipped"),
+        });
+    }
+    Ok(reasons)
+}
+
+fn read_git_config(cwd: &Path, scope: IdentityScope, key: &str) -> Result<Option<String>> {
+    let output = git_command(cwd)
+        .arg("config")
+        .args(scope.git_args())
+        .args(["--get", key])
+        .output()
+        .with_context(|| format!("reading {key} in {}", cwd.display()))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let value = String::from_utf8(output.stdout)
+        .with_context(|| format!("{key} in {} is not valid UTF-8", cwd.display()))?;
+    Ok(Some(value.trim_end_matches('\n').to_string()))
+}
+
+fn set_or_unset_git_config(
+    cwd: &Path,
+    scope: IdentityScope,
+    key: &str,
+    value: Option<&str>,
+) -> Result<()> {
+    let mut command = git_command(cwd);
+    command.arg("config").args(scope.git_args());
+    match value {
+        Some(value) => command.arg(key).arg(value),
+        None => command.args(["--unset", key]),
+    };
+    let status = command
+        .status()
+        .with_context(|| format!("configuring {key} in {}", cwd.display()))?;
+    // `git config --unset` exits 5 when the key is already absent.
+    if status.success() || (value.is_none() && status.code() == Some(5)) {
+        return Ok(());
+    }
+    bail!("git config {key} failed with status {status}")
+}
+
+/// Enable `extensions.worktreeConfig` for the repository owning a linked
+/// worktree so `git config --worktree` has somewhere to write. Bare
+/// repositories must carry `core.bare` in the main worktree config once the
+/// extension is on, otherwise every linked worktree reads as bare.
+fn ensure_worktree_config_extension(worktree_path: &Path) -> Result<()> {
+    if read_git_config(
+        worktree_path,
+        IdentityScope::Repository,
+        "extensions.worktreeConfig",
+    )?
+    .is_some_and(|value| value == "true")
+    {
+        return Ok(());
+    }
+    let common_dir = git_common_dir(worktree_path)?;
+    let common_config = common_dir.join("config");
+    let bare = Command::new("git")
+        .args(["config", "--file"])
+        .arg(&common_config)
+        .args(["--bool", "--get", "core.bare"])
+        .output()
+        .with_context(|| format!("reading core.bare in {}", common_config.display()))?;
+    let bare = bare.status.success() && String::from_utf8_lossy(&bare.stdout).trim() == "true";
+    if bare {
+        let main_worktree_config = common_dir.join("config.worktree");
+        set_git_config_value(&main_worktree_config, "core.bare", "true")?;
+        unset_git_config_value(&main_worktree_config, "core.worktree")?;
+    }
+    set_git_config_value(&common_config, "extensions.worktreeConfig", "true")?;
+    if bare {
+        unset_git_config_value(&common_config, "core.bare")?;
+        unset_git_config_value(&common_config, "core.worktree")?;
+    }
+    Ok(())
+}
+
 pub fn plan_move(
     clone_root: &Path,
     old_locator: Locator,
@@ -2467,6 +2887,7 @@ struct SeedCanonicalPlan<'a> {
     controlling_url: &'a str,
     relationship: &'a str,
     relative_paths: bool,
+    identities: &'a IdentityMap,
 }
 
 impl Store {
@@ -3259,15 +3680,17 @@ fn clone_repo_inner(config: &Config, db: &Store, url: &str) -> Result<CloneResul
         path: path.clone(),
         scan_root: config.clone_root.clone(),
     };
+    let ssh_command = identity_ssh_command(&config.identities, &locator)?;
+    let ssh_command = ssh_command.as_deref();
     let clone_result = if !config.clone_as_bare && which::which("ghq").is_ok() {
         match run_clone_command_with_cancellation(
-            ghq_get_command(&config.clone_root, url),
+            ghq_get_command(&config.clone_root, url, ssh_command),
             "ghq get",
             &lifecycle,
         )? {
             CloneCommandOutcome::Success => Ok(()),
             CloneCommandOutcome::Failed => run_clone_command_with_cancellation(
-                git_clone_command(url, &path, config.clone_as_bare),
+                git_clone_command(url, &path, config.clone_as_bare, ssh_command),
                 "git clone",
                 &lifecycle,
             )
@@ -3275,7 +3698,7 @@ fn clone_repo_inner(config: &Config, db: &Store, url: &str) -> Result<CloneResul
         }
     } else {
         run_clone_command_with_cancellation(
-            git_clone_command(url, &path, config.clone_as_bare),
+            git_clone_command(url, &path, config.clone_as_bare, ssh_command),
             "git clone",
             &lifecycle,
         )
@@ -3297,6 +3720,7 @@ fn clone_repo_inner(config: &Config, db: &Store, url: &str) -> Result<CloneResul
     }
     ensure_remote(&path, "origin", url)?;
     ensure_origin_tracking_refs(&path)?;
+    apply_repo_identity(&config.identities, &locator, &path)?;
     db.upsert_repo(&locator, &path, None)?;
     let worktree_path = init_default_branch_worktree(config, &locator, &path, url)?;
     send_rpc_event_best_effort(
@@ -3380,6 +3804,7 @@ fn create_local_repo_inner(
         "reading initial branch",
     )?;
     configure_branch_upstream(path, branch.trim(), "origin")?;
+    apply_repo_identity(&config.identities, locator, path)?;
     db.upsert_repo(locator, path, None)?;
     send_rpc_event_best_effort(
         &config.rpc_url,
@@ -3901,6 +4326,12 @@ fn manage_repo(config: &Config, db: &Store, output: &Output, args: ManageArgs) -
             materialize_canonical: choice.materialize_canonical,
         },
     )?;
+    // Materialized canonical layouts configure both repositories themselves;
+    // otherwise repo_root still owns its Git dir and its origin is the
+    // checkout locator.
+    if choice.relationship == ManageRelationship::Canonical || !choice.materialize_canonical {
+        apply_identity_for_layout(&config.identities, &checkout_locator, &repo_root)?;
+    }
     let history_review_requested =
         request_daemon_history_review(config, &checkout_locator, &repo_root, &choice.canonical_url);
     output_manage(
@@ -4146,6 +4577,7 @@ fn record_manage_remote_relationships(
                         controlling_url: plan.canonical_url,
                         relationship: plan.relationship.as_str(),
                         relative_paths: config.worktree_use_relative_paths,
+                        identities: &config.identities,
                     },
                 )
                 .map(|_| ());
@@ -4160,6 +4592,7 @@ fn record_manage_remote_relationships(
                 plan.relationship.as_str(),
                 config.clone_as_bare,
                 config.worktree_use_relative_paths,
+                &config.identities,
             )?;
             return Ok(());
         }
@@ -4267,6 +4700,12 @@ fn seed_canonical_from_dependent_checkout(
         let worktree_arg_refs = worktree_args.iter().map(String::as_str);
         run_git_in(plan.controlling_path, worktree_arg_refs)?;
         configure_worktree_path_references(plan.controlling_path, plan.relative_paths)?;
+        apply_repo_identity(
+            plan.identities,
+            plan.controlling_locator,
+            plan.controlling_path,
+        )?;
+        apply_worktree_identity(plan.identities, plan.dependent_locator, plan.dependent_path)?;
         restore_dependent_worktree_state(plan.controlling_path, plan.dependent_path)?;
         checkout_controlling_default_branch(plan.controlling_path, &default_branch)?;
 
@@ -4570,13 +5009,14 @@ fn git_worktree_root(path: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(root.trim()))
 }
 
-fn ghq_get_command(root: &Path, url: &str) -> Command {
+fn ghq_get_command(root: &Path, url: &str, ssh_command: Option<&str>) -> Command {
     let mut command = Command::new("ghq");
     command.env("GHQ_ROOT", root).arg("get").arg(url);
+    set_git_ssh_command(&mut command, ssh_command);
     command
 }
 
-fn git_clone_command(url: &str, path: &Path, bare: bool) -> Command {
+fn git_clone_command(url: &str, path: &Path, bare: bool, ssh_command: Option<&str>) -> Command {
     let mut command = Command::new("git");
     command
         .env_remove("GIT_DIR")
@@ -4584,6 +5024,7 @@ fn git_clone_command(url: &str, path: &Path, bare: bool) -> Command {
         .env_remove("GIT_INDEX_FILE")
         .env_remove("GIT_PREFIX")
         .arg("clone");
+    set_git_ssh_command(&mut command, ssh_command);
     if bare {
         command.arg("--bare");
     }
@@ -4591,8 +5032,17 @@ fn git_clone_command(url: &str, path: &Path, bare: bool) -> Command {
     command
 }
 
-fn run_git_clone(url: &str, path: &Path, bare: bool) -> Result<()> {
-    let status = git_clone_command(url, path, bare)
+/// Network operations that run before a repository exists locally, or from a
+/// repository whose config belongs to a different locator, take the identity's
+/// SSH command through the environment, which overrides `core.sshCommand`.
+fn set_git_ssh_command(command: &mut Command, ssh_command: Option<&str>) {
+    if let Some(ssh_command) = ssh_command {
+        command.env("GIT_SSH_COMMAND", ssh_command);
+    }
+}
+
+fn run_git_clone(url: &str, path: &Path, bare: bool, ssh_command: Option<&str>) -> Result<()> {
+    let status = git_clone_command(url, path, bare, ssh_command)
         .status()
         .with_context(|| format!("cloning {url} to {}", path.display()))?;
     if !status.success() {
@@ -4717,6 +5167,7 @@ fn fork_repo(
     let canonical_path = parent.storage.path.clone();
     let fork_remote = fork_remote_name(&fork_locator);
     fs::create_dir_all(fork_path.parent().context("fork path has no parent")?)?;
+    let fork_ssh_command = identity_ssh_command(&config.identities, &fork_locator)?;
     if config.clone_as_bare {
         ensure_managed_canonical_is_bare(&parent.storage)?;
         let view = materialize_namespace_view(
@@ -4726,6 +5177,7 @@ fn fork_repo(
             &canonical_path,
             "fork",
             fork_url,
+            fork_ssh_command.as_deref(),
         )?;
         db.upsert_repo(&canonical_locator, &canonical_path, None)?;
         let fork_id = db.upsert_repo(&fork_locator, &fork_path, Some(&canonical_locator.key()))?;
@@ -4747,7 +5199,17 @@ fn fork_repo(
     }
     ensure_remote(&canonical_path, "origin", canonical_url)?;
     ensure_remote(&canonical_path, &fork_remote, fork_url)?;
-    run_git_in(&canonical_path, ["fetch", &fork_remote])?;
+    // The canonical repository's core.sshCommand belongs to the canonical
+    // locator; fetching the fork remote needs the fork's identity.
+    let mut fetch = git_command(&canonical_path);
+    set_git_ssh_command(&mut fetch, fork_ssh_command.as_deref());
+    let fetch_status = fetch
+        .args(["fetch", &fork_remote])
+        .status()
+        .with_context(|| format!("fetching {fork_remote} in {}", canonical_path.display()))?;
+    if !fetch_status.success() {
+        bail!("git fetch {fork_remote} failed with status {fetch_status}");
+    }
     let status = git_command(&canonical_path)
         .args(["remote", "set-head", &fork_remote, "-a"])
         .status()
@@ -4762,6 +5224,7 @@ fn fork_repo(
     let worktree_arg_refs = worktree_args.iter().map(String::as_str);
     run_git_in(&canonical_path, worktree_arg_refs)?;
     configure_worktree_path_references(&canonical_path, config.worktree_use_relative_paths)?;
+    apply_worktree_identity(&config.identities, &fork_locator, &fork_path)?;
     db.upsert_repo(&canonical_locator, &canonical_path, None)?;
     let fork_id = db.upsert_repo(&fork_locator, &fork_path, Some(&canonical_locator.key()))?;
     db.record_dependent_relationship(fork_id, parent.parent.id, "fork")?;
@@ -4781,15 +5244,21 @@ fn fork_repo(
     )
 }
 
-fn ensure_canonical_bare_repo(path: &Path, url: &str) -> Result<()> {
+fn ensure_canonical_bare_repo(
+    identities: &IdentityMap,
+    locator: &Locator,
+    path: &Path,
+    url: &str,
+) -> Result<()> {
     fs::create_dir_all(path.parent().context("canonical path has no parent")?)?;
     if path.exists() {
         ensure_bare_repository(path)?;
         ensure_remote(path, "origin", url)?;
     } else {
-        run_git_clone(url, path, true)?;
+        let ssh_command = identity_ssh_command(identities, locator)?;
+        run_git_clone(url, path, true, ssh_command.as_deref())?;
     }
-    Ok(())
+    apply_repo_identity(identities, locator, path)
 }
 
 fn materialize_namespace_view(
@@ -4799,10 +5268,11 @@ fn materialize_namespace_view(
     canonical_path: &Path,
     relationship: &str,
     origin_url: &str,
+    ssh_command: Option<&str>,
 ) -> Result<RepoViewMetadata> {
     ensure_bare_repository(canonical_path)?;
     let default_branch =
-        remote_default_branch_from_url(origin_url)?.unwrap_or_else(|| "main".into());
+        remote_default_branch_from_url(origin_url, ssh_command)?.unwrap_or_else(|| "main".into());
     let refs_prefix = repo_view_refs_prefix(relationship, locator);
     let view = RepoViewMetadata {
         version: REPO_VIEW_METADATA_VERSION,
@@ -4828,7 +5298,7 @@ fn materialize_namespace_view(
     }
     fs::create_dir_all(path).with_context(|| format!("creating repo view {}", path.display()))?;
     write_repo_view_metadata(&view)?;
-    fetch_repo_view(&view, "origin")?;
+    fetch_repo_view(&view, "origin", ssh_command)?;
     ensure_repo_view_default_branch(&view)?;
     Ok(view)
 }
@@ -4872,13 +5342,18 @@ fn read_repo_view_metadata(path: &Path) -> Result<Option<RepoViewMetadata>> {
     Ok(Some(view))
 }
 
-fn fetch_repo_view(view: &RepoViewMetadata, remote: &str) -> Result<()> {
+/// Fetch a view's origin into its namespace inside the canonical bare
+/// repository. The canonical repository's `core.sshCommand` belongs to the
+/// canonical locator, so the view's own SSH command comes via the environment.
+fn fetch_repo_view(view: &RepoViewMetadata, remote: &str, ssh_command: Option<&str>) -> Result<()> {
     if remote != "origin" {
         bail!("repo-manager namespace views currently support only `origin`, got `{remote}`");
     }
     let heads_refspec = format!("+refs/heads/*:{}/remotes/origin/*", view.refs_prefix);
     let tags_refspec = format!("+refs/tags/*:{}/tags/*", view.refs_prefix);
-    let status = git_dir_command(&view.canonical_path)
+    let mut command = git_dir_command(&view.canonical_path);
+    set_git_ssh_command(&mut command, ssh_command);
+    let status = command
         .args(["fetch", "--prune", "--no-tags", &view.origin_url])
         .arg(heads_refspec)
         .arg(tags_refspec)
@@ -4914,12 +5389,15 @@ fn ensure_repo_view_default_branch(view: &RepoViewMetadata) -> Result<()> {
     Ok(())
 }
 
-fn remote_default_branch_from_url(url: &str) -> Result<Option<String>> {
-    let output = Command::new("git")
+fn remote_default_branch_from_url(url: &str, ssh_command: Option<&str>) -> Result<Option<String>> {
+    let mut command = Command::new("git");
+    command
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_PREFIX")
+        .env_remove("GIT_PREFIX");
+    set_git_ssh_command(&mut command, ssh_command);
+    let output = command
         .args(["ls-remote", "--symref", url, "HEAD"])
         .output()
         .with_context(|| format!("reading remote default branch for {url}"))?;
@@ -5079,7 +5557,8 @@ fn fetch_repo(
     let context = repo_context(config, db, dir)?;
     match context {
         RepoContext::View(view) => {
-            fetch_repo_view(&view, &args.remote)?;
+            let ssh_command = identity_ssh_command(&config.identities, &view.locator)?;
+            fetch_repo_view(&view, &args.remote, ssh_command.as_deref())?;
             ensure_repo_view_default_branch(&view)?;
             output_fetch(
                 output,
@@ -5673,6 +6152,7 @@ fn repos_set_type(
                 &repo_type,
                 true,
                 config.worktree_use_relative_paths,
+                &config.identities,
             )?;
             if parent.parent.id != parent.storage.id {
                 let repo_id = db.upsert_repo(
@@ -5766,7 +6246,7 @@ fn ensure_type_change_parent(
     } else {
         remote_url_for_locator(None, &locator)
     };
-    ensure_canonical_bare_repo(&path, &url)?;
+    ensure_canonical_bare_repo(&config.identities, &locator, &path, &url)?;
     let repo_id = db.upsert_repo(&locator, &path, None)?;
     let parent = ManagedRepoRecord {
         id: repo_id,
@@ -5885,6 +6365,7 @@ enum RepairOperationKind {
     ConvertRepositoryFormat(RepairRepositoryFormat),
     TrackUnmanagedCheckout(RepairUntrackedCheckout),
     RepairRelationship(Box<RepairRelationship>),
+    ApplyIdentity(RepairIdentity),
 }
 
 fn repair_operations_from_report(report: &RepairReport) -> Vec<RepairOperation> {
@@ -5958,6 +6439,18 @@ fn repair_operations_from_report(report: &RepairReport) -> Vec<RepairOperation> 
                 relationship.controlling_locator.key()
             ),
             kind: RepairOperationKind::RepairRelationship(Box::new(relationship.clone())),
+        });
+        next_id += 1;
+    }
+
+    for identity in &report.identities {
+        if !matches!(identity.status, RepairIdentityStatus::NeedsUpdate) {
+            continue;
+        }
+        operations.push(RepairOperation {
+            id: next_id,
+            summary: format!("apply identity config to {}", identity.locator.key()),
+            kind: RepairOperationKind::ApplyIdentity(identity.clone()),
         });
         next_id += 1;
     }
@@ -6092,6 +6585,7 @@ fn apply_repair_operations(
         stale_paths: Vec::new(),
         untracked_checkouts: Vec::new(),
         relationships: Vec::new(),
+        identities: Vec::new(),
         skipped: Vec::new(),
     };
 
@@ -6154,6 +6648,7 @@ fn apply_repair_operations(
                     &relationship.relationship,
                     config.clone_as_bare,
                     config.worktree_use_relative_paths,
+                    &config.identities,
                 ) {
                     Ok(shared_git_dir) => report.relationships.push(RepairRelationship {
                         relationship: relationship.relationship.clone(),
@@ -6172,6 +6667,11 @@ fn apply_repair_operations(
                         reason: error.to_string(),
                     }),
                 }
+            }
+            RepairOperationKind::ApplyIdentity(identity) => {
+                report
+                    .identities
+                    .push(apply_identity_repair(&config.identities, identity));
             }
         }
     }
@@ -6306,6 +6806,8 @@ fn build_repair_report(config: &Config, db: &Store, check: bool) -> Result<Repai
             }
         }
     }
+
+    let identities = identity_repair_entries(&config.identities, &current_repos, check)?;
 
     let mut stale_paths = Vec::new();
     let mut stale_repo_ids = HashSet::new();
@@ -6447,6 +6949,7 @@ fn build_repair_report(config: &Config, db: &Store, check: bool) -> Result<Repai
             &relationship.relationship,
             config.clone_as_bare,
             config.worktree_use_relative_paths,
+            &config.identities,
         ) {
             Ok(shared_git_dir) => relationships.push(RepairRelationship {
                 relationship: relationship.relationship,
@@ -6474,6 +6977,7 @@ fn build_repair_report(config: &Config, db: &Store, check: bool) -> Result<Repai
         stale_paths,
         untracked_checkouts,
         relationships,
+        identities,
         skipped,
     })
 }
@@ -6498,6 +7002,77 @@ fn repair_report_needs_repair(report: &RepairReport) -> bool {
             .relationships
             .iter()
             .any(|relationship| matches!(relationship.status, RepairStatus::NeedsRepair))
+        || report
+            .identities
+            .iter()
+            .any(|identity| matches!(identity.status, RepairIdentityStatus::NeedsUpdate))
+}
+
+/// Managed paths whose Git config disagrees with their locator's identity.
+/// In check mode they are reported; otherwise they are updated in place.
+fn identity_repair_entries(
+    identities: &IdentityMap,
+    repos: &[ManagedRepoRecord],
+    check: bool,
+) -> Result<Vec<RepairIdentity>> {
+    let mut entries = Vec::new();
+    if identities.is_empty() {
+        return Ok(entries);
+    }
+    for repo in repos {
+        if !repo.path.exists() {
+            continue;
+        }
+        let scope = match identity_scope_for_path(&repo.path) {
+            Ok(Some(scope)) => scope,
+            Ok(None) => continue,
+            Err(error) => {
+                entries.push(RepairIdentity {
+                    repo_id: repo.id,
+                    locator: repo.current.clone(),
+                    path: repo.path.clone(),
+                    scope: IdentityScope::Repository,
+                    status: RepairIdentityStatus::Skipped,
+                    reasons: vec![error.to_string()],
+                });
+                continue;
+            }
+        };
+        let reasons = identity_drift(identities, &repo.current, &repo.path, scope)?;
+        if reasons.is_empty() {
+            continue;
+        }
+        let entry = RepairIdentity {
+            repo_id: repo.id,
+            locator: repo.current.clone(),
+            path: repo.path.clone(),
+            scope,
+            status: RepairIdentityStatus::NeedsUpdate,
+            reasons,
+        };
+        entries.push(if check {
+            entry
+        } else {
+            apply_identity_repair(identities, &entry)
+        });
+    }
+    Ok(entries)
+}
+
+fn apply_identity_repair(identities: &IdentityMap, entry: &RepairIdentity) -> RepairIdentity {
+    let (status, reasons) =
+        match apply_identity(identities, &entry.locator, &entry.path, entry.scope) {
+            Ok(()) => (RepairIdentityStatus::Updated, entry.reasons.clone()),
+            Err(error) => (RepairIdentityStatus::Skipped, vec![error.to_string()]),
+        };
+    RepairIdentity {
+        repo_id: entry.repo_id,
+        locator: entry.locator.clone(),
+        path: entry.path.clone(),
+        scope: entry.scope,
+        status,
+        reasons,
+    }
 }
 
 fn checkout_uses_shared_git_dir(path: &Path) -> bool {
@@ -6965,6 +7540,7 @@ fn add_repo_view_worktree(
         set_worktree_head(&worktree_path, &branch_ref)?;
         configure_repo_view_worktree_remote(view, &worktree_path, &branch_ref)?;
     }
+    apply_worktree_identity(&config.identities, &view.locator, &worktree_path)?;
     if args.reset {
         run_git_in(&worktree_path, ["reset", "--hard", checkout_ref.as_str()])?;
     }
@@ -7083,6 +7659,7 @@ fn move_repo(
     let plan = plan_move(&config.clone_root, old_locator, new_locator, &historical);
     apply_filesystem_move(&plan)?;
     ensure_remote(&plan.new_path, "origin", new_url)?;
+    apply_identity_for_layout(&config.identities, &plan.new_locator, &plan.new_path)?;
     db.apply_move_metadata(repo_id, &plan)?;
     output_move(output, &plan)
 }
@@ -7122,6 +7699,7 @@ fn reconcile_repos(config: &Config, db: &Store) -> Result<ReconcileReport> {
             apply_filesystem_move(&plan)?;
             let new_origin_url = remote_url_for_locator(origin_url.as_deref(), &plan.new_locator);
             ensure_remote(&plan.new_path, "origin", &new_origin_url)?;
+            apply_identity_for_layout(&config.identities, &plan.new_locator, &plan.new_path)?;
             db.apply_move_metadata(repo.id, &plan)?;
             planned_moves.push(ReconcileMove {
                 repo_id: repo.id,
@@ -7166,6 +7744,7 @@ fn reconcile_repos(config: &Config, db: &Store) -> Result<ReconcileReport> {
         );
         apply_filesystem_move(&plan)?;
         ensure_remote(&plan.new_path, "origin", &origin_url)?;
+        apply_identity_for_layout(&config.identities, &plan.new_locator, &plan.new_path)?;
         db.apply_move_metadata(repo.id, &plan)?;
         planned_moves.push(ReconcileMove {
             repo_id: repo.id,
@@ -7253,6 +7832,7 @@ fn resolve_related_shared_git_dir(
         relationship,
         config.clone_as_bare,
         config.worktree_use_relative_paths,
+        &config.identities,
     )
 }
 
@@ -7266,6 +7846,7 @@ fn materialize_related_shared_git_dir(
     relationship: &str,
     clone_as_bare: bool,
     relative_paths: bool,
+    identities: &IdentityMap,
 ) -> Result<SharedGitDirResolution> {
     if !dependent_path.exists() {
         bail!(
@@ -7288,6 +7869,7 @@ fn materialize_related_shared_git_dir(
             controlling_locator,
             controlling_path,
             relationship,
+            identities,
         );
     }
 
@@ -7336,6 +7918,8 @@ fn materialize_related_shared_git_dir(
         )?;
     }
     configure_worktree_path_references(controlling_path, relative_paths)?;
+    apply_repo_identity(identities, controlling_locator, controlling_path)?;
+    apply_worktree_identity(identities, dependent_locator, dependent_path)?;
 
     let controlling_id = db.upsert_repo(controlling_locator, controlling_path, None)?;
     let dependent_id = db.upsert_repo(
@@ -7367,6 +7951,7 @@ fn materialize_related_bare_repo(
     controlling_locator: &Locator,
     controlling_path: &Path,
     relationship: &str,
+    identities: &IdentityMap,
 ) -> Result<SharedGitDirResolution> {
     if !controlling_path.exists() {
         bail!(
@@ -7380,6 +7965,7 @@ fn materialize_related_bare_repo(
     let controlling_url =
         remote_url_for_locator(controlling_origin.as_deref(), controlling_locator);
     ensure_remote(controlling_path, "origin", &controlling_url)?;
+    apply_repo_identity(identities, controlling_locator, controlling_path)?;
     let dependent_url = remote_url_for_locator(controlling_origin.as_deref(), dependent_locator);
     if dependent_path.exists() && read_repo_view_metadata(dependent_path)?.is_none() {
         fetch_existing_dependent_into_namespace(
@@ -7396,6 +7982,7 @@ fn materialize_related_bare_repo(
         controlling_path,
         relationship,
         &dependent_url,
+        identity_ssh_command(identities, dependent_locator)?.as_deref(),
     )?;
     let local_branch = format!("{}/heads/{}", view.refs_prefix, view.default_branch);
     let remote_branch = format!(
@@ -8101,7 +8688,9 @@ fn init_default_branch_worktree(
     if !is_bare_repository(canonical_path)? {
         return Ok(None);
     }
-    let Some(branch) = default_branch_for_clone(canonical_path, url)? else {
+    let ssh_command = identity_ssh_command(&config.identities, locator)?;
+    let Some(branch) = default_branch_for_clone(canonical_path, url, ssh_command.as_deref())?
+    else {
         return Ok(None);
     };
     let worktree_path = locator_path(&config.dev_worktree_root, locator).join(&branch);
@@ -8128,7 +8717,11 @@ fn init_default_branch_worktree(
 /// The clone's own HEAD is authoritative, but it can name a branch that does
 /// not exist locally, so fall back to the remote's advertised default and
 /// finally give up rather than failing the clone.
-fn default_branch_for_clone(path: &Path, url: &str) -> Result<Option<String>> {
+fn default_branch_for_clone(
+    path: &Path,
+    url: &str,
+    ssh_command: Option<&str>,
+) -> Result<Option<String>> {
     let head = git_output_optional(
         path,
         ["symbolic-ref", "--short", "HEAD"],
@@ -8141,7 +8734,7 @@ fn default_branch_for_clone(path: &Path, url: &str) -> Result<Option<String>> {
     {
         return Ok(Some(branch));
     }
-    if let Some(branch) = remote_default_branch_from_url(url)?
+    if let Some(branch) = remote_default_branch_from_url(url, ssh_command)?
         && git_ref_exists(path, &format!("refs/heads/{branch}"))?
     {
         return Ok(Some(branch));
@@ -9371,6 +9964,21 @@ fn format_repair_report(report: &RepairReport) -> String {
         .iter()
         .filter(|checkout| matches!(checkout.status, RepairUntrackedCheckoutStatus::Tracked))
         .count();
+    let identity_needs_update = report
+        .identities
+        .iter()
+        .filter(|identity| matches!(identity.status, RepairIdentityStatus::NeedsUpdate))
+        .count();
+    let identity_updated = report
+        .identities
+        .iter()
+        .filter(|identity| matches!(identity.status, RepairIdentityStatus::Updated))
+        .count();
+    let identity_skipped = report
+        .identities
+        .iter()
+        .filter(|identity| matches!(identity.status, RepairIdentityStatus::Skipped))
+        .count();
     let untracked_skipped = report
         .untracked_checkouts
         .iter()
@@ -9395,11 +10003,28 @@ fn format_repair_report(report: &RepairReport) -> String {
             "{untracked_needs_tracking} unmanaged checkout(s) need tracking"
         )
         .unwrap();
+        writeln!(
+            text,
+            "{identity_needs_update} repository identity config(s) need updating"
+        )
+        .unwrap();
     } else {
         writeln!(text, "repaired {repaired} relationship(s)").unwrap();
         writeln!(text, "converted {format_converted} repository format(s)").unwrap();
         writeln!(text, "pruned {stale_pruned} stale managed path(s)").unwrap();
         writeln!(text, "tracked {untracked_tracked} unmanaged checkout(s)").unwrap();
+        writeln!(
+            text,
+            "updated {identity_updated} repository identity config(s)"
+        )
+        .unwrap();
+    }
+    if identity_skipped > 0 {
+        writeln!(
+            text,
+            "{identity_skipped} repository identity config(s) skipped"
+        )
+        .unwrap();
     }
     if format_skipped > 0 {
         writeln!(
@@ -9537,6 +10162,34 @@ fn format_repair_report(report: &RepairReport) -> String {
                 &summarized_relationship_reasons(relationship),
                 &[],
             );
+            issue_number += 1;
+        }
+    }
+    if !report.identities.is_empty() {
+        writeln!(
+            text,
+            "\nrepository identity config issue(s): {}",
+            report.identities.len()
+        )
+        .unwrap();
+        for identity in &report.identities {
+            let status = match identity.status {
+                RepairIdentityStatus::NeedsUpdate => "needs update",
+                RepairIdentityStatus::Updated => "updated",
+                RepairIdentityStatus::Skipped => "skipped",
+            };
+            let scope = match identity.scope {
+                IdentityScope::Repository => "repository",
+                IdentityScope::Worktree => "worktree",
+            };
+            writeln!(
+                text,
+                "  [{issue_number}] {status}: {} ({scope} config)",
+                identity.locator.key()
+            )
+            .unwrap();
+            writeln!(text, "      path: {}", identity.path.display()).unwrap();
+            write_reasons(&mut text, &identity.reasons, &[]);
             issue_number += 1;
         }
     }
@@ -10521,6 +11174,7 @@ mod tests {
                 ],
                 shared_git_dir: None,
             }],
+            identities: Vec::new(),
             skipped: Vec::new(),
         };
 
@@ -10546,7 +11200,11 @@ mod tests {
 
     #[test]
     fn ghq_root_is_configured_with_environment() {
-        let command = ghq_get_command(Path::new("/tmp/clones"), "https://github.com/owner/repo");
+        let command = ghq_get_command(
+            Path::new("/tmp/clones"),
+            "https://github.com/owner/repo",
+            None,
+        );
         let args = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -10704,7 +11362,7 @@ mod tests {
         let canonical_path = locator_path(&config.clone_root, &canonical_locator);
         let fork_path = locator_path(&config.clone_root, &fork_locator);
         fs::create_dir_all(canonical_path.parent().unwrap()).unwrap();
-        run_git_clone(&canonical_url, &canonical_path, true).unwrap();
+        run_git_clone(&canonical_url, &canonical_path, true, None).unwrap();
         store
             .upsert_repo(&canonical_locator, &canonical_path, None)
             .unwrap();
@@ -11356,6 +12014,7 @@ mod tests {
                 controlling_url: &canonical_url,
                 relationship: "fork",
                 relative_paths: false,
+                identities: &BTreeMap::new(),
             },
         )
         .unwrap();
@@ -11492,6 +12151,7 @@ mod tests {
             "fork",
             false,
             false,
+            &BTreeMap::new(),
         )
         .unwrap();
 
@@ -11577,6 +12237,7 @@ mod tests {
             worktree_use_relative_paths: false,
             create_default_visibility: RepoVisibility::Private,
             forges: HashMap::new(),
+            identities: BTreeMap::new(),
         };
 
         let report = reconcile_repos(&config, &store).unwrap();
@@ -11635,6 +12296,7 @@ mod tests {
             worktree_use_relative_paths: false,
             create_default_visibility: RepoVisibility::Private,
             forges: HashMap::new(),
+            identities: BTreeMap::new(),
         };
 
         let report = reconcile_repos(&config, &store).unwrap();
@@ -11768,6 +12430,7 @@ mod tests {
                     api_base_url: Some("https://git.example.test".to_string()),
                 },
             )])),
+            identities: None,
         };
 
         let cli = Cli {
@@ -11907,6 +12570,346 @@ mod tests {
         );
     }
 
+    fn identity(ssh: Option<&str>, signing: Option<&str>) -> IdentityConfig {
+        IdentityConfig {
+            ssh_identity_file: ssh.map(PathBuf::from),
+            signing_key: signing.map(str::to_string),
+            signing_format: None,
+        }
+    }
+
+    #[test]
+    fn identities_layer_from_authority_to_repository_prefix() {
+        let identities = normalize_identities(BTreeMap::from([
+            (
+                "GitHub.com".to_string(),
+                identity(Some("/keys/work.pub"), Some("/keys/work.pub")),
+            ),
+            (
+                "github.com/personal".to_string(),
+                identity(Some("/keys/personal.pub"), None),
+            ),
+            (
+                "github.com/personal/pgp-repo".to_string(),
+                identity(None, Some("ABCDEF0123456789")),
+            ),
+        ]))
+        .unwrap();
+
+        let work = resolve_identity(
+            &identities,
+            &Locator::parse("github.com/work/tool").unwrap(),
+        );
+        assert_eq!(
+            work.ssh_identity_file,
+            Some(PathBuf::from("/keys/work.pub"))
+        );
+        assert_eq!(work.signing_key.as_deref(), Some("/keys/work.pub"));
+
+        // The owner layer overrides the SSH key and inherits the signing key.
+        let personal = resolve_identity(
+            &identities,
+            &Locator::parse("github.com/personal/app").unwrap(),
+        );
+        assert_eq!(
+            personal.ssh_identity_file,
+            Some(PathBuf::from("/keys/personal.pub"))
+        );
+        assert_eq!(personal.signing_key.as_deref(), Some("/keys/work.pub"));
+
+        // The repository layer overrides only the signing key; the format
+        // follows the key shape.
+        let pgp_locator = Locator::parse("git@github.com:personal/pgp-repo.git").unwrap();
+        let pgp = resolve_identity(&identities, &pgp_locator);
+        assert_eq!(
+            pgp.ssh_identity_file,
+            Some(PathBuf::from("/keys/personal.pub"))
+        );
+        assert_eq!(pgp.signing_key.as_deref(), Some("ABCDEF0123456789"));
+        let settings = identity_git_settings(&identities, &pgp_locator).unwrap();
+        assert_eq!(
+            settings,
+            vec![
+                (
+                    "core.sshCommand",
+                    Some("ssh -o IdentitiesOnly=yes -i /keys/personal.pub".to_string())
+                ),
+                ("user.signingKey", Some("ABCDEF0123456789".to_string())),
+                ("gpg.format", None),
+                ("commit.gpgsign", Some("true".to_string())),
+                ("tag.gpgsign", Some("true".to_string())),
+            ]
+        );
+        let ssh_signed = identity_git_settings(
+            &identities,
+            &Locator::parse("github.com/work/tool").unwrap(),
+        )
+        .unwrap();
+        assert!(ssh_signed.contains(&("gpg.format", Some("ssh".to_string()))));
+
+        // An unrelated forge resolves to nothing, so owned keys are unset.
+        let other = identity_git_settings(&identities, &Locator::parse("git.sr.ht/~me/x").unwrap())
+            .unwrap();
+        assert_eq!(
+            other,
+            vec![
+                ("core.sshCommand", None),
+                ("user.signingKey", None),
+                ("gpg.format", None),
+                ("commit.gpgsign", None),
+                ("tag.gpgsign", None),
+            ]
+        );
+
+        // Only configured key groups are owned; signing config is untouched
+        // when no identity mentions a signing key.
+        let ssh_only = BTreeMap::from([("github.com".to_string(), identity(Some("/k.pub"), None))]);
+        let settings =
+            identity_git_settings(&ssh_only, &Locator::parse("example.com/a/b").unwrap()).unwrap();
+        assert_eq!(settings, vec![("core.sshCommand", None)]);
+        assert!(
+            identity_git_settings(&BTreeMap::new(), &pgp_locator)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn config_schema_validates_identity_prefixes() {
+        assert!(
+            validate_config_json(&serde_json::json!({
+                "identities": {
+                    "github.com": { "ssh-identity-file": "~/.ssh/a.pub" },
+                    "github.com/owner": { "signing_key": "~/.ssh/b.pub", "signing-format": "ssh" },
+                    "github.com/owner/repo": { "signing-key": "0123ABCD" }
+                }
+            }))
+            .is_ok()
+        );
+        for prefix in [
+            "/github.com",
+            "github.com/",
+            "github.com//owner",
+            "git hub.com",
+        ] {
+            assert!(
+                validate_config_json(&serde_json::json!({
+                    "identities": { prefix: { "ssh-identity-file": "/k.pub" } }
+                }))
+                .is_err(),
+                "{prefix:?} should be rejected"
+            );
+        }
+        assert!(
+            validate_config_json(&serde_json::json!({
+                "identities": { "github.com": { "signing-format": "pgp" } }
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn identity_config_is_applied_per_scope_and_drift_is_repairable() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical_locator = Locator::parse("github.com/upstream/project").unwrap();
+        let fork_locator = Locator::parse("github.com/me/project").unwrap();
+        let canonical_path = dir.path().join("clones/github.com/upstream/project");
+        let fork_path = dir.path().join("clones/github.com/me/project");
+        fs::create_dir_all(&canonical_path).unwrap();
+        run_git_in(&canonical_path, ["init", "-b", "main"]).unwrap();
+        fs::write(canonical_path.join("README.md"), "seed\n").unwrap();
+        run_git_in(&canonical_path, ["add", "."]).unwrap();
+        run_git_in(
+            &canonical_path,
+            [
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        )
+        .unwrap();
+        run_git_in(
+            &canonical_path,
+            [
+                "worktree",
+                "add",
+                "-b",
+                "fork-main",
+                fork_path.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let mut identities = BTreeMap::from([
+            (
+                "github.com".to_string(),
+                identity(Some("/keys/upstream.pub"), Some("/keys/upstream.pub")),
+            ),
+            (
+                "github.com/me".to_string(),
+                identity(Some("/keys/me.pub"), None),
+            ),
+        ]);
+        apply_repo_identity(&identities, &canonical_locator, &canonical_path).unwrap();
+        apply_worktree_identity(&identities, &fork_locator, &fork_path).unwrap();
+
+        let repo_ssh = read_git_config(
+            &canonical_path,
+            IdentityScope::Repository,
+            "core.sshCommand",
+        )
+        .unwrap();
+        assert_eq!(
+            repo_ssh.as_deref(),
+            Some("ssh -o IdentitiesOnly=yes -i /keys/upstream.pub")
+        );
+        assert_eq!(
+            read_git_config(&canonical_path, IdentityScope::Repository, "gpg.format")
+                .unwrap()
+                .as_deref(),
+            Some("ssh")
+        );
+        assert_eq!(
+            read_git_config(&canonical_path, IdentityScope::Repository, "commit.gpgsign")
+                .unwrap()
+                .as_deref(),
+            Some("true")
+        );
+        // The fork worktree sees its own SSH command and inherits the signing key.
+        assert_eq!(
+            git_output(
+                &fork_path,
+                ["config", "core.sshCommand"],
+                "reading fork ssh"
+            )
+            .unwrap()
+            .trim(),
+            "ssh -o IdentitiesOnly=yes -i /keys/me.pub"
+        );
+        assert_eq!(
+            git_output(
+                &fork_path,
+                ["config", "user.signingKey"],
+                "reading fork signing key"
+            )
+            .unwrap()
+            .trim(),
+            "/keys/upstream.pub"
+        );
+        // The canonical repository and its other worktrees are unaffected.
+        assert_eq!(
+            repo_ssh,
+            read_git_config(
+                &canonical_path,
+                IdentityScope::Repository,
+                "core.sshCommand"
+            )
+            .unwrap()
+        );
+        assert!(
+            identity_drift(
+                &identities,
+                &canonical_locator,
+                &canonical_path,
+                IdentityScope::Repository
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            identity_drift(
+                &identities,
+                &fork_locator,
+                &fork_path,
+                IdentityScope::Worktree
+            )
+            .unwrap()
+            .is_empty()
+        );
+
+        // Reconfiguring the owner shows drift, and repair applies it.
+        identities.insert(
+            "github.com/me".to_string(),
+            identity(Some("/keys/me-rotated.pub"), None),
+        );
+        let repos = vec![
+            ManagedRepoRecord {
+                id: 1,
+                current: canonical_locator.clone(),
+                path: canonical_path.clone(),
+            },
+            ManagedRepoRecord {
+                id: 2,
+                current: fork_locator.clone(),
+                path: fork_path.clone(),
+            },
+        ];
+        let checked = identity_repair_entries(&identities, &repos, true).unwrap();
+        assert_eq!(checked.len(), 1);
+        assert_eq!(checked[0].repo_id, 2);
+        assert_eq!(checked[0].scope, IdentityScope::Worktree);
+        assert_eq!(checked[0].status, RepairIdentityStatus::NeedsUpdate);
+        assert_eq!(
+            checked[0].reasons,
+            vec![
+                "core.sshCommand is `ssh -o IdentitiesOnly=yes -i /keys/me.pub`; identity config sets `ssh -o IdentitiesOnly=yes -i /keys/me-rotated.pub`"
+            ]
+        );
+        let repaired = identity_repair_entries(&identities, &repos, false).unwrap();
+        assert_eq!(repaired[0].status, RepairIdentityStatus::Updated);
+        assert!(
+            identity_repair_entries(&identities, &repos, true)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Dropping every signing key releases the signing group: the values
+        // repo-manager wrote are removed, falling back to global Git config.
+        let ssh_only = BTreeMap::from([(
+            "github.com".to_string(),
+            identity(Some("/keys/upstream.pub"), None),
+        )]);
+        apply_repo_identity(&ssh_only, &canonical_locator, &canonical_path).unwrap();
+        assert_eq!(
+            read_git_config(&canonical_path, IdentityScope::Repository, "commit.gpgsign")
+                .unwrap()
+                .as_deref(),
+            Some("true"),
+            "unowned groups must not be touched"
+        );
+        let signing_elsewhere =
+            BTreeMap::from([("git.sr.ht".to_string(), identity(None, Some("ABCD")))]);
+        apply_repo_identity(&signing_elsewhere, &canonical_locator, &canonical_path).unwrap();
+        assert!(
+            read_git_config(&canonical_path, IdentityScope::Repository, "commit.gpgsign")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            read_git_config(
+                &canonical_path,
+                IdentityScope::Repository,
+                "user.signingKey"
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            read_git_config(
+                &canonical_path,
+                IdentityScope::Repository,
+                "core.sshCommand"
+            )
+            .unwrap()
+            .is_some(),
+            "ssh group is unowned by a signing-only map"
+        );
+    }
+
     #[test]
     fn repod_rejects_invalid_versioned_config_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -11967,6 +12970,7 @@ mod tests {
             worktree_use_relative_paths: false,
             create_default_visibility: RepoVisibility::Private,
             forges: HashMap::new(),
+            identities: BTreeMap::new(),
         };
         let explicit_file = dir.path().join("custom/repo-config.json");
 
@@ -12034,6 +13038,7 @@ mod tests {
             background_fetch_minimum_interval_seconds: None,
             create_default_visibility: None,
             forges: None,
+            identities: None,
         };
 
         base.merge(FileConfig {
@@ -12053,6 +13058,7 @@ mod tests {
             background_fetch_minimum_interval_seconds: None,
             create_default_visibility: None,
             forges: None,
+            identities: None,
         });
 
         assert_eq!(base.state, Some(dir.path().join("state/base.sqlite")));
@@ -12364,7 +13370,7 @@ mod tests {
         )
         .unwrap();
         fs::create_dir_all(clone_path.parent().unwrap()).unwrap();
-        run_git_clone(&file_url_for_path(&seed), &clone_path, true).unwrap();
+        run_git_clone(&file_url_for_path(&seed), &clone_path, true, None).unwrap();
         let repo_id = store.upsert_repo(&locator, &clone_path, None).unwrap();
 
         fs::write(seed.join("README.md"), "updated\n").unwrap();
@@ -12425,7 +13431,7 @@ mod tests {
         let tracked_locator = Locator::parse("example.com/tracked/repo").unwrap();
         let tracked_path = locator_path(&config.clone_root, &tracked_locator);
         fs::create_dir_all(tracked_path.parent().unwrap()).unwrap();
-        run_git_clone(&file_url_for_path(&seed), &tracked_path, true).unwrap();
+        run_git_clone(&file_url_for_path(&seed), &tracked_path, true, None).unwrap();
         let tracked_id = store
             .upsert_repo(&tracked_locator, &tracked_path, None)
             .unwrap();
@@ -12742,7 +13748,7 @@ mod tests {
         let locator = Locator::parse("example.com/bare/repo").unwrap();
         let repo_path = locator_path(&config.clone_root, &locator);
         fs::create_dir_all(repo_path.parent().unwrap()).unwrap();
-        run_git_clone(seed.to_str().unwrap(), &repo_path, true).unwrap();
+        run_git_clone(seed.to_str().unwrap(), &repo_path, true, None).unwrap();
 
         add_worktree(
             &config,
@@ -12876,7 +13882,7 @@ mod tests {
         fs::create_dir_all(repo_path.parent().unwrap()).unwrap();
         // A bare clone made before repo-manager wrote fetch refspecs: no
         // remote-tracking refs at all.
-        run_git_clone(seed.to_str().unwrap(), &repo_path, true).unwrap();
+        run_git_clone(seed.to_str().unwrap(), &repo_path, true, None).unwrap();
         assert!(!git_ref_exists(&repo_path, "refs/remotes/origin/main").unwrap());
         // A branch that exists only upstream, pushed after the clone.
         run_git_in(&seed, ["checkout", "-b", "feature"]).unwrap();
@@ -13197,7 +14203,7 @@ mod tests {
     // repository; a bare `git` here would act on that instead of the tempdir.
     fn clone_local_repo(seed: &Path, destination: &Path) {
         fs::create_dir_all(destination.parent().unwrap()).unwrap();
-        run_git_clone(seed.to_str().unwrap(), destination, false).unwrap();
+        run_git_clone(seed.to_str().unwrap(), destination, false, None).unwrap();
     }
 
     fn file_url_for_path(path: &Path) -> String {
@@ -13224,6 +14230,7 @@ mod tests {
             worktree_use_relative_paths: false,
             create_default_visibility: RepoVisibility::Private,
             forges: HashMap::new(),
+            identities: BTreeMap::new(),
         }
     }
 

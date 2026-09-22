@@ -100,6 +100,40 @@
           }
         }
       }
+    },
+    "identities": {
+      "type": ["object", "null"],
+      "propertyNames": {
+        "pattern": "^[^/\\s]+(/[^/\\s]+)*$"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "ssh_identity_file": {
+            "type": ["string", "null"],
+            "minLength": 1
+          },
+          "ssh-identity-file": {
+            "type": ["string", "null"],
+            "minLength": 1
+          },
+          "signing_key": {
+            "type": ["string", "null"],
+            "minLength": 1
+          },
+          "signing-key": {
+            "type": ["string", "null"],
+            "minLength": 1
+          },
+          "signing_format": {
+            "enum": ["openpgp", "ssh", "x509", null]
+          },
+          "signing-format": {
+            "enum": ["openpgp", "ssh", "x509", null]
+          }
+        }
+      }
     }
   }
 }

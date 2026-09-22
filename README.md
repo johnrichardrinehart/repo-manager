@@ -67,7 +67,7 @@ When constructing a remote URL from a locator such as `github.com/me/project`,
 repo-manager uses `git@github.com:me/project`: SSH, with no added `.git` suffix.
 This policy is the same for every forge. Explicit URLs retain their transport,
 username, port, and `.git` suffix if supplied; use an explicit HTTPS URL when
-HTTPS is desired. SSH access requires credentials configured outside repo-manager.
+HTTPS is desired.
 
 `repo create --no-auto-create-remote` initializes a local repository with `origin`
 and tracking configuration for its initial branch. Once the remote exists and
@@ -108,6 +108,72 @@ review old temporary refs. Run `repo refs gc` to remove refs older than the
 The collector keeps newer refs and refs that hold otherwise unreachable
 commits. Pass `--prune-unreachable` after review to remove old refs that hold
 unique commits.
+
+### Identities
+
+SSH keys and signing keys can be pinned per locator prefix under `identities`.
+Keys are `<authority>`, `<authority>/<owner>`, `<authority>/<owner>/<repo>`, or
+any deeper prefix of a locator. When a repository is cloned, created, managed,
+moved, or forked, repo-manager resolves its locator against every matching
+prefix, least specific first; each field set on a more specific entry overrides
+the same field from a less specific one, so an owner entry that only sets
+`signing-key` still inherits the authority's `ssh-identity-file`.
+
+```json
+{
+  "config_version": 1,
+  "identities": {
+    "github.com": {
+      "ssh-identity-file": "~/.ssh/id_ed25519_personal.pub",
+      "signing-key": "~/.ssh/id_ed25519_personal.pub"
+    },
+    "github.com/work-org": {
+      "ssh-identity-file": "~/.ssh/id_ed25519_work.pub",
+      "signing-key": "0123456789ABCDEF",
+      "signing-format": "openpgp"
+    },
+    "github.com/work-org/legacy-service": {
+      "signing-key": "~/.ssh/id_ed25519_work.pub"
+    }
+  }
+}
+```
+
+The resolved identity is written to the repository's Git config:
+
+- `ssh-identity-file` sets `core.sshCommand` to
+  `ssh -o IdentitiesOnly=yes -i <file>`. A `.pub` path is enough when the
+  private key lives in an SSH agent; `IdentitiesOnly` stops the agent from
+  offering another account's key first. Clones, `ls-remote`, and fetches that
+  run before or outside the repository's own config use the same command via
+  `GIT_SSH_COMMAND`.
+- `signing-key` sets `user.signingKey`, `commit.gpgsign=true`, and
+  `tag.gpgsign=true`. `gpg.format`
+  is set to `signing-format` when given; otherwise it is set to `ssh` when the
+  key looks like an SSH key (a path, `.pub`, or `key::ssh-…`) and left to
+  Git's default for OpenPGP key ids. Paths are written as configured: a
+  leading `~` is left for ssh and Git to expand, so a managed tree shared
+  between hosts with different home directories resolves on each.
+
+Forks and other dependents that share a canonical repository's Git dir get
+their own identity in worktree-scoped config (`git config --worktree`), so a
+fork under another account pushes with that account's key while the canonical
+checkout keeps its own. Namespace views are not Git directories; their
+worktrees receive the config when created with `repo worktree add`.
+
+repo-manager owns a key group only once some identity entry configures it: if
+no entry sets `signing-key`, signing config in managed repositories is never
+touched, and an empty `identities` map changes nothing. Within an owned group,
+a locator that resolves to no value has the keys removed from the repository
+so Git falls back to global config; `repo move` between owners therefore swaps
+identities rather than leaving a stale one. `repo check` reports managed
+repositories whose config disagrees with their identity and `repo check
+--repair` applies it, which is how existing repositories pick up new
+`identities` entries.
+
+`core.sshCommand` is per repository, not per remote. A non-bare canonical
+checkout that carries a fork as an extra remote fetches that remote with the
+canonical identity except during `repo fork`, which passes the fork's key.
 
 ## Daemon API
 
