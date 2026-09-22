@@ -11541,29 +11541,17 @@ mod tests {
         let old_locator = Locator::parse("example.com/old/project").unwrap();
         let repo_path = locator_path(&clone_root, &old_locator);
         fs::create_dir_all(&repo_path).unwrap();
-        assert!(
-            Command::new("git")
-                .arg("-C")
-                .arg(&repo_path)
-                .arg("init")
-                .status()
-                .unwrap()
-                .success()
-        );
-        assert!(
-            Command::new("git")
-                .arg("-C")
-                .arg(&repo_path)
-                .args([
-                    "remote",
-                    "add",
-                    "origin",
-                    "https://github.com/new/project.git"
-                ])
-                .status()
-                .unwrap()
-                .success()
-        );
+        run_git_in(&repo_path, ["init"]).unwrap();
+        run_git_in(
+            &repo_path,
+            [
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/new/project.git",
+            ],
+        )
+        .unwrap();
 
         let store = Store::open(&dir.path().join("repos.sqlite")).unwrap();
         store.upsert_repo(&old_locator, &repo_path, None).unwrap();
@@ -11604,29 +11592,17 @@ mod tests {
         let old_path = locator_path(&clone_root, &old_locator);
         let new_path = locator_path(&clone_root, &new_locator);
         fs::create_dir_all(&old_path).unwrap();
-        assert!(
-            Command::new("git")
-                .arg("-C")
-                .arg(&old_path)
-                .arg("init")
-                .status()
-                .unwrap()
-                .success()
-        );
-        assert!(
-            Command::new("git")
-                .arg("-C")
-                .arg(&old_path)
-                .args([
-                    "remote",
-                    "add",
-                    "origin",
-                    "https://github.com/old-owner/old-name.git"
-                ])
-                .status()
-                .unwrap()
-                .success()
-        );
+        run_git_in(&old_path, ["init"]).unwrap();
+        run_git_in(
+            &old_path,
+            [
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/old-owner/old-name.git",
+            ],
+        )
+        .unwrap();
 
         let cache_root = dir.path().join("cache");
         write_cached_github_response(
@@ -13155,15 +13131,7 @@ mod tests {
 
     fn clone_local_repo(seed: &Path, destination: &Path) {
         fs::create_dir_all(destination.parent().unwrap()).unwrap();
-        assert!(
-            Command::new("git")
-                .arg("clone")
-                .arg(seed)
-                .arg(destination)
-                .status()
-                .unwrap()
-                .success()
-        );
+        run_git_clone(seed.to_str().unwrap(), destination, false).unwrap();
     }
 
     fn file_url_for_path(path: &Path) -> String {
@@ -13217,6 +13185,8 @@ mod tests {
                 "commit",
                 "--allow-empty",
                 "-m",
+    // Tests run under git hooks too, where git exports GIT_DIR for the real
+    // repository; a bare `git` here would act on that instead of the tempdir.
                 "stable",
             ],
         )
