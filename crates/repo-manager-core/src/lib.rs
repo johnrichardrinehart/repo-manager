@@ -150,7 +150,7 @@ struct ConfigArgs {
         value_name = "BOOL",
         num_args = 0..=1,
         default_missing_value = "true",
-        help = "Link Git worktrees with relative paths for portable shared filesystems"
+        help = "Link Git worktrees with relative paths so a shared root resolves under any mount prefix (default: true)"
     )]
     worktree_use_relative_paths: Option<bool>,
 }
@@ -416,7 +416,7 @@ struct SetupArgs {
         value_name = "BOOL",
         num_args = 0..=1,
         default_missing_value = "true",
-        help = "Persist whether Git worktrees use relative path references"
+        help = "Persist whether Git worktrees use relative path references (default: true)"
     )]
     worktree_use_relative_paths: Option<bool>,
 }
@@ -1853,10 +1853,17 @@ impl Config {
             .or(file_config.auto_create_remote)
             .unwrap_or(true);
         let clone_as_bare = file_config.clone_as_bare.unwrap_or(false);
+        // Relative links are the default because the managed tree is not
+        // guaranteed a single absolute path: the same root exported from a
+        // host into a guest sits under different prefixes on each side, and an
+        // absolute link written on one is dead on the other. Older Git ignores
+        // the setting rather than failing, so opting out is only needed where
+        // repositories must stay readable by Git older than 2.48, which rejects
+        // the extensions.relativeWorktrees marker newer Git writes.
         let worktree_use_relative_paths = args
             .worktree_use_relative_paths
             .or(file_config.worktree_use_relative_paths)
-            .unwrap_or(false);
+            .unwrap_or(true);
         let create_default_visibility = file_config.create_default_visibility.unwrap_or_default();
         let forges = file_config.forges.unwrap_or_default();
         Ok(Self {
@@ -11652,6 +11659,63 @@ mod tests {
     }
 
     #[test]
+    fn worktree_relative_paths_default_on_when_unset_and_off_only_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config/config.json");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(
+            &config_path,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "root": dir.path().join("code"),
+                    "state": dir.path().join("state.sqlite"),
+                    "cache_root": dir.path().join("cache"),
+                    "client_id": "00000000-0000-4000-8000-000000000003",
+                })
+            ),
+        )
+        .unwrap();
+        let cli_with = |worktree_use_relative_paths: Option<bool>| Cli {
+            config: ConfigArgs {
+                config: Some(config_path.clone()),
+                state: None,
+                cache_root: None,
+                root: None,
+                rpc_url: None,
+                client_id: None,
+                assume_origin_as_canonical: None,
+                auto_create_remote: None,
+                worktree_use_relative_paths,
+            },
+            dir: None,
+            json: false,
+            command: Commands::Setup(SetupCommands::Setup(SetupArgs {
+                file: None,
+                state: None,
+                cache_root: None,
+                root: None,
+                rpc_url: None,
+                client_id: None,
+                assume_origin_as_canonical: None,
+                auto_create_remote: None,
+                worktree_use_relative_paths: None,
+            })),
+        };
+
+        assert!(
+            Config::from_cli(&cli_with(None))
+                .unwrap()
+                .worktree_use_relative_paths
+        );
+        assert!(
+            !Config::from_cli(&cli_with(Some(false)))
+                .unwrap()
+                .worktree_use_relative_paths
+        );
+    }
+
+    #[test]
     fn file_config_loads_and_cli_values_override_it() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config/config.json");
@@ -13129,6 +13193,8 @@ mod tests {
         }
     }
 
+    // Tests run under git hooks too, where git exports GIT_DIR for the real
+    // repository; a bare `git` here would act on that instead of the tempdir.
     fn clone_local_repo(seed: &Path, destination: &Path) {
         fs::create_dir_all(destination.parent().unwrap()).unwrap();
         run_git_clone(seed.to_str().unwrap(), destination, false).unwrap();
@@ -13185,8 +13251,6 @@ mod tests {
                 "commit",
                 "--allow-empty",
                 "-m",
-    // Tests run under git hooks too, where git exports GIT_DIR for the real
-    // repository; a bare `git` here would act on that instead of the tempdir.
                 "stable",
             ],
         )

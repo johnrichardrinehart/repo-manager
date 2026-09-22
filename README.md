@@ -140,16 +140,18 @@ loaded by default is `$XDG_CONFIG_HOME/repo-manager/config.json`.
 Runtime environment variables and top-level CLI options override persisted
 values.
 
-Set `worktree-use-relative-paths` to `true` (or pass
-`--worktree-use-relative-paths=true` / set
-`REPO_MANAGER_WORKTREE_USE_RELATIVE_PATHS=true`) when the repo-manager root is
-shared across host and guest filesystems with different mount prefixes.
-Repo-manager then asks Git to store the links between `clones` and
-`dev-worktrees` as relative paths and records the same policy in each
-repository for direct `git worktree add` commands. This requires Git 2.48 or
-newer. The default remains `false` for compatibility with older Git versions.
-Existing absolute links can be converted with `git worktree repair
---relative-paths <worktree>...`.
+Git worktrees are linked to their clone with relative paths by default:
+repo-manager asks Git to store the links between `clones` and `dev-worktrees`
+relative to each other and records the same policy in each repository for
+direct `git worktree add` commands, so a root shared across host and guest
+filesystems with different mount prefixes resolves from both sides. Relative
+links need Git 2.48 or newer, and a repository that has one carries the
+`extensions.relativeWorktrees` marker, which older Git refuses to open. Set
+`worktree-use-relative-paths` to `false` (or pass
+`--worktree-use-relative-paths=false` / set
+`REPO_MANAGER_WORKTREE_USE_RELATIVE_PATHS=false`) where repositories must stay
+readable by such a Git. Existing absolute links can be converted with
+`git worktree repair --relative-paths <worktree>...`.
 
 Config files are versioned JSON and validated against the matching JSON Schema
 before being deserialized. `repo setup` writes `config_version: 1`; existing
