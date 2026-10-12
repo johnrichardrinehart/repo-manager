@@ -2896,6 +2896,34 @@ struct ManageChoice {
     relationship: ManageRelationship,
 }
 
+fn ensure_empty_legacy_repo(
+    tx: &rusqlite::Transaction<'_>,
+    id: i64,
+    allowed_fork_parent: Option<i64>,
+) -> Result<()> {
+    let referenced: i64 = tx.query_row(
+        "SELECT
+           (SELECT COUNT(*) FROM aliases WHERE repo_id = ?1)
+         + (SELECT COUNT(*) FROM events WHERE repo_id = ?1)
+         + (SELECT COUNT(*) FROM background_fetch WHERE repo_id = ?1)
+         + (SELECT COUNT(*) FROM forks WHERE canonical_repo_id = ?1)
+         + (SELECT COUNT(*) FROM forks
+            WHERE fork_repo_id = ?1 AND (?2 IS NULL OR canonical_repo_id != ?2))
+         + (SELECT COUNT(*) FROM related_history WHERE repo_id = ?1 OR related_repo_id = ?1)
+         + (SELECT COUNT(*) FROM locators
+            JOIN repos ON repos.id = locators.repo_id
+            WHERE locators.repo_id = ?1
+              AND (locators.authority != repos.current_authority
+                   OR locators.remote_path != repos.current_remote_path))",
+        params![id, allowed_fork_parent],
+        |row| row.get(0),
+    )?;
+    if referenced != 0 {
+        bail!("repository {id} has independent metadata; refusing shared-path migration");
+    }
+    Ok(())
+}
+
 impl Store {
     fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -2903,12 +2931,12 @@ impl Store {
                 .with_context(|| format!("creating state directory {}", parent.display()))?;
         }
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
-        let store = Self { conn };
+        let mut store = Self { conn };
         store.migrate()?;
         Ok(store)
     }
 
-    fn migrate(&self) -> Result<()> {
+    fn migrate(&mut self) -> Result<()> {
         self.conn.execute_batch(
             "
             PRAGMA foreign_keys = ON;
@@ -2919,6 +2947,7 @@ impl Store {
               current_authority TEXT NOT NULL,
               current_remote_path TEXT NOT NULL,
               current_path TEXT NOT NULL,
+              path_key TEXT NOT NULL DEFAULT '',
               canonical_identity TEXT,
               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
               updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -2989,6 +3018,112 @@ impl Store {
             DROP TABLE IF EXISTS worktrees;
             ",
         )?;
+        self.migrate_repository_paths()
+    }
+
+    /// Give every repository a comparable path key and make it unique. A
+    /// managed filesystem path has exactly one repository identity. Older
+    /// databases may hold a fork or a stale rename record at its canonical
+    /// repository's path; remove such a record only when it carries no
+    /// independent metadata, and refuse to open the store otherwise.
+    fn migrate_repository_paths(&mut self) -> Result<()> {
+        let has_path_key = {
+            let mut columns = self.conn.prepare("PRAGMA table_info(repos)")?;
+            columns
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .iter()
+                .any(|column| column == "path_key")
+        };
+        if !has_path_key {
+            self.conn
+                .execute_batch("ALTER TABLE repos ADD COLUMN path_key TEXT NOT NULL DEFAULT ''")?;
+        }
+
+        let tx = self.conn.transaction()?;
+        let unset = {
+            let mut stmt = tx.prepare("SELECT id, current_path FROM repos WHERE path_key = ''")?;
+            stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (id, path) in unset {
+            tx.execute(
+                "UPDATE repos SET path_key = ?2 WHERE id = ?1",
+                params![id, comparable_path(Path::new(&path)).display().to_string()],
+            )?;
+        }
+
+        let shared_paths = {
+            let mut stmt =
+                tx.prepare("SELECT path_key FROM repos GROUP BY path_key HAVING COUNT(*) > 1")?;
+            stmt.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for path_key in shared_paths {
+            let rows = {
+                let mut stmt = tx.prepare(
+                    "SELECT id, identity, current_authority || '/' || current_remote_path, canonical_identity
+                     FROM repos WHERE path_key = ?1 ORDER BY id",
+                )?;
+                stmt.query_map(params![path_key], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let canonical = rows
+                .iter()
+                .filter(|row| row.3.is_none())
+                .collect::<Vec<_>>();
+            if canonical.len() == 1 {
+                // A fork recorded at its canonical repository's path.
+                let owner = canonical[0];
+                for dependent in rows.iter().filter(|row| row.0 != owner.0) {
+                    let fork_count: i64 = tx.query_row(
+                        "SELECT COUNT(*) FROM forks WHERE fork_repo_id = ?1 AND canonical_repo_id = ?2",
+                        params![dependent.0, owner.0],
+                        |row| row.get(0),
+                    )?;
+                    if dependent.3.as_deref() != Some(owner.2.as_str()) || fork_count != 1 {
+                        bail!("ambiguous repository identities at {path_key}; refusing migration");
+                    }
+                    ensure_empty_legacy_repo(&tx, dependent.0, Some(owner.0))?;
+                    tx.execute("DELETE FROM repos WHERE id = ?1", params![dependent.0])?;
+                }
+            } else if canonical.len() == 2
+                && rows.len() == 2
+                && rows[0].2 == rows[1].2
+                && rows.iter().any(|row| row.1 != row.2)
+                && rows.iter().any(|row| row.1 == row.2)
+            {
+                // A renamed repository and a second record for its new name:
+                // keep the original record under the new identity.
+                let previous = rows.iter().find(|row| row.1 != row.2).unwrap();
+                let redundant = rows.iter().find(|row| row.1 == row.2).unwrap();
+                ensure_empty_legacy_repo(&tx, redundant.0, None)?;
+                tx.execute("DELETE FROM repos WHERE id = ?1", params![redundant.0])?;
+                tx.execute(
+                    "UPDATE repos SET identity = ?2 WHERE id = ?1",
+                    params![previous.0, previous.2],
+                )?;
+                tx.execute(
+                    "UPDATE repos SET canonical_identity = ?2 WHERE canonical_identity = ?1",
+                    params![previous.1, previous.2],
+                )?;
+            } else {
+                bail!("ambiguous repository identities at {path_key}; refusing migration");
+            }
+        }
+        tx.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS repos_path_key_unique ON repos(path_key)",
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -2998,14 +3133,30 @@ impl Store {
         path: &Path,
         canonical_identity: Option<&str>,
     ) -> Result<i64> {
+        let path_key = comparable_path(path).display().to_string();
+        let owner: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT identity FROM repos WHERE path_key = ?1 AND identity != ?2",
+                params![path_key, locator.key()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(owner) = owner {
+            bail!(
+                "repository path {} is already owned by {owner}",
+                path.display()
+            );
+        }
         self.conn.execute(
             "
-            INSERT INTO repos (identity, current_authority, current_remote_path, current_path, canonical_identity)
-            VALUES (?1, ?2, ?3, ?4, ?5)
+            INSERT INTO repos (identity, current_authority, current_remote_path, current_path, path_key, canonical_identity)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
             ON CONFLICT(identity) DO UPDATE SET
               current_authority = excluded.current_authority,
               current_remote_path = excluded.current_remote_path,
               current_path = excluded.current_path,
+              path_key = excluded.path_key,
               canonical_identity = COALESCE(excluded.canonical_identity, repos.canonical_identity),
               updated_at = CURRENT_TIMESTAMP
             ",
@@ -3014,6 +3165,7 @@ impl Store {
                 locator.authority,
                 locator.remote_path,
                 path.display().to_string(),
+                path_key,
                 canonical_identity
             ],
         )?;
@@ -3321,21 +3473,32 @@ impl Store {
     }
 
     fn apply_move_metadata(&self, repo_id: i64, plan: &MovePlan) -> Result<()> {
+        // The record takes the new identity; the old locator stays reachable
+        // through the locators table. A second record for the new name would
+        // claim the same path.
         self.conn.execute(
             "
             UPDATE repos SET
-              current_authority = ?2,
-              current_remote_path = ?3,
-              current_path = ?4,
+              identity = ?2,
+              current_authority = ?3,
+              current_remote_path = ?4,
+              current_path = ?5,
+              path_key = ?6,
               updated_at = CURRENT_TIMESTAMP
             WHERE id = ?1
             ",
             params![
                 repo_id,
+                plan.new_locator.key(),
                 plan.new_locator.authority,
                 plan.new_locator.remote_path,
-                plan.new_path.display().to_string()
+                plan.new_path.display().to_string(),
+                comparable_path(&plan.new_path).display().to_string(),
             ],
+        )?;
+        self.conn.execute(
+            "UPDATE repos SET canonical_identity = ?2 WHERE canonical_identity = ?1",
+            params![plan.old_locator.key(), plan.new_locator.key()],
         )?;
         self.record_locator(repo_id, &plan.old_locator, &plan.old_path, false)?;
         self.record_locator(repo_id, &plan.new_locator, &plan.new_path, true)?;
@@ -4316,7 +4479,7 @@ fn manage_repo(config: &Config, db: &Store, output: &Output, args: ManageArgs) -
         move_repo_into_managed_path(config, &original_root, &checkout_locator)?;
     let (worktree_path, history_review_requested) =
         if choice.relationship == ManageRelationship::Canonical {
-            manage_canonical_checkout(config, db, &canonical_locator, &repo_root, &remotes)?;
+            manage_canonical_checkout(config, db, &canonical_locator, &repo_root)?;
             let worktree_path = init_default_branch_worktree(
                 config,
                 &checkout_locator,
@@ -4375,36 +4538,21 @@ fn manage_repo(config: &Config, db: &Store, output: &Output, args: ManageArgs) -
 }
 
 /// Turn a canonical checkout already sitting at its clone-root path into the
-/// bare repository, and record every other locator-shaped remote it carried
-/// as a fork stored alongside it.
+/// bare repository and record it. Other Git remotes on the checkout stay Git
+/// remotes: the path belongs to the canonical repository alone, and a fork
+/// needs its own path and view.
 fn manage_canonical_checkout(
     config: &Config,
     db: &Store,
     canonical_locator: &Locator,
     repo_root: &Path,
-    remotes: &[GitRemote],
 ) -> Result<()> {
     if !is_bare_repository(repo_root)? {
         convert_standalone_checkout_to_bare_repository(repo_root)?;
     }
     ensure_origin_tracking_refs(repo_root)?;
     apply_repo_identity(&config.identities, canonical_locator, repo_root)?;
-    let canonical_id = db.upsert_repo(canonical_locator, repo_root, None)?;
-    for remote in remotes {
-        let Ok(remote_locator) = Locator::parse(&remote.url) else {
-            debug!(
-                "skipping non-locator-compatible remote {}: {}",
-                remote.name, remote.url
-            );
-            continue;
-        };
-        if remote_locator == *canonical_locator {
-            continue;
-        }
-        let remote_id =
-            db.upsert_repo(&remote_locator, repo_root, Some(&canonical_locator.key()))?;
-        db.record_fork(remote_id, canonical_id)?;
-    }
+    db.upsert_repo(canonical_locator, repo_root, None)?;
     Ok(())
 }
 
@@ -7513,6 +7661,16 @@ fn materialize_related_view(
     relationship: &str,
     identities: &IdentityMap,
 ) -> Result<SharedGitDirResolution> {
+    // Check before touching Git: a view written at the canonical path would
+    // replace the canonical repository.
+    if comparable_path(dependent_path) == comparable_path(controlling_path) {
+        bail!(
+            "dependent {} and canonical {} share the same checkout path {}; assign a distinct dependent path before repairing",
+            dependent_locator.key(),
+            controlling_locator.key(),
+            controlling_path.display()
+        );
+    }
     if !controlling_path.exists() {
         bail!(
             "canonical bare repository does not exist: {}",
@@ -10899,6 +11057,233 @@ mod tests {
     }
 
     #[test]
+    fn move_keeps_one_repository_identity_for_old_and_new_locator() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("repos.sqlite")).unwrap();
+        let old = Locator::parse("github.com/example/old").unwrap();
+        let new = Locator::parse("github.com/example/new").unwrap();
+        let clone_root = dir.path().join("clones");
+        let old_path = locator_path(&clone_root, &old);
+        let id = store.upsert_repo(&old, &old_path, None).unwrap();
+
+        let plan = plan_move(
+            &clone_root,
+            &dir.path().join("dev-worktrees"),
+            old.clone(),
+            new.clone(),
+            std::slice::from_ref(&old),
+        );
+        store.apply_move_metadata(id, &plan).unwrap();
+
+        assert_eq!(store.find_repo(&old.key()).unwrap().unwrap().id, id);
+        assert_eq!(store.find_repo(&new.key()).unwrap().unwrap().id, id);
+        assert_eq!(store.current_repos().unwrap().len(), 1);
+        assert_eq!(store.current_repos().unwrap()[0].path, plan.new_path);
+        assert_eq!(store.upsert_repo(&new, &plan.new_path, None).unwrap(), id);
+    }
+
+    #[test]
+    fn repository_path_has_one_owner_even_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("repos.sqlite")).unwrap();
+        let canonical = Locator::parse("github.com/example/canonical").unwrap();
+        let fork = Locator::parse("github.com/example/fork").unwrap();
+        let path = dir.path().join("canonical");
+        let alias = dir.path().join("alias");
+        fs::create_dir(&path).unwrap();
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+
+        store.upsert_repo(&canonical, &path, None).unwrap();
+        assert!(
+            store
+                .upsert_repo(&fork, &path, Some(&canonical.key()))
+                .unwrap_err()
+                .to_string()
+                .contains("already owned")
+        );
+        assert!(store.upsert_repo(&fork, &alias, None).is_err());
+        assert_eq!(store.current_repos().unwrap().len(), 1);
+        assert!(store.find_repo(&fork.key()).unwrap().is_none());
+    }
+
+    #[test]
+    fn rows_written_without_a_path_key_get_one_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("repos.sqlite");
+        let store = Store::open(&state).unwrap();
+        let first = Locator::parse("github.com/example/first").unwrap();
+        store
+            .upsert_repo(&first, &dir.path().join("first"), None)
+            .unwrap();
+        // An older binary inserts without the column, leaving the default.
+        store
+            .conn
+            .execute(
+                "INSERT INTO repos (identity, current_authority, current_remote_path, current_path)
+                 VALUES ('github.com/example/second', 'github.com', 'example/second', ?1)",
+                params![dir.path().join("second").display().to_string()],
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = Store::open(&state).unwrap();
+        let empty: i64 = reopened
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM repos WHERE path_key = ''",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(empty, 0);
+        let third = Locator::parse("github.com/example/third").unwrap();
+        reopened
+            .upsert_repo(&third, &dir.path().join("third"), None)
+            .unwrap();
+        assert_eq!(reopened.current_repos().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn legacy_shared_paths_keep_canonical_and_historical_locator() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("repos.sqlite");
+        let store = Store::open(&state).unwrap();
+        let canonical = Locator::parse("github.com/example/canonical").unwrap();
+        let fork = Locator::parse("github.com/example/fork").unwrap();
+        let old = Locator::parse("github.com/example/old-name").unwrap();
+        let renamed = Locator::parse("github.com/example/new-name").unwrap();
+        let canonical_path = dir.path().join("canonical");
+        let renamed_path = dir.path().join("renamed");
+        let canonical_id = store
+            .upsert_repo(&canonical, &canonical_path, None)
+            .unwrap();
+        let old_id = store.upsert_repo(&old, &renamed_path, None).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO aliases (repo_id, alias_path, target_path) VALUES (?1, ?2, ?3)",
+                params![
+                    old_id,
+                    dir.path().join("old-name").display().to_string(),
+                    renamed_path.display().to_string()
+                ],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute_batch(
+                "DROP INDEX repos_path_key_unique; ALTER TABLE repos DROP COLUMN path_key",
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO repos (identity, current_authority, current_remote_path, current_path, canonical_identity)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    fork.key(),
+                    fork.authority,
+                    fork.remote_path,
+                    canonical_path.display().to_string(),
+                    canonical.key()
+                ],
+            )
+            .unwrap();
+        let fork_id = store.conn.last_insert_rowid();
+        store
+            .record_locator(fork_id, &fork, &canonical_path, true)
+            .unwrap();
+        store.record_fork(fork_id, canonical_id).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE repos SET current_authority = ?2, current_remote_path = ?3 WHERE id = ?1",
+                params![old_id, renamed.authority, renamed.remote_path],
+            )
+            .unwrap();
+        store
+            .record_locator(old_id, &renamed, &renamed_path, true)
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO repos (identity, current_authority, current_remote_path, current_path)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    renamed.key(),
+                    renamed.authority,
+                    renamed.remote_path,
+                    renamed_path.display().to_string()
+                ],
+            )
+            .unwrap();
+        let redundant_id = store.conn.last_insert_rowid();
+        store
+            .record_locator(redundant_id, &renamed, &renamed_path, true)
+            .unwrap();
+        drop(store);
+
+        let migrated = Store::open(&state).unwrap();
+        assert_eq!(migrated.current_repos().unwrap().len(), 2);
+        assert_eq!(migrated.find_repo(&old.key()).unwrap().unwrap().id, old_id);
+        assert_eq!(
+            migrated.find_repo(&renamed.key()).unwrap().unwrap().id,
+            old_id
+        );
+        assert_eq!(migrated.aliases(&old.key()).unwrap().len(), 1);
+        assert!(migrated.find_repo(&fork.key()).unwrap().is_none());
+        assert!(migrated.shared_git_dir_relationships().unwrap().is_empty());
+        assert!(
+            migrated
+                .upsert_repo(&fork, &canonical_path, Some(&canonical.key()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn ambiguous_legacy_path_ownership_fails_without_removing_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("repos.sqlite");
+        let store = Store::open(&state).unwrap();
+        let first = Locator::parse("github.com/example/first").unwrap();
+        let second = Locator::parse("github.com/example/second").unwrap();
+        let shared = dir.path().join("shared");
+        store.upsert_repo(&first, &shared, None).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "DROP INDEX repos_path_key_unique; ALTER TABLE repos DROP COLUMN path_key",
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO repos (identity, current_authority, current_remote_path, current_path)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    second.key(),
+                    second.authority,
+                    second.remote_path,
+                    shared.display().to_string()
+                ],
+            )
+            .unwrap();
+        drop(store);
+
+        let error = Store::open(&state).err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("ambiguous repository identities")
+        );
+        let conn = Connection::open(&state).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM repos", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
     fn clone_repo_honors_bare_clone_configuration() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
@@ -11394,13 +11779,8 @@ mod tests {
             "shared history\n"
         );
         assert!(store.find_repo("example.com/current").unwrap().is_some());
-        assert_eq!(
-            store
-                .conn
-                .query_row("SELECT COUNT(*) FROM forks", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
+        assert!(store.find_repo("example.com/upstream").unwrap().is_none());
+        assert!(store.shared_git_dir_relationships().unwrap().is_empty());
         assert!(store.related_suggestions(true).unwrap().is_empty());
     }
 
@@ -13920,6 +14300,37 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn repair_rejects_dependent_at_canonical_path_without_replacing_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let canonical_locator = Locator::parse("github.com/example/canonical").unwrap();
+        let dependent_locator = Locator::parse("github.com/example/fork").unwrap();
+        let canonical_path = locator_path(&config.clone_root, &canonical_locator);
+        fs::create_dir_all(canonical_path.parent().unwrap()).unwrap();
+        run_git_in(
+            dir.path(),
+            ["init", "--bare", canonical_path.to_str().unwrap()],
+        )
+        .unwrap();
+
+        let error = materialize_related_view(
+            &store,
+            &dependent_locator,
+            &canonical_path,
+            &canonical_locator,
+            &canonical_path,
+            "fork",
+            &config.identities,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("share the same checkout path"));
+        assert!(is_bare_repository(&canonical_path).unwrap());
+        assert!(read_repo_view_metadata(&canonical_path).unwrap().is_none());
     }
 
     #[test]

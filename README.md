@@ -107,6 +107,14 @@ replaces legacy dependent checkouts with views. The `clone-as-bare` config key
 is accepted for compatibility with existing files and ignored; setting it to
 `false` is an error.
 
+Each managed filesystem path has one repository identity and one type
+(`canonical`, `fork`, or `mirror`). Additional Git remotes on a canonical
+repository do not create separate managed forks at that path. Existing
+shared-path remote records are removed from metadata when the database opens;
+Git remotes, refs, and historical locators are preserved. Fork and mirror
+repair requires a distinct dependent path and will not replace its canonical
+repository with a namespace view.
+
 Temporary refs use the `refs/tmp/` namespace. Run `repo refs gc --dry-run` to
 review old temporary refs. Run `repo refs gc` to remove refs older than the
 30-day grace period when a stable ref already reaches their target commit.
