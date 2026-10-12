@@ -5186,7 +5186,9 @@ fn read_repo_view_metadata(path: &Path) -> Result<Option<RepoViewMetadata>> {
             .with_context(|| format!("reading {}", metadata_path.display()))?,
     )
     .with_context(|| format!("parsing {}", metadata_path.display()))?;
-    if view.version != REPO_VIEW_METADATA_VERSION {
+    // Version 2 views use `refs/namespaces/repo-manager/` prefixes. Both
+    // versions record their prefix, which every reader uses as given.
+    if view.version != REPO_VIEW_METADATA_VERSION && view.version != 2 {
         bail!(
             "unsupported repo-manager view version {} in {}",
             view.version,
@@ -14331,6 +14333,38 @@ mod tests {
         assert!(error.to_string().contains("share the same checkout path"));
         assert!(is_bare_repository(&canonical_path).unwrap());
         assert!(read_repo_view_metadata(&canonical_path).unwrap().is_none());
+    }
+
+    #[test]
+    fn version_two_view_metadata_is_read_with_its_recorded_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let view_path = dir.path().join("mirror");
+        fs::create_dir(&view_path).unwrap();
+        let refs_prefix = "refs/namespaces/repo-manager/mirrors/example.com-mirror/refs";
+        fs::write(
+            view_path.join(REPO_VIEW_METADATA_FILE),
+            serde_json::json!({
+                "version": 2,
+                "relationship": "mirror",
+                "locator": Locator::parse("example.com/mirror").unwrap(),
+                "path": view_path,
+                "canonical_locator": Locator::parse("example.com/canonical").unwrap(),
+                "canonical_path": dir.path().join("canonical"),
+                "refs_prefix": refs_prefix,
+                "origin_url": "https://example.com/mirror",
+                "default_branch": "main",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let view = read_repo_view_metadata(&view_path).unwrap().unwrap();
+        assert_eq!(view.refs_prefix, refs_prefix);
+
+        let mut unknown = view;
+        unknown.version = 3;
+        write_repo_view_metadata(&unknown).unwrap();
+        assert!(read_repo_view_metadata(&view_path).is_err());
     }
 
     #[test]

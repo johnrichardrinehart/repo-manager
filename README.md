@@ -115,6 +115,11 @@ Git remotes, refs, and historical locators are preserved. Fork and mirror
 repair requires a distinct dependent path and will not replace its canonical
 repository with a namespace view.
 
+Existing fork and mirror views may use either `refs/repo-manager/` or
+`refs/namespaces/repo-manager/` references in their canonical repository.
+Repo-manager reads both view metadata versions and uses each view's recorded
+reference prefix; it does not rewrite existing references during `repo check`.
+
 Temporary refs use the `refs/tmp/` namespace. Run `repo refs gc --dry-run` to
 review old temporary refs. Run `repo refs gc` to remove refs older than the
 30-day grace period when a stable ref already reaches their target commit.
