@@ -83,9 +83,21 @@ push policy, without a separate `--set-upstream` step. This also applies to the
 initial branch checked out in a worktree of a locally created bare repository.
 Existing repositories are not automatically migrated to this configuration.
 
-`repo move` updates `origin` to the new locator. `repo reconcile` does the
-same for detected moves, preserving the existing remote URL style when
-possible.
+`repo move` and `repo reconcile` point every remote of the moved repository at
+the new locator: each `url` and `pushurl` that names the old locator, or any
+earlier locator of the repository, is rewritten in its own URL form. An SSH
+remote stays SSH, so `insteadOf` rules and SSH host aliases still select the
+same key. Remotes that name another repository, such as forks and upstreams,
+do not change. Both commands report the rewritten remotes.
+
+`origin` always ends at the new locator. If `repo move` gets a full URL (with
+a scheme such as `https://` or `ssh://`, or in scp style such as
+`git@github.com:org/project`), `origin` becomes exactly that URL: type an
+HTTPS URL to fetch a repository that you cannot push to with your key. If it
+gets a bare locator such as `github.com/org/project`, `origin` keeps its URL
+form and only the locator changes; a repository without `origin` gets the URL
+that `repo clone` uses for that locator. `repo reconcile` always keeps the URL
+form of `origin`.
 
 Forks and mirrors are namespace views of their canonical bare repository, not
 separate clones: `repo fork` fetches the fork's refs into the canonical Git dir

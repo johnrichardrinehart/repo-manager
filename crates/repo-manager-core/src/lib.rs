@@ -314,7 +314,7 @@ enum OrganizationalChangeCommands {
     // repository records.
     #[command(
         about = "Same repo, new locator (e.g. renamed/transferred GitHub repo)",
-        long_about = "Record and apply a move for the same hosted repository at a new locator.\n\nUse this when the same repository was renamed, transferred, or otherwise kept its hosted repository record but changed locator. `repo move` moves the real directory, records historical locators, updates remotes, and makes old paths aliases of the current path.\n\nDo not use this for canonicalization changes where the old source was archived, source-closed, deleted, or resumed elsewhere as a distinct repository. Use `repo successor set` for that."
+        long_about = "Record and apply a move for the same hosted repository at a new locator.\n\nUse this when the same repository was renamed, transferred, or otherwise kept its hosted repository record but changed locator. `repo move` moves the real directory, records historical locators, updates remotes, and makes old paths aliases of the current path.\n\nIf NEW_URL is a full URL (with a scheme such as https:// or ssh://, or scp style such as git@host:owner/repo), origin is set to exactly that URL. If NEW_URL is a bare locator such as github.com/owner/repo, origin keeps its URL form and only the locator changes; without an origin, the URL form of `repo clone` is used. Other remotes and push URLs that name the old repository keep their own URL form and get the new locator.\n\nDo not use this for canonicalization changes where the old source was archived, source-closed, deleted, or resumed elsewhere as a distinct repository. Use `repo successor set` for that."
     )]
     Move(MoveArgs),
     // Reconcile operates only on repositories already known to the metadata DB.
@@ -568,7 +568,7 @@ struct MoveArgs {
     repo_ref: String,
     #[arg(
         value_name = "NEW_URL",
-        help = "New Git URL or locator for the same hosted repository"
+        help = "New Git URL or locator for the same hosted repository. A full URL (with a scheme, or scp style) becomes origin exactly; a bare locator keeps origin's URL form"
     )]
     new_url: String,
 }
@@ -949,6 +949,25 @@ struct ReconcileMove {
     repo_path: PathBuf,
     evidence: String,
     plan: MovePlan,
+    remotes: Vec<RemoteRewrite>,
+}
+
+/// The result of `repo move`: the applied plan and the remotes it retargeted.
+#[derive(Debug, Serialize)]
+struct MoveReport {
+    #[serde(flatten)]
+    plan: MovePlan,
+    remotes: Vec<RemoteRewrite>,
+}
+
+/// A Git remote that a move pointed at the new locator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct RemoteRewrite {
+    remote: String,
+    /// The locator the remote pointed at before the move; `None` when its URL
+    /// was not a supported Git locator.
+    old_locator: Option<Locator>,
+    new_locator: Locator,
 }
 
 #[derive(Debug, Serialize)]
@@ -2342,6 +2361,13 @@ impl Locator {
     pub fn key(&self) -> String {
         format!("{}/{}", self.authority, self.remote_path)
     }
+}
+
+/// Whether `input` is a full Git URL, with a scheme or in scp style, rather
+/// than a bare `<authority>/<remote-path>` locator.
+fn is_explicit_git_url(input: &str) -> bool {
+    let input = input.trim();
+    input.contains("://") || parse_scp_like(input).is_some()
 }
 
 fn parse_scp_like(input: &str) -> Option<(&str, &str)> {
@@ -6095,7 +6121,7 @@ fn ensure_type_change_parent(
 
     let locator = Locator::parse(parent_ref)?;
     let path = locator_path(&config.clone_root, &locator);
-    let url = if parent_ref.contains("://") || parse_scp_like(parent_ref).is_some() {
+    let url = if is_explicit_git_url(parent_ref) {
         parent_ref.to_string()
     } else {
         remote_url_for_locator(None, &locator)
@@ -7471,10 +7497,15 @@ fn move_repo(
         &historical,
     );
     apply_filesystem_move(&plan)?;
-    ensure_remote(&plan.new_path, "origin", new_url)?;
+    let remotes = retarget_moved_remotes(
+        &plan.new_path,
+        &moved_from(historical, &plan),
+        &plan.new_locator,
+        is_explicit_git_url(new_url).then_some(new_url),
+    )?;
     apply_identity_for_layout(&config.identities, &plan.new_locator, &plan.new_path)?;
     db.apply_move_metadata(repo_id, &plan)?;
-    output_move(output, &plan)
+    output_move(output, &MoveReport { plan, remotes })
 }
 
 fn reconcile(config: &Config, db: &Store, output: &Output) -> Result<()> {
@@ -7511,8 +7542,12 @@ fn reconcile_repos(config: &Config, db: &Store) -> Result<ReconcileReport> {
                 &historical,
             );
             apply_filesystem_move(&plan)?;
-            let new_origin_url = remote_url_for_locator(origin_url.as_deref(), &plan.new_locator);
-            ensure_remote(&plan.new_path, "origin", &new_origin_url)?;
+            let remotes = retarget_moved_remotes(
+                &plan.new_path,
+                &moved_from(historical, &plan),
+                &plan.new_locator,
+                None,
+            )?;
             apply_identity_for_layout(&config.identities, &plan.new_locator, &plan.new_path)?;
             db.apply_move_metadata(repo.id, &plan)?;
             planned_moves.push(ReconcileMove {
@@ -7520,6 +7555,7 @@ fn reconcile_repos(config: &Config, db: &Store) -> Result<ReconcileReport> {
                 repo_path: repo.path,
                 evidence: "github-api".to_string(),
                 plan,
+                remotes,
             });
             continue;
         }
@@ -7558,7 +7594,12 @@ fn reconcile_repos(config: &Config, db: &Store) -> Result<ReconcileReport> {
             &historical,
         );
         apply_filesystem_move(&plan)?;
-        ensure_remote(&plan.new_path, "origin", &origin_url)?;
+        let remotes = retarget_moved_remotes(
+            &plan.new_path,
+            &moved_from(historical, &plan),
+            &plan.new_locator,
+            None,
+        )?;
         apply_identity_for_layout(&config.identities, &plan.new_locator, &plan.new_path)?;
         db.apply_move_metadata(repo.id, &plan)?;
         planned_moves.push(ReconcileMove {
@@ -7566,6 +7607,7 @@ fn reconcile_repos(config: &Config, db: &Store) -> Result<ReconcileReport> {
             repo_path: repo.path,
             evidence: format!("origin-url:{origin_url}"),
             plan,
+            remotes,
         });
     }
 
@@ -8885,6 +8927,144 @@ fn repair_worktrees(clone_path: &Path, worktree_root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Every locator a moved repository was known by: its history and the locator
+/// the move left.
+fn moved_from(historical: Vec<Locator>, plan: &MovePlan) -> Vec<Locator> {
+    let mut locators = historical;
+    locators.push(plan.old_locator.clone());
+    locators
+}
+
+/// Point the remotes of a moved repository at its new locator.
+///
+/// Every `url` and `pushurl` that names one of `moved_from` is rewritten in
+/// its own URL form, so an SSH remote stays SSH and keeps the host alias that
+/// `insteadOf` rules and SSH configuration select keys by. Remotes that name
+/// another repository, such as forks and upstreams, are left alone.
+///
+/// `origin` always ends at the new locator. `explicit_origin_url`, a URL the
+/// user typed, is used exactly. Without it, `origin` keeps its own URL form,
+/// or, if it is missing, gets the form `repo clone` uses for a bare locator.
+fn retarget_moved_remotes(
+    cwd: &Path,
+    moved_from: &[Locator],
+    new_locator: &Locator,
+    explicit_origin_url: Option<&str>,
+) -> Result<Vec<RemoteRewrite>> {
+    let original_origin_url = git_origin_url(cwd)?;
+    let mut rewrites: Vec<RemoteRewrite> = Vec::new();
+    for (key, url) in git_remote_url_entries(cwd)? {
+        let Ok(locator) = Locator::parse(&url) else {
+            continue;
+        };
+        if &locator == new_locator || !moved_from.contains(&locator) {
+            continue;
+        }
+        let new_url = remote_url_for_locator(Some(&url), new_locator);
+        run_git_in(
+            cwd,
+            [
+                "config",
+                "--local",
+                "--fixed-value",
+                "--replace-all",
+                &key.config_key(),
+                &new_url,
+                &url,
+            ],
+        )?;
+        if !rewrites.iter().any(|rewrite| rewrite.remote == key.remote) {
+            rewrites.push(RemoteRewrite {
+                remote: key.remote,
+                old_locator: Some(locator),
+                new_locator: new_locator.clone(),
+            });
+        }
+    }
+
+    let origin_url = git_origin_url(cwd)?;
+    let target_origin_url = match (explicit_origin_url, origin_url.as_deref()) {
+        (Some(explicit), _) => explicit.to_string(),
+        (None, Some(current)) if Locator::parse(current).ok().as_ref() == Some(new_locator) => {
+            current.to_string()
+        }
+        (None, current) => remote_url_for_locator(current, new_locator),
+    };
+    if origin_url.as_deref() != Some(target_origin_url.as_str()) {
+        ensure_remote(cwd, "origin", &target_origin_url)?;
+        if original_origin_url.is_some()
+            && !rewrites.iter().any(|rewrite| rewrite.remote == "origin")
+        {
+            rewrites.push(RemoteRewrite {
+                remote: "origin".to_string(),
+                old_locator: original_origin_url
+                    .as_deref()
+                    .and_then(|url| Locator::parse(url).ok()),
+                new_locator: new_locator.clone(),
+            });
+        }
+    }
+    Ok(rewrites)
+}
+
+/// One `remote.<name>.url` or `remote.<name>.pushurl` key.
+struct RemoteUrlKey {
+    remote: String,
+    variable: &'static str,
+}
+
+impl RemoteUrlKey {
+    fn config_key(&self) -> String {
+        format!("remote.{}.{}", self.remote, self.variable)
+    }
+}
+
+/// Every URL and push URL in the repository's own config, one entry per value.
+fn git_remote_url_entries(cwd: &Path) -> Result<Vec<(RemoteUrlKey, String)>> {
+    let Some(stdout) = git_output_optional(
+        cwd,
+        [
+            "config",
+            "--local",
+            "--get-regexp",
+            r"^remote\..*\.(url|pushurl)$",
+        ],
+        "reading Git remote URLs",
+    )?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut entries = Vec::new();
+    for line in stdout.lines() {
+        let Some((key, url)) = line.split_once(' ') else {
+            continue;
+        };
+        let Some((remote, variable)) = key
+            .strip_prefix("remote.")
+            .and_then(|key| key.rsplit_once('.'))
+        else {
+            continue;
+        };
+        let variable = match variable {
+            "url" => "url",
+            "pushurl" => "pushurl",
+            _ => continue,
+        };
+        let url = url.trim();
+        if remote.is_empty() || url.is_empty() {
+            continue;
+        }
+        entries.push((
+            RemoteUrlKey {
+                remote: remote.to_string(),
+                variable,
+            },
+            url.to_string(),
+        ));
+    }
+    Ok(entries)
+}
+
 fn ensure_remote(cwd: &Path, name: &str, url: &str) -> Result<()> {
     if git_remote_url(cwd, name)?.is_some() {
         run_git_in(cwd, ["remote", "set-url", name, url])
@@ -9416,10 +9596,11 @@ fn output_worktree(
     Ok(())
 }
 
-fn output_move(output: &Output, plan: &MovePlan) -> Result<()> {
+fn output_move(output: &Output, report: &MoveReport) -> Result<()> {
     if output.json {
-        return print_json(plan);
+        return print_json(report);
     }
+    let plan = &report.plan;
     println!(
         "moved {} -> {}",
         plan.old_locator.key(),
@@ -9440,7 +9621,22 @@ fn output_move(output: &Output, plan: &MovePlan) -> Result<()> {
             alias.target_path.display()
         );
     }
+    print_remote_rewrites(&report.remotes);
     Ok(())
+}
+
+fn print_remote_rewrites(rewrites: &[RemoteRewrite]) {
+    for rewrite in rewrites {
+        let old = rewrite
+            .old_locator
+            .as_ref()
+            .map_or_else(|| "unrecognized URL".to_string(), Locator::key);
+        println!(
+            "remote {}: {old} -> {}",
+            rewrite.remote,
+            rewrite.new_locator.key()
+        );
+    }
 }
 
 fn output_fetch(output: &Output, result: &FetchResult) -> Result<()> {
@@ -9495,6 +9691,9 @@ fn output_reconcile(output: &Output, report: &ReconcileReport) -> Result<()> {
         return print_json(report);
     }
     println!("applied {} move(s)", report.planned_moves.len());
+    for planned in &report.planned_moves {
+        print_remote_rewrites(&planned.remotes);
+    }
     if !report.skipped.is_empty() {
         println!("skipped {} repo(s)", report.skipped.len());
     }
@@ -12152,6 +12351,462 @@ mod tests {
         assert_eq!(
             git_origin_url(&new_path).unwrap().unwrap(),
             "https://github.com/new-owner/new-name.git"
+        );
+    }
+
+    fn init_tracked_repo(config: &Config, store: &Store, locator: &str, origin: &str) -> PathBuf {
+        let locator = Locator::parse(locator).unwrap();
+        let path = locator_path(&config.clone_root, &locator);
+        fs::create_dir_all(&path).unwrap();
+        run_git_in(&path, ["init"]).unwrap();
+        run_git_in(&path, ["remote", "add", "origin", origin]).unwrap();
+        store.upsert_repo(&locator, &path, None).unwrap();
+        path
+    }
+
+    fn git_config_all(cwd: &Path, key: &str) -> Vec<String> {
+        git_output_optional(cwd, ["config", "--get-all", key], "reading test config")
+            .unwrap()
+            .map(|values| values.lines().map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    fn move_for_test(config: &Config, store: &Store, repo_ref: &str, new_url: &str) {
+        move_repo(config, store, &Output { json: true }, repo_ref, new_url).unwrap();
+    }
+
+    #[test]
+    fn move_to_a_bare_locator_keeps_scp_style_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        init_tracked_repo(
+            &config,
+            &store,
+            "github.com/OldOwner/repo",
+            "git@github.com:OldOwner/repo.git",
+        );
+
+        move_for_test(
+            &config,
+            &store,
+            "github.com/OldOwner/repo",
+            "github.com/NewOwner/repo",
+        );
+
+        let new_path = locator_path(
+            &config.clone_root,
+            &Locator::parse("github.com/NewOwner/repo").unwrap(),
+        );
+        assert_eq!(
+            git_origin_url(&new_path).unwrap().unwrap(),
+            "git@github.com:NewOwner/repo.git"
+        );
+    }
+
+    #[test]
+    fn move_to_a_bare_locator_keeps_ssh_url_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        init_tracked_repo(
+            &config,
+            &store,
+            "github.com/OldOwner/repo",
+            "ssh://git@github.com/OldOwner/repo",
+        );
+
+        move_for_test(
+            &config,
+            &store,
+            "github.com/OldOwner/repo",
+            "github.com/NewOwner/repo",
+        );
+
+        let new_path = locator_path(
+            &config.clone_root,
+            &Locator::parse("github.com/NewOwner/repo").unwrap(),
+        );
+        assert_eq!(
+            git_origin_url(&new_path).unwrap().unwrap(),
+            "ssh://git@github.com/NewOwner/repo"
+        );
+    }
+
+    #[test]
+    fn move_to_an_https_url_sets_exactly_that_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        init_tracked_repo(
+            &config,
+            &store,
+            "github.com/OldOwner/repo",
+            "git@github.com:OldOwner/repo.git",
+        );
+
+        move_for_test(
+            &config,
+            &store,
+            "github.com/OldOwner/repo",
+            "https://github.com/Org/repo",
+        );
+
+        let new_path = locator_path(
+            &config.clone_root,
+            &Locator::parse("github.com/Org/repo").unwrap(),
+        );
+        assert_eq!(
+            git_config_all(&new_path, "remote.origin.url"),
+            ["https://github.com/Org/repo"]
+        );
+    }
+
+    #[test]
+    fn move_to_an_scp_style_url_sets_exactly_that_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        init_tracked_repo(
+            &config,
+            &store,
+            "github.com/OldOwner/repo",
+            "https://github.com/OldOwner/repo.git",
+        );
+
+        move_for_test(
+            &config,
+            &store,
+            "github.com/OldOwner/repo",
+            "git@github-work:Org/repo",
+        );
+
+        // The host alias is not the locator's authority, so the move lands at
+        // the alias's locator; origin is still exactly the typed URL.
+        let new_path = locator_path(
+            &config.clone_root,
+            &Locator::parse("git@github-work:Org/repo").unwrap(),
+        );
+        assert_eq!(
+            git_config_all(&new_path, "remote.origin.url"),
+            ["git@github-work:Org/repo"]
+        );
+    }
+
+    #[test]
+    fn move_without_origin_uses_a_typed_url_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let old_path = init_tracked_repo(
+            &config,
+            &store,
+            "github.com/OldOwner/repo",
+            "git@github.com:OldOwner/repo.git",
+        );
+        run_git_in(&old_path, ["remote", "remove", "origin"]).unwrap();
+
+        move_for_test(
+            &config,
+            &store,
+            "github.com/OldOwner/repo",
+            "https://github.com/NewOwner/repo",
+        );
+
+        let new_path = locator_path(
+            &config.clone_root,
+            &Locator::parse("github.com/NewOwner/repo").unwrap(),
+        );
+        assert_eq!(
+            git_origin_url(&new_path).unwrap().unwrap(),
+            "https://github.com/NewOwner/repo"
+        );
+    }
+
+    #[test]
+    fn move_without_origin_to_a_bare_locator_uses_the_clone_url_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let old_path = init_tracked_repo(
+            &config,
+            &store,
+            "github.com/OldOwner/repo",
+            "git@github.com:OldOwner/repo.git",
+        );
+        run_git_in(&old_path, ["remote", "remove", "origin"]).unwrap();
+
+        move_for_test(
+            &config,
+            &store,
+            "github.com/OldOwner/repo",
+            "github.com/NewOwner/repo",
+        );
+
+        let new_locator = Locator::parse("github.com/NewOwner/repo").unwrap();
+        let new_path = locator_path(&config.clone_root, &new_locator);
+        assert_eq!(
+            git_origin_url(&new_path).unwrap().unwrap(),
+            remote_url_for_locator(Some("github.com/NewOwner/repo"), &new_locator)
+        );
+        assert_eq!(
+            git_origin_url(&new_path).unwrap().unwrap(),
+            "git@github.com:NewOwner/repo"
+        );
+    }
+
+    #[test]
+    fn move_retargets_every_remote_of_the_moved_repository_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        init_tracked_repo(
+            &config,
+            &store,
+            "github.com/first/repo",
+            "git@github.com:first/repo.git",
+        );
+        move_for_test(
+            &config,
+            &store,
+            "github.com/first/repo",
+            "git@github.com:OldOwner/repo.git",
+        );
+
+        let old_path = locator_path(
+            &config.clone_root,
+            &Locator::parse("github.com/OldOwner/repo").unwrap(),
+        );
+        // Another remote for the same repository in another URL form.
+        run_git_in(
+            &old_path,
+            [
+                "remote",
+                "add",
+                "work",
+                "https://github.com/OldOwner/repo.git/",
+            ],
+        )
+        .unwrap();
+        // A remote that still names a locator this repository had before.
+        run_git_in(
+            &old_path,
+            ["remote", "add", "legacy", "ssh://git@github.com/first/repo"],
+        )
+        .unwrap();
+        // A different repository.
+        run_git_in(
+            &old_path,
+            [
+                "remote",
+                "add",
+                "upstream",
+                "git@github.com:someone/repo.git",
+            ],
+        )
+        .unwrap();
+
+        move_for_test(
+            &config,
+            &store,
+            "github.com/OldOwner/repo",
+            "github.com/NewOwner/repo",
+        );
+
+        let new_path = locator_path(
+            &config.clone_root,
+            &Locator::parse("github.com/NewOwner/repo").unwrap(),
+        );
+
+        assert_eq!(
+            git_config_all(&new_path, "remote.origin.url"),
+            ["git@github.com:NewOwner/repo.git"]
+        );
+        assert_eq!(
+            git_config_all(&new_path, "remote.work.url"),
+            ["https://github.com/NewOwner/repo.git"]
+        );
+        assert_eq!(
+            git_config_all(&new_path, "remote.legacy.url"),
+            ["ssh://git@github.com/NewOwner/repo"]
+        );
+        assert_eq!(
+            git_config_all(&new_path, "remote.upstream.url"),
+            ["git@github.com:someone/repo.git"]
+        );
+    }
+
+    #[test]
+    fn move_reports_retargeted_remotes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let old_path = init_tracked_repo(
+            &config,
+            &store,
+            "github.com/OldOwner/repo",
+            "git@github.com:OldOwner/repo.git",
+        );
+        run_git_in(
+            &old_path,
+            ["remote", "add", "work", "https://github.com/OldOwner/repo"],
+        )
+        .unwrap();
+        run_git_in(
+            &old_path,
+            ["remote", "add", "upstream", "https://github.com/other/repo"],
+        )
+        .unwrap();
+
+        let old_locator = Locator::parse("github.com/OldOwner/repo").unwrap();
+        let new_locator = Locator::parse("github.com/NewOwner/repo").unwrap();
+        let plan = plan_move(
+            &config.clone_root,
+            &config.dev_worktree_root,
+            old_locator.clone(),
+            new_locator.clone(),
+            &[],
+        );
+        apply_filesystem_move(&plan).unwrap();
+        let remotes = retarget_moved_remotes(
+            &plan.new_path,
+            std::slice::from_ref(&old_locator),
+            &new_locator,
+            None,
+        )
+        .unwrap();
+
+        let rewrite = |remote: &str| RemoteRewrite {
+            remote: remote.to_string(),
+            old_locator: Some(old_locator.clone()),
+            new_locator: new_locator.clone(),
+        };
+        assert_eq!(remotes, [rewrite("origin"), rewrite("work")]);
+        let json = serde_json::to_value(MoveReport { plan, remotes }).unwrap();
+        assert_eq!(json["new_locator"]["remote_path"], "NewOwner/repo");
+        assert_eq!(json["remotes"][1]["remote"], "work");
+        assert_eq!(
+            json["remotes"][1]["old_locator"]["remote_path"],
+            "OldOwner/repo"
+        );
+    }
+
+    #[test]
+    fn move_retargets_push_urls_of_the_moved_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let old_path = init_tracked_repo(
+            &config,
+            &store,
+            "github.com/OldOwner/repo",
+            "https://github.com/OldOwner/repo",
+        );
+        run_git_in(
+            &old_path,
+            [
+                "remote",
+                "set-url",
+                "--add",
+                "--push",
+                "origin",
+                "git@github.com:OldOwner/repo.git",
+            ],
+        )
+        .unwrap();
+        run_git_in(
+            &old_path,
+            [
+                "remote",
+                "set-url",
+                "--add",
+                "--push",
+                "origin",
+                "git@github.com:backup/repo.git",
+            ],
+        )
+        .unwrap();
+
+        move_for_test(
+            &config,
+            &store,
+            "github.com/OldOwner/repo",
+            "github.com/NewOwner/repo",
+        );
+
+        let new_path = locator_path(
+            &config.clone_root,
+            &Locator::parse("github.com/NewOwner/repo").unwrap(),
+        );
+        assert_eq!(
+            git_config_all(&new_path, "remote.origin.url"),
+            ["https://github.com/NewOwner/repo"]
+        );
+        assert_eq!(
+            git_config_all(&new_path, "remote.origin.pushurl"),
+            [
+                "git@github.com:NewOwner/repo.git",
+                "git@github.com:backup/repo.git"
+            ]
+        );
+    }
+
+    #[test]
+    fn reconcile_retargets_other_remotes_of_the_moved_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let old_path = init_tracked_repo(
+            &config,
+            &store,
+            "example.com/old/project",
+            "https://github.com/new/project.git",
+        );
+        run_git_in(
+            &old_path,
+            [
+                "remote",
+                "add",
+                "mirror",
+                "ssh://git@example.com/old/project.git",
+            ],
+        )
+        .unwrap();
+        run_git_in(
+            &old_path,
+            [
+                "remote",
+                "add",
+                "upstream",
+                "https://example.com/other/project",
+            ],
+        )
+        .unwrap();
+
+        let report = reconcile_repos(&config, &store).unwrap();
+
+        assert_eq!(report.planned_moves.len(), 1);
+        let new_locator = Locator::parse("github.com/new/project").unwrap();
+        assert_eq!(
+            report.planned_moves[0].remotes,
+            [RemoteRewrite {
+                remote: "mirror".to_string(),
+                old_locator: Some(Locator::parse("example.com/old/project").unwrap()),
+                new_locator: new_locator.clone(),
+            }]
+        );
+        let new_path = locator_path(&config.clone_root, &new_locator);
+        assert_eq!(
+            git_config_all(&new_path, "remote.origin.url"),
+            ["https://github.com/new/project.git"]
+        );
+        assert_eq!(
+            git_config_all(&new_path, "remote.mirror.url"),
+            ["ssh://git@github.com/new/project.git"]
+        );
+        assert_eq!(
+            git_config_all(&new_path, "remote.upstream.url"),
+            ["https://example.com/other/project"]
         );
     }
 
