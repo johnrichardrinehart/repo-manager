@@ -7,6 +7,8 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,6 +31,15 @@ const CURRENT_CONFIG_VERSION: u32 = 1;
 const RPC_PROTOCOL_VERSION: u32 = 1;
 const BACKGROUND_FETCH_MIN_WAKE_SECONDS: u64 = 1;
 const BACKGROUND_FETCH_MAX_WAKE_SECONDS: u64 = 300;
+/// Longest one background `git fetch` may run. Git's SSH transport has no
+/// timeout of its own, and ssh without ServerAlive options waits forever on a
+/// connection whose other end is gone, for example after the machine slept.
+/// The background pass fetches one repository at a time, so without a bound
+/// one such fetch stops every later one.
+const BACKGROUND_FETCH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// How long a timed-out fetch gets after SIGTERM, so that Git can remove its
+/// lock files and temporary packs, before SIGKILL.
+const BACKGROUND_FETCH_TERM_GRACE: Duration = Duration::from_secs(10);
 const DEFAULT_TMP_REF_GRACE_PERIOD_SECONDS: u64 = 30 * 24 * 60 * 60;
 const REPO_VIEW_METADATA_FILE: &str = ".repo-manager-view.json";
 const REPO_VIEW_METADATA_VERSION: u32 = 1;
@@ -5454,7 +5465,7 @@ fn fetch_repo(
             )
         }
         RepoContext::Managed(repo) => {
-            fetch_remote_updating_refs(&repo.path, &args.remote)?;
+            fetch_remote_updating_refs(&repo.path, &args.remote, None)?;
             output_fetch(
                 output,
                 &FetchResult {
@@ -8135,7 +8146,11 @@ fn background_fetch_repo(path: &Path) -> Result<bool> {
     if is_bare_repository(path)? {
         background_fetch_bare_repo(path)?;
     } else {
-        run_git_in(path, ["fetch", "--all", "--prune"])?;
+        run_git_in_with_timeout(
+            path,
+            ["fetch", "--all", "--prune"],
+            Some(BACKGROUND_FETCH_TIMEOUT),
+        )?;
     }
     let after = git_ref_fingerprint(path)?;
     Ok(before != after)
@@ -8143,12 +8158,14 @@ fn background_fetch_repo(path: &Path) -> Result<bool> {
 
 fn background_fetch_bare_repo(path: &Path) -> Result<()> {
     for remote in git_remotes(path)? {
-        fetch_remote_updating_refs(path, &remote.name)?;
+        fetch_remote_updating_refs(path, &remote.name, Some(BACKGROUND_FETCH_TIMEOUT))?;
     }
     Ok(())
 }
 
 /// Fetch `remote` into `path`, updating remote-tracking refs when the repository is bare.
+/// With `timeout`, a fetch that runs longer is stopped and reported as failed
+/// (see `run_git_in_with_timeout`).
 ///
 /// `git clone --bare` records no `remote.origin.fetch` refspec, unlike
 /// `--mirror`, so a plain `git fetch origin` in a bare repository advances only
@@ -8158,19 +8175,20 @@ fn background_fetch_bare_repo(path: &Path) -> Result<()> {
 /// branches owned by the worktrees. Fetching straight into `refs/heads/*`
 /// would be refused for any branch checked out in a worktree and would clobber
 /// unpushed local commits elsewhere.
-fn fetch_remote_updating_refs(path: &Path, remote: &str) -> Result<()> {
+fn fetch_remote_updating_refs(path: &Path, remote: &str, timeout: Option<Duration>) -> Result<()> {
     if !is_bare_repository(path)? {
-        return run_git_in(path, ["fetch", "--prune", remote]);
+        return run_git_in_with_timeout(path, ["fetch", "--prune", remote], timeout);
     }
     if remote == "origin" {
         ensure_tracking_refspec(path, remote)?;
-        run_git_in(path, ["fetch", "--prune", remote])
+        run_git_in_with_timeout(path, ["fetch", "--prune", remote], timeout)
     } else {
         let heads_refspec = format!("+refs/heads/*:refs/remotes/{remote}/*");
         let tags_refspec = format!("+refs/tags/*:refs/repo-manager/remotes/{remote}/tags/*");
-        run_git_in(
+        run_git_in_with_timeout(
             path,
             ["fetch", "--prune", remote, &heads_refspec, &tags_refspec],
+            timeout,
         )
     }
 }
@@ -9150,6 +9168,105 @@ where
         bail!("git command failed with status {status}");
     }
     Ok(())
+}
+
+/// Run `git -C cwd args`. With `timeout`, stop it if it runs longer.
+fn run_git_in_with_timeout<I, S>(cwd: &Path, args: I, timeout: Option<Duration>) -> Result<()>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let Some(timeout) = timeout else {
+        return run_git_in(cwd, args);
+    };
+    let mut command = git_command(cwd);
+    command.args(args);
+    run_command_with_timeout(
+        command,
+        &format!("git in {}", cwd.display()),
+        timeout,
+        BACKGROUND_FETCH_TERM_GRACE,
+    )
+}
+
+/// Run `command` and wait at most `timeout` for it to finish.
+///
+/// The command runs in a process group of its own. On timeout the whole group
+/// gets SIGTERM, then SIGKILL once `grace` has passed: `git fetch` runs `ssh`
+/// as a child, and stopping only Git would leave ssh holding the connection.
+fn run_command_with_timeout(
+    mut command: Command,
+    label: &str,
+    timeout: Duration,
+    grace: Duration,
+) -> Result<()> {
+    const POLL: Duration = Duration::from_millis(100);
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("starting {label}"))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("waiting for {label}"))?
+        {
+            if !status.success() {
+                bail!("{label} failed with status {status}");
+            }
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(POLL);
+    }
+    signal_child_group(&mut child, Signal::Terminate);
+    let grace_deadline = Instant::now() + grace;
+    while Instant::now() < grace_deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            break;
+        }
+        thread::sleep(POLL);
+    }
+    // Also after the leader exited: other members of its group, such as ssh,
+    // may still run.
+    signal_child_group(&mut child, Signal::Kill);
+    let _ = child.wait();
+    bail!(
+        "{label} did not finish within {} seconds and was stopped",
+        timeout.as_secs()
+    )
+}
+
+#[derive(Clone, Copy)]
+enum Signal {
+    Terminate,
+    Kill,
+}
+
+/// Send `signal` to the process group that `child` leads (see
+/// `run_command_with_timeout`). A group without members is not an error.
+#[cfg(unix)]
+fn signal_child_group(child: &mut std::process::Child, signal: Signal) {
+    let signal = match signal {
+        Signal::Terminate => libc::SIGTERM,
+        Signal::Kill => libc::SIGKILL,
+    };
+    let Ok(group) = libc::pid_t::try_from(child.id()) else {
+        return;
+    };
+    // SAFETY: kill(2) takes plain integers and touches no memory of ours. The
+    // negative pid names the group that `process_group(0)` made for the child.
+    unsafe {
+        libc::kill(-group, signal);
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_child_group(child: &mut std::process::Child, _signal: Signal) {
+    let _ = child.kill();
 }
 
 fn git_output<const N: usize>(cwd: &Path, args: [&str; N], action: &str) -> Result<String> {
@@ -10433,6 +10550,62 @@ mod tests {
         assert!(help.contains("--detect-related"));
         assert!(help.contains("--clone-start-ttl-minutes"));
         assert!(help.contains("--rpc-rate-limit-per-second"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_with_timeout_stops_the_whole_process_group() {
+        // A shell that never finishes, with a background child standing in for
+        // the ssh that `git fetch` runs: it writes the marker one second in,
+        // unless the timeout stopped the group, not just the shell.
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("survived");
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "(sleep 1; echo alive > \"$1\") & sleep 30", "sh"])
+            .arg(&marker);
+
+        let started = Instant::now();
+        let error = run_command_with_timeout(
+            command,
+            "hung command",
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the runner waited {:?}",
+            started.elapsed()
+        );
+        assert!(
+            error.to_string().contains("did not finish"),
+            "unexpected error: {error:#}"
+        );
+        thread::sleep(Duration::from_secs(2));
+        assert!(
+            !marker.exists(),
+            "a member of the process group outlived the timeout"
+        );
+    }
+
+    #[test]
+    fn command_with_timeout_reports_the_exit_status() {
+        let run = |program: &str| {
+            run_command_with_timeout(
+                Command::new(program),
+                program,
+                Duration::from_secs(30),
+                Duration::from_secs(1),
+            )
+        };
+        run("true").unwrap();
+        let error = run("false").unwrap_err();
+        assert!(
+            error.to_string().contains("failed with status"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[cfg(unix)]
@@ -14466,7 +14639,7 @@ mod tests {
         seed_commit(&seed, "README.md", "two\n", "two");
         let upstream_tip = git_output(&seed, ["rev-parse", "HEAD"], "seed tip").unwrap();
 
-        fetch_remote_updating_refs(&clone_path, "origin").unwrap();
+        fetch_remote_updating_refs(&clone_path, "origin", None).unwrap();
 
         assert_eq!(
             git_output(

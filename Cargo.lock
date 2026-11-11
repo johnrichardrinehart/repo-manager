@@ -1183,6 +1183,7 @@ dependencies = [
  "env_logger",
  "getrandom 0.4.2",
  "jsonschema",
+ "libc",
  "log",
  "prost",
  "prost-build",
