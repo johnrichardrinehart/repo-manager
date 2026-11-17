@@ -1080,6 +1080,7 @@ struct RepairReport {
     relationships: Vec<RepairRelationship>,
     identities: Vec<RepairIdentity>,
     skipped: Vec<RepairSkip>,
+    backups: Vec<RepairBackup>,
 }
 
 #[derive(Debug, Serialize)]
@@ -6657,6 +6658,7 @@ enum RepairOperationKind {
     TrackUnmanagedCheckout(RepairUntrackedCheckout),
     RepairRelationship(Box<RepairRelationship>),
     ApplyIdentity(RepairIdentity),
+    RemoveBackup(RepairBackup),
 }
 
 fn repair_operations_from_report(report: &RepairReport) -> Vec<RepairOperation> {
@@ -6742,6 +6744,18 @@ fn repair_operations_from_report(report: &RepairReport) -> Vec<RepairOperation> 
             id: next_id,
             summary: format!("apply identity config to {}", identity.locator.key()),
             kind: RepairOperationKind::ApplyIdentity(identity.clone()),
+        });
+        next_id += 1;
+    }
+
+    for backup in &report.backups {
+        if backup.status != RepairBackupStatus::Preserved {
+            continue;
+        }
+        operations.push(RepairOperation {
+            id: next_id,
+            summary: format!("remove fully preserved backup {}", backup.path.display()),
+            kind: RepairOperationKind::RemoveBackup(backup.clone()),
         });
         next_id += 1;
     }
@@ -6878,6 +6892,7 @@ fn apply_repair_operations(
         relationships: Vec::new(),
         identities: Vec::new(),
         skipped: Vec::new(),
+        backups: Vec::new(),
     };
 
     for operation in operations {
@@ -6984,13 +6999,256 @@ fn apply_repair_operations(
                     .identities
                     .push(apply_identity_repair(&config.identities, identity));
             }
+            RepairOperationKind::RemoveBackup(backup) => {
+                report.backups.push(remove_replaced_backup(backup)?);
+            }
         }
     }
 
     Ok(report)
 }
 
+/// Name prefix of a checkout moved aside by [`unique_backup_path`].
+const REPLACED_BACKUP_PREFIX: &str = ".repo-manager-replaced-";
+
+#[derive(Debug, Clone, Serialize)]
+struct RepairBackup {
+    path: PathBuf,
+    /// The managed path the backup was moved aside from.
+    replaced_path: PathBuf,
+    /// The repository now holding the backup's contents.
+    storage_path: PathBuf,
+    refs: usize,
+    status: RepairBackupStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum RepairBackupStatus {
+    /// Everything in the backup is in `storage_path`; it can be removed.
+    Preserved,
+    Removed,
+}
+
+/// Directories under `root` that [`unique_backup_path`] moved a checkout
+/// aside to. Repositories, views and aliases are not descended into.
+fn find_replaced_backups(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    let mut pending = vec![(root.to_path_buf(), 0_usize)];
+    while let Some((dir, depth)) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let path = entry.path();
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(REPLACED_BACKUP_PREFIX)
+            {
+                found.push(path);
+                continue;
+            }
+            let opaque = path.join("HEAD").exists()
+                || path.join(".git").exists()
+                || path.join(REPO_VIEW_METADATA_FILE).exists();
+            if depth < 8 && !opaque {
+                pending.push((path, depth + 1));
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// The path `backup` was moved aside from: the sibling named by the leaf
+/// in `.repo-manager-replaced-<leaf>-<pid>-<index>`.
+fn replaced_path_of_backup(backup: &Path) -> Option<PathBuf> {
+    let name = backup
+        .file_name()?
+        .to_str()?
+        .strip_prefix(REPLACED_BACKUP_PREFIX)?;
+    let mut parts = name.rsplitn(3, '-');
+    let index = parts.next()?;
+    let pid = parts.next()?;
+    let leaf = parts.next()?;
+    (index.parse::<u32>().is_ok() && pid.parse::<u32>().is_ok() && !leaf.is_empty())
+        .then(|| backup.with_file_name(leaf))
+}
+
+/// The repository that took over what was at `replaced`: the storage of the
+/// view now there, the target of a `moved` alias, or the repository itself.
+fn backup_storage(replaced: &Path) -> std::result::Result<PathBuf, String> {
+    let metadata = fs::symlink_metadata(replaced)
+        .map_err(|_| format!("{} no longer exists", replaced.display()))?;
+    if metadata.file_type().is_symlink() {
+        return fs::canonicalize(replaced)
+            .map_err(|error| format!("alias {} is broken: {error}", replaced.display()));
+    }
+    match read_repo_view_metadata(replaced) {
+        Ok(Some(view)) => Ok(view.canonical_path),
+        Ok(None) if is_git_repository_path(replaced) => Ok(replaced.to_path_buf()),
+        Ok(None) => Err(format!(
+            "{} is neither a repository, a view, nor an alias",
+            replaced.display()
+        )),
+        Err(error) => Err(format!("{error:#}")),
+    }
+}
+
+/// Whether `object` exists in `repo` and, when it is or names a commit,
+/// is reachable from one of `repo`'s refs.
+fn object_preserved_in(repo: &Path, object: &str) -> Result<bool> {
+    let exists = git_command(repo)
+        .args(["cat-file", "-e", object])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .with_context(|| format!("looking up {object} in {}", repo.display()))?
+        .success();
+    if !exists {
+        return Ok(false);
+    }
+    let peeled = git_command(repo)
+        .args([
+            "rev-parse",
+            "-q",
+            "--verify",
+            &format!("{object}^{{commit}}"),
+        ])
+        .output()
+        .with_context(|| format!("peeling {object} in {}", repo.display()))?;
+    if !peeled.status.success() {
+        return Ok(true);
+    }
+    let commit = String::from_utf8_lossy(&peeled.stdout).trim().to_string();
+    let unreachable = git_output(
+        repo,
+        ["rev-list", "-n", "1", commit.as_str(), "--not", "--all"],
+        "checking reachability",
+    )?;
+    Ok(unreachable.trim().is_empty())
+}
+
+/// Verify that nothing in `backup` would be lost by deleting it. Returns
+/// the backup and every piece of information found missing elsewhere.
+fn verify_replaced_backup(backup: &Path) -> Result<(RepairBackup, Vec<String>)> {
+    let mut problems = Vec::new();
+    let mut report = RepairBackup {
+        path: backup.to_path_buf(),
+        replaced_path: PathBuf::new(),
+        storage_path: PathBuf::new(),
+        refs: 0,
+        status: RepairBackupStatus::Preserved,
+    };
+    let Some(replaced) = replaced_path_of_backup(backup) else {
+        problems.push("its name does not identify the path it replaced".to_string());
+        return Ok((report, problems));
+    };
+    report.replaced_path = replaced.clone();
+    let storage = match backup_storage(&replaced) {
+        Ok(storage) => storage,
+        Err(problem) => {
+            problems.push(problem);
+            return Ok((report, problems));
+        }
+    };
+    report.storage_path = storage.clone();
+    if !is_git_repository_path(backup) {
+        problems.push("it is not a Git repository, so its contents cannot be verified".into());
+        return Ok((report, problems));
+    }
+
+    let bare = is_bare_repository(backup)?;
+    if !bare {
+        let status = git_output(
+            backup,
+            ["status", "--porcelain=v1", "--untracked-files=all"],
+            "checking backup cleanliness",
+        )?;
+        for line in status.lines() {
+            problems.push(format!("uncommitted change: {line}"));
+        }
+    }
+    for worktree in linked_worktrees(backup)? {
+        problems.push(format!(
+            "worktree {} still uses it",
+            worktree.path.display()
+        ));
+    }
+
+    let refs = git_output(
+        backup,
+        ["for-each-ref", "--format=%(objectname) %(refname)"],
+        "listing backup refs",
+    )?;
+    let mut objects = refs
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .map(|(object, refname)| (object.to_string(), refname.to_string()))
+        .collect::<Vec<_>>();
+    report.refs = objects.len();
+    if !bare && let Ok(head) = git_output(backup, ["rev-parse", "-q", "--verify", "HEAD"], "HEAD") {
+        objects.push((head.trim().to_string(), "HEAD".to_string()));
+    }
+    for (object, refname) in objects {
+        if !object_preserved_in(&storage, &object)? {
+            problems.push(format!(
+                "{refname} ({}) is not reachable in {}",
+                short_hash(&object),
+                storage.display()
+            ));
+        }
+    }
+    Ok((report, problems))
+}
+
+/// Verify every replaced backup under the clone root, failing with every
+/// missing piece of information when any backup is not fully preserved.
+fn preserved_replaced_backups(config: &Config) -> Result<Vec<RepairBackup>> {
+    let mut preserved = Vec::new();
+    let mut message = String::new();
+    for path in find_replaced_backups(&config.clone_root)? {
+        let (backup, problems) = verify_replaced_backup(&path)?;
+        if problems.is_empty() {
+            preserved.push(backup);
+            continue;
+        }
+        writeln!(message, "  {}", path.display()).unwrap();
+        for problem in problems {
+            writeln!(message, "    - {problem}").unwrap();
+        }
+    }
+    if !message.is_empty() {
+        bail!(
+            "replaced checkout backup(s) hold information that is not in the repository that replaced them:\n{message}Recover what is missing (for example `git -C <repository> fetch <backup> <ref>:<ref>`) or delete the backup by hand; `repo check` stops until then."
+        );
+    }
+    Ok(preserved)
+}
+
+/// Re-verify `backup` and delete it; refuses when anything would be lost.
+fn remove_replaced_backup(backup: &RepairBackup) -> Result<RepairBackup> {
+    let (mut current, problems) = verify_replaced_backup(&backup.path)?;
+    if !problems.is_empty() {
+        bail!(
+            "refusing to remove {}: {}",
+            backup.path.display(),
+            problems.join("; ")
+        );
+    }
+    fs::remove_dir_all(&backup.path)
+        .with_context(|| format!("removing {}", backup.path.display()))?;
+    current.status = RepairBackupStatus::Removed;
+    Ok(current)
+}
+
 fn build_repair_report(config: &Config, db: &Store, check: bool) -> Result<RepairReport> {
+    // Hard-fail before anything else when a backup holds lost information.
+    let backups = preserved_replaced_backups(config)?;
     let current_repos = db.current_repos()?;
     let mut current_by_locator = HashMap::new();
     let mut current_paths = HashSet::new();
@@ -7003,6 +7261,12 @@ fn build_repair_report(config: &Config, db: &Store, check: bool) -> Result<Repai
     let mut relocated_locator_keys = HashSet::new();
     for checkout_path in discover_git_repositories(&config.clone_root)? {
         if current_paths.contains(&comparable_path(&checkout_path)) {
+            continue;
+        }
+        if backups
+            .iter()
+            .any(|backup| comparable_path(&backup.path) == comparable_path(&checkout_path))
+        {
             continue;
         }
 
@@ -7321,19 +7585,25 @@ fn build_repair_report(config: &Config, db: &Store, check: bool) -> Result<Repai
         relationships,
         identities,
         skipped,
+        backups,
     })
 }
 
 fn repair_report_needs_repair(report: &RepairReport) -> bool {
-    report.repository_formats.iter().any(|format| {
-        matches!(
-            format.status,
-            RepairRepositoryFormatStatus::NeedsBareConversion
-        )
-    }) || report
-        .stale_paths
+    report
+        .backups
         .iter()
-        .any(|stale| matches!(stale.status, RepairStalePathStatus::NeedsPrune))
+        .any(|backup| backup.status == RepairBackupStatus::Preserved)
+        || report.repository_formats.iter().any(|format| {
+            matches!(
+                format.status,
+                RepairRepositoryFormatStatus::NeedsBareConversion
+            )
+        })
+        || report
+            .stale_paths
+            .iter()
+            .any(|stale| matches!(stale.status, RepairStalePathStatus::NeedsPrune))
         || report.untracked_checkouts.iter().any(|checkout| {
             matches!(
                 checkout.status,
@@ -8805,6 +9075,7 @@ fn fold_moved_refs(
         .args(["fetch", "--no-tags"])
         .arg(moved_path)
         .arg(format!("+refs/heads/*:{prefix}/heads/*"))
+        .arg(format!("+refs/remotes/origin/*:{prefix}/remotes/origin/*"))
         .arg(format!("+refs/tags/*:{prefix}/tags/*"))
         .status()
         .with_context(|| {
@@ -11173,6 +11444,26 @@ fn format_repair_report(report: &RepairReport) -> String {
     if untracked_skipped > 0 {
         writeln!(text, "{untracked_skipped} unmanaged checkout(s) skipped").unwrap();
     }
+    let backups_preserved = report
+        .backups
+        .iter()
+        .filter(|backup| backup.status == RepairBackupStatus::Preserved)
+        .count();
+    let backups_removed = report.backups.len() - backups_preserved;
+    if backups_preserved > 0 {
+        writeln!(
+            text,
+            "{backups_preserved} replaced checkout backup(s) fully preserved, can be removed"
+        )
+        .unwrap();
+    }
+    if backups_removed > 0 {
+        writeln!(
+            text,
+            "{backups_removed} replaced checkout backup(s) removed"
+        )
+        .unwrap();
+    }
 
     let mut issue_number = 1;
     if !report.stale_paths.is_empty() {
@@ -11335,6 +11626,36 @@ fn format_repair_report(report: &RepairReport) -> String {
             )
             .unwrap();
             writeln!(text, "      reason: {}", skipped.reason).unwrap();
+            issue_number += 1;
+        }
+    }
+
+    if !report.backups.is_empty() {
+        writeln!(
+            text,
+            "\nreplaced checkout backup(s): {}",
+            report.backups.len()
+        )
+        .unwrap();
+        for backup in &report.backups {
+            let status = match backup.status {
+                RepairBackupStatus::Preserved => "fully preserved",
+                RepairBackupStatus::Removed => "removed",
+            };
+            writeln!(
+                text,
+                "  [{issue_number}] {status}: {}",
+                backup.path.display()
+            )
+            .unwrap();
+            writeln!(text, "      replaced: {}", backup.replaced_path.display()).unwrap();
+            writeln!(
+                text,
+                "      all {} ref(s) reachable in {}",
+                backup.refs,
+                backup.storage_path.display()
+            )
+            .unwrap();
             issue_number += 1;
         }
     }
@@ -12644,6 +12965,7 @@ mod tests {
             }],
             identities: Vec::new(),
             skipped: Vec::new(),
+            backups: Vec::new(),
         };
 
         let text = format_repair_report(&report);
@@ -16522,6 +16844,98 @@ mod tests {
             1,
             "only a/c stays open"
         );
+    }
+
+    #[test]
+    fn replaced_backup_names_identify_the_replaced_path() {
+        assert_eq!(
+            replaced_path_of_backup(Path::new(
+                "/c/github.com/o/.repo-manager-replaced-test-infrastructure-3851990-0"
+            )),
+            Some(PathBuf::from("/c/github.com/o/test-infrastructure"))
+        );
+        assert_eq!(
+            replaced_path_of_backup(Path::new("/c/.repo-manager-replaced-x-y-z")),
+            None
+        );
+        assert_eq!(replaced_path_of_backup(Path::new("/c/project")), None);
+    }
+
+    /// A successor resolution leaves the old checkout as a backup.
+    fn successor_with_backup(dir: &Path) -> (Config, Store, PathBuf, PathBuf) {
+        let config = test_config(dir);
+        let store = Store::open(&config.state).unwrap();
+        let repos = related_seeded_checkouts(&config, &store, dir, &["old", "new"]);
+        resolve_pair(
+            &config,
+            &store,
+            repos[0].2,
+            repos[1].2,
+            RelatedKind::Successor,
+        )
+        .unwrap();
+        let backups = find_replaced_backups(&config.clone_root).unwrap();
+        assert_eq!(backups.len(), 1, "{backups:?}");
+        (config, store, backups[0].clone(), repos[1].1.clone())
+    }
+
+    #[test]
+    fn preserved_backup_is_reported_and_removed_by_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, store, backup, new_path) = successor_with_backup(dir.path());
+
+        let report = build_repair_report(&config, &store, true).unwrap();
+        assert_eq!(report.backups.len(), 1);
+        assert_eq!(report.backups[0].status, RepairBackupStatus::Preserved);
+        assert_eq!(report.backups[0].storage_path, new_path);
+        assert!(
+            report.untracked_checkouts.is_empty(),
+            "{:?}",
+            report.untracked_checkouts
+        );
+        assert!(repair_report_needs_repair(&report));
+
+        let operations = repair_operations_from_report(&report);
+        let selected = operations
+            .iter()
+            .filter(|operation| matches!(operation.kind, RepairOperationKind::RemoveBackup(_)))
+            .map(|operation| operation.id)
+            .collect::<HashSet<_>>();
+        assert_eq!(selected.len(), 1);
+        let applied = apply_repair_operations(&config, &store, &operations, &selected).unwrap();
+        assert_eq!(applied.backups[0].status, RepairBackupStatus::Removed);
+        assert!(!backup.exists());
+        let report = build_repair_report(&config, &store, true).unwrap();
+        assert!(report.backups.is_empty());
+    }
+
+    #[test]
+    fn backup_with_missing_information_hard_fails_check_and_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, store, backup, _) = successor_with_backup(dir.path());
+        let preserved = verify_replaced_backup(&backup).unwrap().0;
+
+        // A commit made in the backup after the resolution exists nowhere else.
+        fs::write(backup.join("late.txt"), "late\n").unwrap();
+        commit_all(&backup, "late");
+        fs::write(backup.join("scratch.txt"), "scratch\n").unwrap();
+
+        let error = build_repair_report(&config, &store, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&backup.display().to_string()), "{error}");
+        assert!(error.contains("refs/heads/main"), "{error}");
+        assert!(error.contains("HEAD ("), "{error}");
+        assert!(
+            error.contains("uncommitted change: ?? scratch.txt"),
+            "{error}"
+        );
+        assert!(build_repair_report(&config, &store, false).is_err());
+
+        // A removal planned earlier re-verifies and refuses.
+        let error = remove_replaced_backup(&preserved).unwrap_err().to_string();
+        assert!(error.contains("refusing to remove"), "{error}");
+        assert!(backup.join("late.txt").exists());
     }
 
     #[test]
