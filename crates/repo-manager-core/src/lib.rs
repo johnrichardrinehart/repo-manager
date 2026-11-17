@@ -10166,10 +10166,13 @@ fn is_git_repository_path(path: &Path) -> bool {
 }
 
 fn should_prune_scan_dir(name: &std::ffi::OsStr) -> bool {
-    matches!(
-        name.to_str(),
-        Some(".git" | ".direnv" | ".jj" | "target" | "node_modules")
-    )
+    // A replaced-checkout backup is not a repository to manage or compare:
+    // registering it would create a second record for a locator that now
+    // belongs to its replacement. `repo check` verifies backups separately.
+    name.to_str().is_some_and(|name| {
+        matches!(name, ".git" | ".direnv" | ".jj" | "target" | "node_modules")
+            || name.starts_with(REPLACED_BACKUP_PREFIX)
+    })
 }
 
 fn repo_locator_from_origin(path: &Path) -> Result<Option<Locator>> {
@@ -16977,6 +16980,21 @@ mod tests {
         assert_eq!((record.id, &record.current), (new, &new_locator));
         assert_eq!(store.pending_related_count().unwrap(), 0);
         assert!(store.repo_by_id(old).unwrap().is_none());
+        // The daemon's shared-history scan must not register the backup of
+        // the old checkout as a repository of its own.
+        let backups = find_replaced_backups(&config.clone_root).unwrap();
+        assert_eq!(backups.len(), 1);
+        assert!(
+            !discover_git_repositories(&config.clone_root)
+                .unwrap()
+                .contains(&backups[0])
+        );
+        detect_related_history_under_code(&store, &new_locator, &new_path, &config.clone_root)
+            .unwrap();
+        assert_eq!(store.current_repos().unwrap().len(), 1);
+        let report = build_repair_report(&config, &store, true).unwrap();
+        assert!(report.stale_paths.is_empty(), "{:?}", report.stale_paths);
+        assert_eq!(report.backups.len(), 1);
     }
 
     /// Resolve "old moved to new" where both have a `topic` worktree, with
