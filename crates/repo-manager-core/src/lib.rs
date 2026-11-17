@@ -760,7 +760,7 @@ enum RelatedSubcommand {
     List,
     #[command(
         about = "Resolve a shared-history suggestion",
-        long_about = "Resolve a shared-history suggestion with an explicit relationship.\n\nKinds: mirror, fork, canonical, moved, successor, unrelated.\n\nFor fork and mirror, the first repository shown by `repo related list` is treated as the fork or mirror checkout and the second repository is treated as the canonical checkout. The fork or mirror checkout is converted into a Git worktree of the canonical checkout when possible."
+        long_about = "Resolve a shared-history suggestion with an explicit relationship.\n\n`repo related list` labels the two repositories of each suggestion A (first line) and B (second line). KIND says how A relates to B.\n\nOnly fork and mirror change anything on disk, and only they give A and B different roles: A is the fork or mirror, B is the canonical repository. A's branches move into a namespace inside B's Git directory and A's existing checkout is moved aside. Every other kind records the label and closes the suggestion without storing a direction."
     )]
     Resolve(RelatedResolveArgs),
 }
@@ -788,11 +788,77 @@ struct RelatedResolveArgs {
     #[arg(value_name = "ID", help = "Suggestion ID from `repo related list`")]
     id: i64,
 
-    #[arg(
-        value_name = "KIND",
-        help = "Relationship kind: mirror, fork, canonical, moved, successor, or unrelated"
-    )]
-    kind: String,
+    #[arg(value_name = "KIND", help = "How A relates to B (see possible values)")]
+    kind: RelatedKind,
+}
+
+/// How repository A of a shared-history suggestion relates to repository B.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelatedKind {
+    Fork,
+    Mirror,
+    Moved,
+    Successor,
+    Canonical,
+    Unrelated,
+}
+
+impl RelatedKind {
+    const ALL: [Self; 6] = [
+        Self::Fork,
+        Self::Mirror,
+        Self::Moved,
+        Self::Successor,
+        Self::Canonical,
+        Self::Unrelated,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fork => "fork",
+            Self::Mirror => "mirror",
+            Self::Moved => "moved",
+            Self::Successor => "successor",
+            Self::Canonical => "canonical",
+            Self::Unrelated => "unrelated",
+        }
+    }
+
+    /// Whether resolving with this kind changes checkouts on disk. Only these
+    /// kinds give A and B distinct roles.
+    fn is_directional(self) -> bool {
+        matches!(self, Self::Fork | Self::Mirror)
+    }
+
+    /// One-line meaning in terms of the A and B labels from `repo related list`.
+    fn description(self) -> &'static str {
+        match self {
+            Self::Fork => "A is a fork of B; A's checkout becomes a view inside B's Git directory",
+            Self::Mirror => {
+                "A is a mirror of B; A's checkout becomes a view inside B's Git directory"
+            }
+            Self::Moved => {
+                "label only: A and B are the same hosted repository at different locators (apply with `repo move`)"
+            }
+            Self::Successor => {
+                "label only: one replaced the other, direction not stored (record with `repo successor set <OLD> <NEW>`)"
+            }
+            Self::Canonical => {
+                "label only: A and B are separate canonical repositories that share history"
+            }
+            Self::Unrelated => "label only: dismiss the suggestion",
+        }
+    }
+}
+
+impl clap::ValueEnum for RelatedKind {
+    fn value_variants<'a>() -> &'a [Self] {
+        &Self::ALL
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(clap::builder::PossibleValue::new(self.as_str()).help(self.description()))
+    }
 }
 
 #[derive(Debug, Args)]
@@ -1558,6 +1624,14 @@ struct RelatedListReport {
     action: &'static str,
     unresolved_count: usize,
     suggestions: Vec<RelatedSuggestionReport>,
+    kinds: Vec<RelatedKindReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RelatedKindReport {
+    kind: &'static str,
+    changes_checkouts: bool,
+    description: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1571,6 +1645,8 @@ struct RelatedSuggestionReport {
 
 #[derive(Debug, Clone, Serialize)]
 struct RelatedRepositoryReport {
+    /// "A" for the first repository of a suggestion, "B" for the second.
+    label: &'static str,
     repo_id: i64,
     locator: Locator,
     path: PathBuf,
@@ -1587,6 +1663,8 @@ struct RelatedResolution {
     action: &'static str,
     id: i64,
     resolution: String,
+    repositories: [RelatedRepositoryReport; 2],
+    changes_checkouts: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     shared_git_dir: Option<SharedGitDirResolution>,
 }
@@ -1875,7 +1953,7 @@ pub fn run() -> Result<()> {
                 match command.command {
                     RelatedSubcommand::List => related_list(&db, &output),
                     RelatedSubcommand::Resolve(args) => {
-                        related_resolve(&config, &db, &output, args.id, &args.kind)
+                        related_resolve(&config, &db, &output, args.id, args.kind)
                     }
                 }
             }
@@ -7663,19 +7741,22 @@ fn related_resolve(
     db: &Store,
     output: &Output,
     id: i64,
-    kind: &str,
+    kind: RelatedKind,
 ) -> Result<()> {
-    validate_relationship_kind(kind)?;
-    let shared_git_dir = matches!(kind, "fork" | "mirror")
-        .then(|| resolve_related_shared_git_dir(config, db, id, kind))
+    let suggestion = db.related_suggestion(id)?;
+    let shared_git_dir = kind
+        .is_directional()
+        .then(|| resolve_related_shared_git_dir(config, db, id, kind.as_str()))
         .transpose()?;
-    db.resolve_related(id, kind)?;
+    db.resolve_related(id, kind.as_str())?;
     output_related_resolution(
         output,
         &RelatedResolution {
             action: "related-resolve",
             id,
-            resolution: kind.to_string(),
+            resolution: kind.as_str().to_string(),
+            repositories: related_repository_reports(&suggestion),
+            changes_checkouts: kind.is_directional(),
             shared_git_dir,
         },
     )
@@ -7914,15 +7995,6 @@ fn unique_backup_path(path: &Path) -> Result<PathBuf> {
         }
     }
     bail!("could not allocate backup path for {}", path.display())
-}
-
-fn validate_relationship_kind(kind: &str) -> Result<()> {
-    match kind {
-        "mirror" | "fork" | "canonical" | "moved" | "successor" | "unrelated" => Ok(()),
-        _ => bail!(
-            "invalid relationship kind: {kind}; expected mirror, fork, canonical, moved, successor, or unrelated"
-        ),
-    }
 }
 
 fn warn_pending_related(db: &Store) -> Result<()> {
@@ -10250,12 +10322,17 @@ fn output_related(output: &Output, suggestions: &[RelatedSuggestion]) -> Result<
         report.unresolved_count
     );
     for suggestion in &report.suggestions {
-        let [repo, related] = &suggestion.repositories;
+        let [a, b] = &suggestion.repositories;
         println!();
-        println!("#{}  {}", suggestion.id, repo.locator.key());
-        println!("    {}", related.locator.key());
+        println!("#{}  {}: {}", suggestion.id, a.label, a.locator.key());
+        println!("    {}: {}", b.label, b.locator.key());
         println!("    evidence: {}", suggestion.evidence.summary);
         println!("    resolve:  {}", suggestion.resolve_command);
+    }
+    println!();
+    println!("<kind> says how A relates to B:");
+    for kind in &report.kinds {
+        println!("  {:<10} {}", kind.kind, kind.description);
     }
     Ok(())
 }
@@ -10268,24 +10345,41 @@ fn related_list_report(suggestions: &[RelatedSuggestion]) -> RelatedListReport {
             .iter()
             .map(|suggestion| RelatedSuggestionReport {
                 id: suggestion.id,
-                repositories: [
-                    RelatedRepositoryReport {
-                        repo_id: suggestion.repo_id,
-                        locator: suggestion.repo_locator.clone(),
-                        path: suggestion.repo_path.clone(),
-                    },
-                    RelatedRepositoryReport {
-                        repo_id: suggestion.related_repo_id,
-                        locator: suggestion.related_locator.clone(),
-                        path: suggestion.related_path.clone(),
-                    },
-                ],
+                repositories: related_repository_reports(suggestion),
                 evidence: related_evidence_report(suggestion),
                 resolution: suggestion.resolution.clone(),
                 resolve_command: format!("repo related resolve {} <kind>", suggestion.id),
             })
             .collect(),
+        kinds: RelatedKind::ALL
+            .iter()
+            .map(|kind| RelatedKindReport {
+                kind: kind.as_str(),
+                changes_checkouts: kind.is_directional(),
+                description: kind.description(),
+            })
+            .collect(),
     }
+}
+
+/// The two repositories of a suggestion, labelled A (the stored repository)
+/// and B (the related repository). Fork and mirror resolutions read as
+/// "A is a fork/mirror of B".
+fn related_repository_reports(suggestion: &RelatedSuggestion) -> [RelatedRepositoryReport; 2] {
+    [
+        RelatedRepositoryReport {
+            label: "A",
+            repo_id: suggestion.repo_id,
+            locator: suggestion.repo_locator.clone(),
+            path: suggestion.repo_path.clone(),
+        },
+        RelatedRepositoryReport {
+            label: "B",
+            repo_id: suggestion.related_repo_id,
+            locator: suggestion.related_locator.clone(),
+            path: suggestion.related_path.clone(),
+        },
+    ]
 }
 
 fn related_evidence_report(suggestion: &RelatedSuggestion) -> RelatedEvidenceReport {
@@ -10333,10 +10427,35 @@ fn output_related_resolution(output: &Output, resolution: &RelatedResolution) ->
     if output.json {
         return print_json(resolution);
     }
-    println!(
-        "resolved shared-history suggestion #{} as {}",
-        resolution.id, resolution.resolution
-    );
+    let [a, b] = &resolution.repositories;
+    let (a, b) = (a.locator.key(), b.locator.key());
+    match resolution.resolution.as_str() {
+        kind @ ("fork" | "mirror") => println!(
+            "resolved shared-history suggestion #{}: {a} is a {kind} of {b}",
+            resolution.id
+        ),
+        kind => {
+            println!(
+                "resolved shared-history suggestion #{} as {kind} (A: {a}, B: {b})",
+                resolution.id
+            );
+            println!("label only: no checkout changed and no direction was stored");
+            let follow_up = match kind {
+                "moved" => Some(("to apply the move", "repo move", "moved to")),
+                "successor" => Some((
+                    "to record which replaced which",
+                    "repo successor set",
+                    "was replaced by",
+                )),
+                _ => None,
+            };
+            if let Some((purpose, command, verb)) = follow_up {
+                println!("{purpose}, run one of:");
+                println!("  {command} {a} {b}    # A {verb} B");
+                println!("  {command} {b} {a}    # B {verb} A");
+            }
+        }
+    }
     if let Some(shared_git_dir) = &resolution.shared_git_dir {
         println!(
             "{} now lives in canonical Git directory {}",
@@ -10472,6 +10591,40 @@ mod tests {
         assert!(help.contains("--assume-origin-as-canonical"));
         assert!(!help.contains("--locator"));
         assert!(!help.contains("origin or --locator"));
+    }
+
+    #[test]
+    fn related_resolve_help_explains_a_and_b_roles() {
+        let mut command = Cli::command();
+        let resolve = command
+            .find_subcommand_mut("related")
+            .unwrap()
+            .find_subcommand_mut("resolve")
+            .unwrap();
+        let help = resolve.render_long_help().to_string();
+
+        assert!(help.contains("A (first line) and B (second line)"));
+        for kind in RelatedKind::ALL {
+            assert!(help.contains(kind.description()), "missing {kind:?}");
+        }
+    }
+
+    #[test]
+    fn related_resolve_parses_known_kinds_and_rejects_others() {
+        let cli = Cli::try_parse_from(["repo", "related", "resolve", "3", "fork"]).unwrap();
+        match cli.command {
+            Commands::OrganizationalAnalysis(OrganizationalAnalysisCommands::Related(command)) => {
+                match command.command {
+                    RelatedSubcommand::Resolve(args) => {
+                        assert_eq!(args.id, 3);
+                        assert_eq!(args.kind, RelatedKind::Fork);
+                    }
+                    RelatedSubcommand::List => panic!("unexpected list command"),
+                }
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+        assert!(Cli::try_parse_from(["repo", "related", "resolve", "3", "upstream"]).is_err());
     }
 
     #[test]
@@ -14798,6 +14951,22 @@ mod tests {
 
         assert_eq!(report.suggestions[0].evidence.summary, "unknown");
         assert!(report.suggestions[0].evidence.details.is_empty());
+        let [a, b] = &report.suggestions[0].repositories;
+        assert_eq!(
+            (a.label, a.locator.key()),
+            ("A", "example.com/first".into())
+        );
+        assert_eq!(
+            (b.label, b.locator.key()),
+            ("B", "example.com/second".into())
+        );
+        let directional: Vec<_> = report
+            .kinds
+            .iter()
+            .filter(|kind| kind.changes_checkouts)
+            .map(|kind| kind.kind)
+            .collect();
+        assert_eq!(directional, ["fork", "mirror"]);
     }
 
     #[test]
@@ -15097,7 +15266,7 @@ mod tests {
             &store,
             &Output { json: true },
             suggestion_id,
-            "fork",
+            RelatedKind::Fork,
         )
         .unwrap();
 
@@ -15903,7 +16072,7 @@ mod tests {
             &store,
             &Output { json: true },
             suggestion_id,
-            "mirror",
+            RelatedKind::Mirror,
         )
         .unwrap();
 
