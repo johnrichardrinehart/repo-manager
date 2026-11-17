@@ -760,7 +760,7 @@ enum RelatedSubcommand {
     List,
     #[command(
         about = "Resolve a shared-history suggestion",
-        long_about = "Resolve a shared-history suggestion with an explicit relationship.\n\n`repo related list` labels the two repositories of each suggestion A (first line) and B (second line). KIND says how A relates to B.\n\nOnly fork and mirror change anything on disk, and only they give A and B different roles: A is the fork or mirror, B is the canonical repository. A's branches move into a namespace inside B's Git directory and A's existing checkout is moved aside. Every other kind records the label and closes the suggestion without storing a direction."
+        long_about = "Resolve a shared-history suggestion with an explicit relationship.\n\n`repo related list` labels the two repositories of each suggestion A (first line) and B (second line). KIND is read as a statement about A and B, such as \"A is a fork of B\" or \"A was succeeded by B\". Pass --reverse to swap the roles: \"B is a fork of A\".\n\nEvery kind except unrelated is directional and is stored with its direction. A related set of repositories has exactly one canonical repository; resolving a second canonical in the same set is refused.\n\nOnly fork and mirror change anything on disk: the fork or mirror's branches move into a namespace inside the other repository's Git directory and its existing checkout is moved aside. successor is also recorded as `repo successor set <OLD> <NEW>` would."
     )]
     Resolve(RelatedResolveArgs),
 }
@@ -790,63 +790,83 @@ struct RelatedResolveArgs {
 
     #[arg(value_name = "KIND", help = "How A relates to B (see possible values)")]
     kind: RelatedKind,
+
+    #[arg(
+        long,
+        help = "Swap A and B, e.g. `fork --reverse` means B is a fork of A (not valid with unrelated)"
+    )]
+    reverse: bool,
 }
 
 /// How repository A of a shared-history suggestion relates to repository B.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RelatedKind {
+    Canonical,
     Fork,
     Mirror,
     Moved,
     Successor,
-    Canonical,
     Unrelated,
 }
 
 impl RelatedKind {
     const ALL: [Self; 6] = [
+        Self::Canonical,
         Self::Fork,
         Self::Mirror,
         Self::Moved,
         Self::Successor,
-        Self::Canonical,
         Self::Unrelated,
     ];
 
     fn as_str(self) -> &'static str {
         match self {
+            Self::Canonical => "canonical",
             Self::Fork => "fork",
             Self::Mirror => "mirror",
             Self::Moved => "moved",
             Self::Successor => "successor",
-            Self::Canonical => "canonical",
             Self::Unrelated => "unrelated",
         }
     }
 
-    /// Whether resolving with this kind changes checkouts on disk. Only these
-    /// kinds give A and B distinct roles.
+    /// Every kind but `unrelated` distinguishes A from B and accepts `--reverse`.
     fn is_directional(self) -> bool {
+        self != Self::Unrelated
+    }
+
+    /// Whether resolving with this kind changes checkouts on disk.
+    fn changes_checkouts(self) -> bool {
         matches!(self, Self::Fork | Self::Mirror)
+    }
+
+    /// The relationship as a sentence about `subject` and `object`.
+    fn statement(self, subject: &str, object: &str) -> String {
+        match self {
+            Self::Canonical => format!("{subject} is the canonical repository for {object}"),
+            Self::Fork => format!("{subject} is a fork of {object}"),
+            Self::Mirror => format!("{subject} is a mirror of {object}"),
+            Self::Moved => format!("{subject} moved to {object}"),
+            Self::Successor => format!("{subject} was succeeded by {object}"),
+            Self::Unrelated => format!("{subject} and {object} are unrelated"),
+        }
     }
 
     /// One-line meaning in terms of the A and B labels from `repo related list`.
     fn description(self) -> &'static str {
         match self {
+            Self::Canonical => {
+                "A is the canonical repository for B (one canonical per related set)"
+            }
             Self::Fork => "A is a fork of B; A's checkout becomes a view inside B's Git directory",
             Self::Mirror => {
                 "A is a mirror of B; A's checkout becomes a view inside B's Git directory"
             }
-            Self::Moved => {
-                "label only: A and B are the same hosted repository at different locators (apply with `repo move`)"
-            }
+            Self::Moved => "A moved to B: same hosted repository, B is the current locator",
             Self::Successor => {
-                "label only: one replaced the other, direction not stored (record with `repo successor set <OLD> <NEW>`)"
+                "A was succeeded by B: development continued in B (also recorded as a successor)"
             }
-            Self::Canonical => {
-                "label only: A and B are separate canonical repositories that share history"
-            }
-            Self::Unrelated => "label only: dismiss the suggestion",
+            Self::Unrelated => "A and B are unrelated; dismiss the suggestion (no direction)",
         }
     }
 }
@@ -1630,6 +1650,7 @@ struct RelatedListReport {
 #[derive(Debug, Clone, Serialize)]
 struct RelatedKindReport {
     kind: &'static str,
+    directional: bool,
     changes_checkouts: bool,
     description: &'static str,
 }
@@ -1663,8 +1684,14 @@ struct RelatedResolution {
     action: &'static str,
     id: i64,
     resolution: String,
+    /// Whether `--reverse` swapped A and B, making B the subject.
+    reversed: bool,
+    /// The recorded relationship as a sentence, subject first.
+    statement: String,
     repositories: [RelatedRepositoryReport; 2],
     changes_checkouts: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    successor: Option<SuccessorRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
     shared_git_dir: Option<SharedGitDirResolution>,
 }
@@ -1953,7 +1980,7 @@ pub fn run() -> Result<()> {
                 match command.command {
                     RelatedSubcommand::List => related_list(&db, &output),
                     RelatedSubcommand::Resolve(args) => {
-                        related_resolve(&config, &db, &output, args.id, args.kind)
+                        related_resolve(&config, &db, &output, args.id, args.kind, args.reverse)
                     }
                 }
             }
@@ -3732,6 +3759,20 @@ impl Store {
         if repo_id == related_repo_id {
             return Ok(());
         }
+        // A resolved row is stored with its subject first (see
+        // `resolve_related`), so an existing pair may be in either order.
+        let shared_refs_json = serde_json::to_string(shared_refs)?;
+        let updated = self.conn.execute(
+            "
+            UPDATE related_history SET shared_refs_json = ?3
+            WHERE (repo_id = ?1 AND related_repo_id = ?2)
+               OR (repo_id = ?2 AND related_repo_id = ?1)
+            ",
+            params![repo_id, related_repo_id, shared_refs_json],
+        )?;
+        if updated > 0 {
+            return Ok(());
+        }
         let (repo_id, related_repo_id) = if repo_id < related_repo_id {
             (repo_id, related_repo_id)
         } else {
@@ -3741,14 +3782,8 @@ impl Store {
             "
             INSERT INTO related_history (repo_id, related_repo_id, shared_refs_json)
             VALUES (?1, ?2, ?3)
-            ON CONFLICT(repo_id, related_repo_id) DO UPDATE SET
-              shared_refs_json = excluded.shared_refs_json
             ",
-            params![
-                repo_id,
-                related_repo_id,
-                serde_json::to_string(shared_refs)?
-            ],
+            params![repo_id, related_repo_id, shared_refs_json],
         )?;
         Ok(())
     }
@@ -3759,16 +3794,26 @@ impl Store {
         controlling_repo_id: i64,
         resolution: &str,
     ) -> Result<()> {
-        self.conn.execute(
+        // Reuse the pair's row in whichever order it was stored, re-oriented
+        // so the dependent comes first.
+        let updated = self.conn.execute(
             "
-            INSERT INTO related_history (repo_id, related_repo_id, shared_refs_json, resolution, resolved_at)
-            VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP)
-            ON CONFLICT(repo_id, related_repo_id) DO UPDATE SET
-              resolution = excluded.resolution,
-              resolved_at = CURRENT_TIMESTAMP
+            UPDATE related_history
+            SET repo_id = ?1, related_repo_id = ?2, resolution = ?3, resolved_at = CURRENT_TIMESTAMP
+            WHERE (repo_id = ?1 AND related_repo_id = ?2)
+               OR (repo_id = ?2 AND related_repo_id = ?1)
             ",
-            params![dependent_repo_id, controlling_repo_id, "[]", resolution],
+            params![dependent_repo_id, controlling_repo_id, resolution],
         )?;
+        if updated == 0 {
+            self.conn.execute(
+                "
+                INSERT INTO related_history (repo_id, related_repo_id, shared_refs_json, resolution, resolved_at)
+                VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP)
+                ",
+                params![dependent_repo_id, controlling_repo_id, "[]", resolution],
+            )?;
+        }
         Ok(())
     }
 
@@ -3918,17 +3963,86 @@ impl Store {
         Ok(relationships)
     }
 
-    fn resolve_related(&self, id: i64, resolution: &str) -> Result<()> {
-        let changed = self.conn.execute(
-            "
-            UPDATE related_history
-            SET resolution = ?2, resolved_at = CURRENT_TIMESTAMP
-            WHERE id = ?1
-            ",
-            params![id, resolution],
-        )?;
+    /// Resolve suggestion `id` as "`subject_id` <resolution> `object_id`".
+    /// The row is re-oriented so `repo_id` is the subject, which is how
+    /// fork and mirror rows name their dependent.
+    fn resolve_related(
+        &self,
+        id: i64,
+        resolution: &str,
+        subject_id: i64,
+        object_id: i64,
+    ) -> Result<()> {
+        let changed = self
+            .conn
+            .execute(
+                "
+                UPDATE related_history
+                SET resolution = ?2, resolved_at = CURRENT_TIMESTAMP,
+                    repo_id = ?3, related_repo_id = ?4
+                WHERE id = ?1
+                  AND ((repo_id = ?3 AND related_repo_id = ?4)
+                    OR (repo_id = ?4 AND related_repo_id = ?3))
+                ",
+                params![id, resolution, subject_id, object_id],
+            )
+            .with_context(|| format!("recording resolution of suggestion #{id}"))?;
         if changed == 0 {
-            bail!("unknown related-history suggestion: {id}");
+            bail!(
+                "unknown related-history suggestion #{id} for repositories {subject_id} and {object_id}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A related set (repositories connected by shared history that has not
+    /// been dismissed as unrelated) has exactly one canonical repository.
+    /// Refuse to make `candidate_id` canonical when another repository of
+    /// the set reached through `other_id` already is.
+    fn ensure_single_canonical(&self, candidate_id: i64, other_id: i64) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT id, repo_id, related_repo_id, resolution FROM related_history
+            WHERE resolution IS NULL OR resolution != 'unrelated'
+            ",
+        )?;
+        let edges = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut members = HashSet::from([candidate_id, other_id]);
+        let mut grew = true;
+        while grew {
+            grew = false;
+            for (_, repo_id, related_repo_id, _) in &edges {
+                if members.contains(repo_id) != members.contains(related_repo_id) {
+                    members.insert(*repo_id);
+                    members.insert(*related_repo_id);
+                    grew = true;
+                }
+            }
+        }
+
+        let conflict = edges.iter().find(|(_, repo_id, _, resolution)| {
+            resolution.as_deref() == Some("canonical")
+                && *repo_id != candidate_id
+                && members.contains(repo_id)
+        });
+        if let Some((suggestion_id, canonical_id, _, _)) = conflict {
+            let canonical = self.repo_by_id(*canonical_id)?.map_or_else(
+                || format!("repository {canonical_id}"),
+                |repo| repo.current.key(),
+            );
+            bail!(
+                "{canonical} is already the canonical repository of this related set (suggestion #{suggestion_id}); a related set has exactly one canonical repository"
+            );
         }
         Ok(())
     }
@@ -7742,45 +7856,68 @@ fn related_resolve(
     output: &Output,
     id: i64,
     kind: RelatedKind,
+    reverse: bool,
 ) -> Result<()> {
+    if reverse && !kind.is_directional() {
+        bail!("{} has no direction; drop --reverse", kind.as_str());
+    }
     let suggestion = db.related_suggestion(id)?;
+    if let Some(resolution) = &suggestion.resolution {
+        bail!("related-history suggestion #{id} is already resolved as {resolution}");
+    }
+    let repositories = related_repository_reports(&suggestion);
+    let [a, b] = &repositories;
+    let (subject, object) = if reverse { (b, a) } else { (a, b) };
+
+    if kind == RelatedKind::Canonical {
+        db.ensure_single_canonical(subject.repo_id, object.repo_id)?;
+    }
     let shared_git_dir = kind
-        .is_directional()
-        .then(|| resolve_related_shared_git_dir(config, db, id, kind.as_str()))
+        .changes_checkouts()
+        .then(|| {
+            materialize_related_view(
+                db,
+                &subject.locator,
+                &subject.path,
+                &object.locator,
+                &object.path,
+                kind.as_str(),
+                &config.identities,
+            )
+        })
         .transpose()?;
-    db.resolve_related(id, kind.as_str())?;
+    db.resolve_related(id, kind.as_str(), subject.repo_id, object.repo_id)?;
+    let successor = if kind == RelatedKind::Successor {
+        let old_ref = subject.locator.key();
+        db.record_successor(&old_ref, &object.locator)?;
+        Some(SuccessorRecord {
+            old_ref,
+            new_locator: object.locator.clone(),
+        })
+    } else {
+        None
+    };
+
     output_related_resolution(
         output,
         &RelatedResolution {
             action: "related-resolve",
             id,
             resolution: kind.as_str().to_string(),
-            repositories: related_repository_reports(&suggestion),
-            changes_checkouts: kind.is_directional(),
+            reversed: reverse,
+            statement: kind.statement(&subject.locator.key(), &object.locator.key()),
+            changes_checkouts: kind.changes_checkouts(),
+            successor,
             shared_git_dir,
+            repositories,
         },
     )
 }
 
-fn resolve_related_shared_git_dir(
-    config: &Config,
-    db: &Store,
-    id: i64,
-    relationship: &str,
-) -> Result<SharedGitDirResolution> {
-    let suggestion = db.related_suggestion(id)?;
-    if let Some(resolution) = suggestion.resolution {
-        bail!("related-history suggestion #{id} is already resolved as {resolution}");
-    }
-    materialize_related_view(
-        db,
-        &suggestion.repo_locator,
-        &suggestion.repo_path,
-        &suggestion.related_locator,
-        &suggestion.related_path,
-        relationship,
-        &config.identities,
-    )
+#[derive(Debug, Clone, Serialize)]
+struct SuccessorRecord {
+    old_ref: String,
+    new_locator: Locator,
 }
 
 /// Attach a fork or mirror to its canonical bare repository as a namespace
@@ -10330,7 +10467,7 @@ fn output_related(output: &Output, suggestions: &[RelatedSuggestion]) -> Result<
         println!("    resolve:  {}", suggestion.resolve_command);
     }
     println!();
-    println!("<kind> says how A relates to B:");
+    println!("<kind> says how A relates to B (add --reverse to swap A and B):");
     for kind in &report.kinds {
         println!("  {:<10} {}", kind.kind, kind.description);
     }
@@ -10355,7 +10492,8 @@ fn related_list_report(suggestions: &[RelatedSuggestion]) -> RelatedListReport {
             .iter()
             .map(|kind| RelatedKindReport {
                 kind: kind.as_str(),
-                changes_checkouts: kind.is_directional(),
+                directional: kind.is_directional(),
+                changes_checkouts: kind.changes_checkouts(),
                 description: kind.description(),
             })
             .collect(),
@@ -10427,34 +10565,19 @@ fn output_related_resolution(output: &Output, resolution: &RelatedResolution) ->
     if output.json {
         return print_json(resolution);
     }
-    let [a, b] = &resolution.repositories;
-    let (a, b) = (a.locator.key(), b.locator.key());
-    match resolution.resolution.as_str() {
-        kind @ ("fork" | "mirror") => println!(
-            "resolved shared-history suggestion #{}: {a} is a {kind} of {b}",
-            resolution.id
-        ),
-        kind => {
-            println!(
-                "resolved shared-history suggestion #{} as {kind} (A: {a}, B: {b})",
-                resolution.id
-            );
-            println!("label only: no checkout changed and no direction was stored");
-            let follow_up = match kind {
-                "moved" => Some(("to apply the move", "repo move", "moved to")),
-                "successor" => Some((
-                    "to record which replaced which",
-                    "repo successor set",
-                    "was replaced by",
-                )),
-                _ => None,
-            };
-            if let Some((purpose, command, verb)) = follow_up {
-                println!("{purpose}, run one of:");
-                println!("  {command} {a} {b}    # A {verb} B");
-                println!("  {command} {b} {a}    # B {verb} A");
-            }
-        }
+    println!(
+        "resolved shared-history suggestion #{}: {}",
+        resolution.id, resolution.statement
+    );
+    if let Some(successor) = &resolution.successor {
+        println!(
+            "recorded successor: {} -> {}",
+            successor.old_ref,
+            successor.new_locator.key()
+        );
+    }
+    if !resolution.changes_checkouts {
+        println!("no checkout changed");
     }
     if let Some(shared_git_dir) = &resolution.shared_git_dir {
         println!(
@@ -10611,13 +10734,15 @@ mod tests {
 
     #[test]
     fn related_resolve_parses_known_kinds_and_rejects_others() {
-        let cli = Cli::try_parse_from(["repo", "related", "resolve", "3", "fork"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["repo", "related", "resolve", "3", "fork", "--reverse"]).unwrap();
         match cli.command {
             Commands::OrganizationalAnalysis(OrganizationalAnalysisCommands::Related(command)) => {
                 match command.command {
                     RelatedSubcommand::Resolve(args) => {
                         assert_eq!(args.id, 3);
                         assert_eq!(args.kind, RelatedKind::Fork);
+                        assert!(args.reverse);
                     }
                     RelatedSubcommand::List => panic!("unexpected list command"),
                 }
@@ -15188,10 +15313,173 @@ mod tests {
         assert_eq!(suggestions.len(), 1);
         assert_eq!(store.pending_related_count().unwrap(), 1);
 
-        store.resolve_related(suggestions[0].id, "mirror").unwrap();
+        store
+            .resolve_related(suggestions[0].id, "mirror", first_id, second_id)
+            .unwrap();
 
         assert_eq!(store.pending_related_count().unwrap(), 0);
         assert!(store.related_suggestions(true).unwrap().is_empty());
+    }
+
+    /// Register `names` as repositories `github.com/example/<name>` (no
+    /// checkouts) and return their ids in order.
+    fn example_repos(store: &Store, dir: &Path, names: &[&str]) -> Vec<i64> {
+        names
+            .iter()
+            .map(|name| {
+                let locator = Locator::parse(&format!("github.com/example/{name}")).unwrap();
+                let path = dir.join("clones/github.com/example").join(name);
+                store.upsert_repo(&locator, &path, None).unwrap()
+            })
+            .collect()
+    }
+
+    fn suggestion_between(store: &Store, first: i64, second: i64) -> i64 {
+        store
+            .record_related_history(first, second, &["shared root commit abc".to_string()])
+            .unwrap();
+        store
+            .related_suggestions(false)
+            .unwrap()
+            .into_iter()
+            .find(|s| {
+                (s.repo_id, s.related_repo_id) == (first, second)
+                    || (s.repo_id, s.related_repo_id) == (second, first)
+            })
+            .unwrap()
+            .id
+    }
+
+    fn resolved_row(store: &Store, id: i64) -> (i64, i64, String) {
+        store
+            .conn
+            .query_row(
+                "SELECT repo_id, related_repo_id, resolution FROM related_history WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn reversed_resolution_is_stored_subject_first_and_not_suggested_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let ids = example_repos(&store, dir.path(), &["a", "b"]);
+        let (a, b) = (ids[0], ids[1]);
+        let id = suggestion_between(&store, a, b);
+
+        related_resolve(
+            &config,
+            &store,
+            &Output { json: true },
+            id,
+            RelatedKind::Moved,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(resolved_row(&store, id), (b, a, "moved".to_string()));
+        // The daemon seeing the pair again, in either order, must not reopen it.
+        suggestion_between(&store, a, b);
+        suggestion_between(&store, b, a);
+        assert_eq!(store.pending_related_count().unwrap(), 0);
+        let rows: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM related_history", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn successor_resolution_records_old_and_new_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let ids = example_repos(&store, dir.path(), &["old", "new"]);
+        let id = suggestion_between(&store, ids[0], ids[1]);
+
+        // A is `old`; "A was succeeded by B".
+        related_resolve(
+            &config,
+            &store,
+            &Output { json: true },
+            id,
+            RelatedKind::Successor,
+            false,
+        )
+        .unwrap();
+
+        let (old_ref, new_path): (String, String) = store
+            .conn
+            .query_row(
+                "SELECT old_ref, new_remote_path FROM successors",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(old_ref, "github.com/example/old");
+        assert_eq!(new_path, "example/new");
+        assert_eq!(
+            resolved_row(&store, id),
+            (ids[0], ids[1], "successor".to_string())
+        );
+    }
+
+    #[test]
+    fn related_set_has_exactly_one_canonical_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let ids = example_repos(&store, dir.path(), &["a", "b", "c"]);
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+        let ab = suggestion_between(&store, a, b);
+        let bc = suggestion_between(&store, b, c);
+        let ac = suggestion_between(&store, a, c);
+        let resolve = |id, reverse| {
+            related_resolve(
+                &config,
+                &store,
+                &Output { json: true },
+                id,
+                RelatedKind::Canonical,
+                reverse,
+            )
+        };
+
+        resolve(ab, false).unwrap();
+        for reverse in [false, true] {
+            let error = resolve(bc, reverse).unwrap_err().to_string();
+            assert!(
+                error.contains("github.com/example/a is already the canonical repository"),
+                "{error}"
+            );
+        }
+        // The same canonical repository may be named again for another member.
+        resolve(ac, false).unwrap();
+        assert_eq!(resolved_row(&store, ac), (a, c, "canonical".to_string()));
+    }
+
+    #[test]
+    fn related_resolve_rejects_reversed_unrelated_and_resolved_suggestions() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let ids = example_repos(&store, dir.path(), &["a", "b"]);
+        let id = suggestion_between(&store, ids[0], ids[1]);
+        let resolve = |kind, reverse| {
+            related_resolve(&config, &store, &Output { json: true }, id, kind, reverse)
+        };
+
+        let error = resolve(RelatedKind::Unrelated, true).unwrap_err();
+        assert!(error.to_string().contains("has no direction"), "{error}");
+        resolve(RelatedKind::Unrelated, false).unwrap();
+        let error = resolve(RelatedKind::Moved, false).unwrap_err();
+        assert!(
+            error.to_string().contains("already resolved as unrelated"),
+            "{error}"
+        );
     }
 
     /// Two standalone checkouts under the clone root whose shared history
@@ -15267,6 +15555,7 @@ mod tests {
             &Output { json: true },
             suggestion_id,
             RelatedKind::Fork,
+            false,
         )
         .unwrap();
 
@@ -15299,6 +15588,46 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn reversed_related_fork_folds_second_repo_into_bare_first_as_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let (fork_path, canonical_path, fork_locator, canonical_locator, _, suggestion_id) =
+            related_checkouts(&config, &store, dir.path());
+        // List the canonical repository as A and the fork as B.
+        store
+            .conn
+            .execute(
+                "UPDATE related_history SET repo_id = related_repo_id, related_repo_id = repo_id WHERE id = ?1",
+                params![suggestion_id],
+            )
+            .unwrap();
+        let suggestion = store.related_suggestion(suggestion_id).unwrap();
+        assert_eq!(suggestion.repo_locator, canonical_locator);
+
+        // "B is a fork of A".
+        related_resolve(
+            &config,
+            &store,
+            &Output { json: true },
+            suggestion_id,
+            RelatedKind::Fork,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(store.pending_related_count().unwrap(), 0);
+        assert!(is_bare_repository(&canonical_path).unwrap());
+        let view = read_repo_view_metadata(&fork_path).unwrap().unwrap();
+        assert_eq!(view.locator, fork_locator);
+        assert_eq!(view.canonical_locator, canonical_locator);
+        let suggestion = store.related_suggestion(suggestion_id).unwrap();
+        assert_eq!(suggestion.repo_locator, fork_locator);
+        assert_eq!(suggestion.related_locator, canonical_locator);
+        assert_eq!(suggestion.resolution.as_deref(), Some("fork"));
     }
 
     #[test]
@@ -15422,7 +15751,9 @@ mod tests {
             )
             .unwrap();
         let suggestion_id = store.related_suggestions(true).unwrap()[0].id;
-        store.resolve_related(suggestion_id, "fork").unwrap();
+        store
+            .resolve_related(suggestion_id, "fork", fork_id, canonical_id)
+            .unwrap();
 
         // Two standalone checkouts under the clone root violate the bare-only
         // layout on their own and the fork also needs folding into canonical.
@@ -16073,6 +16404,7 @@ mod tests {
             &Output { json: true },
             suggestion_id,
             RelatedKind::Mirror,
+            false,
         )
         .unwrap();
 
