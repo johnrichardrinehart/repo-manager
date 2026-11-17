@@ -760,7 +760,7 @@ enum RelatedSubcommand {
     List,
     #[command(
         about = "Resolve a shared-history suggestion",
-        long_about = "Resolve a shared-history suggestion with an explicit relationship.\n\n`repo related list` labels the two repositories of each suggestion A (first line) and B (second line). KIND is read as a statement about A and B, such as \"A is a fork of B\" or \"A was succeeded by B\". Pass --reverse to swap the roles: \"B is a fork of A\".\n\nEvery kind except unrelated is directional and is stored with its direction. A related set of repositories has exactly one canonical repository; resolving a second canonical in the same set is refused.\n\nOnly fork and mirror change anything on disk: the fork or mirror's branches move into a namespace inside the other repository's Git directory and its existing checkout is moved aside. successor is also recorded as `repo successor set <OLD> <NEW>` would."
+        long_about = "Resolve a shared-history suggestion with an explicit relationship.\n\n`repo related list` labels the two repositories of each suggestion A (first line) and B (second line). KIND is read as a statement about A and B, such as \"A is a fork of B\" or \"A was succeeded by B\". Pass --reverse to swap the roles: \"B is a fork of A\". A suggestion can be resolved only once.\n\nEvery kind except unrelated restructures the checkouts. The parent (B, or A with --reverse) is stored in the related set's canonical repository, which keeps the only bare Git directory: B itself, or the repository B is already stored in when B is a fork, mirror or predecessor view. That repository is marked canonical. When a third repository of the related set is already canonical, resolving fails until B's own relationship to it is resolved.\n\n  fork, mirror  A becomes a fork or mirror namespace view inside the canonical Git directory.\n  successor     A becomes a predecessor namespace view inside the canonical Git directory and is recorded as `repo successor set A B` would.\n  moved         A is folded into B: B keeps A's branches, A's dev worktrees move under B, and A's old path becomes an alias symlink to B, like `repo move`.\n\nRepositories stored in A's Git directory (its own forks, mirrors and predecessors) move with it, and A's dev worktrees are re-created against the new Git directory, so they must be clean. To mark a repository canonical before any suggestion is resolved, use `repo repos set-type <PATH> canonical`."
     )]
     Resolve(RelatedResolveArgs),
 }
@@ -801,7 +801,6 @@ struct RelatedResolveArgs {
 /// How repository A of a shared-history suggestion relates to repository B.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RelatedKind {
-    Canonical,
     Fork,
     Mirror,
     Moved,
@@ -810,8 +809,7 @@ enum RelatedKind {
 }
 
 impl RelatedKind {
-    const ALL: [Self; 6] = [
-        Self::Canonical,
+    const ALL: [Self; 5] = [
         Self::Fork,
         Self::Mirror,
         Self::Moved,
@@ -821,7 +819,6 @@ impl RelatedKind {
 
     fn as_str(self) -> &'static str {
         match self {
-            Self::Canonical => "canonical",
             Self::Fork => "fork",
             Self::Mirror => "mirror",
             Self::Moved => "moved",
@@ -830,20 +827,26 @@ impl RelatedKind {
         }
     }
 
-    /// Every kind but `unrelated` distinguishes A from B and accepts `--reverse`.
+    /// Every kind but `unrelated` distinguishes A from B, accepts `--reverse`
+    /// and restructures the checkouts.
     fn is_directional(self) -> bool {
         self != Self::Unrelated
     }
 
-    /// Whether resolving with this kind changes checkouts on disk.
-    fn changes_checkouts(self) -> bool {
-        matches!(self, Self::Fork | Self::Mirror)
+    /// The namespace view the subject becomes inside the canonical Git
+    /// directory, if it becomes one.
+    fn view_relationship(self) -> Option<&'static str> {
+        match self {
+            Self::Fork => Some("fork"),
+            Self::Mirror => Some("mirror"),
+            Self::Successor => Some("predecessor"),
+            Self::Moved | Self::Unrelated => None,
+        }
     }
 
     /// The relationship as a sentence about `subject` and `object`.
     fn statement(self, subject: &str, object: &str) -> String {
         match self {
-            Self::Canonical => format!("{subject} is the canonical repository for {object}"),
             Self::Fork => format!("{subject} is a fork of {object}"),
             Self::Mirror => format!("{subject} is a mirror of {object}"),
             Self::Moved => format!("{subject} moved to {object}"),
@@ -855,17 +858,10 @@ impl RelatedKind {
     /// One-line meaning in terms of the A and B labels from `repo related list`.
     fn description(self) -> &'static str {
         match self {
-            Self::Canonical => {
-                "A is the canonical repository for B (one canonical per related set)"
-            }
-            Self::Fork => "A is a fork of B; A's checkout becomes a view inside B's Git directory",
-            Self::Mirror => {
-                "A is a mirror of B; A's checkout becomes a view inside B's Git directory"
-            }
-            Self::Moved => "A moved to B: same hosted repository, B is the current locator",
-            Self::Successor => {
-                "A was succeeded by B: development continued in B (also recorded as a successor)"
-            }
+            Self::Fork => "A is a fork of B; A becomes a fork view stored with B",
+            Self::Mirror => "A is a mirror of B; A becomes a mirror view stored with B",
+            Self::Moved => "A moved to B; A is folded into B and its path becomes an alias of B",
+            Self::Successor => "A was succeeded by B; A becomes a predecessor view stored with B",
             Self::Unrelated => "A and B are unrelated; dismiss the suggestion (no direction)",
         }
     }
@@ -1651,7 +1647,6 @@ struct RelatedListReport {
 struct RelatedKindReport {
     kind: &'static str,
     directional: bool,
-    changes_checkouts: bool,
     description: &'static str,
 }
 
@@ -1689,11 +1684,9 @@ struct RelatedResolution {
     /// The recorded relationship as a sentence, subject first.
     statement: String,
     repositories: [RelatedRepositoryReport; 2],
-    changes_checkouts: bool,
+    /// How the checkouts were restructured; absent for `unrelated`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    successor: Option<SuccessorRecord>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    shared_git_dir: Option<SharedGitDirResolution>,
+    restructure: Option<RelatedRestructure>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3148,6 +3141,11 @@ impl Store {
               UNIQUE(repo_id, related_repo_id)
             );
 
+            CREATE TABLE IF NOT EXISTS canonical_repos (
+              repo_id INTEGER PRIMARY KEY REFERENCES repos(id) ON DELETE CASCADE,
+              marked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
             CREATE TABLE IF NOT EXISTS background_fetch (
               repo_id INTEGER PRIMARY KEY REFERENCES repos(id) ON DELETE CASCADE,
               last_fetch_at INTEGER,
@@ -3692,7 +3690,7 @@ impl Store {
             params![repo_id],
         )?;
         self.conn.execute(
-            "DELETE FROM related_history WHERE repo_id = ?1 AND resolution IN ('fork', 'mirror')",
+            "DELETE FROM related_history WHERE repo_id = ?1 AND resolution IN ('fork', 'mirror', 'successor')",
             params![repo_id],
         )?;
         self.conn.execute(
@@ -3709,12 +3707,12 @@ impl Store {
             |row| row.get(0),
         )?;
         let mirror_dependents: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM related_history WHERE related_repo_id = ?1 AND resolution IN ('fork', 'mirror')",
+            "SELECT COUNT(*) FROM related_history WHERE related_repo_id = ?1 AND resolution IN ('fork', 'mirror', 'successor')",
             params![repo_id],
             |row| row.get(0),
         )?;
         if fork_dependents + mirror_dependents > 0 {
-            bail!("repository is canonical for existing fork/mirror checkout(s)");
+            bail!("repository is canonical for existing fork/mirror/predecessor checkout(s)");
         }
         Ok(())
     }
@@ -3893,17 +3891,21 @@ impl Store {
             let Some(resolution) = suggestion.resolution.as_deref() else {
                 continue;
             };
-            if !matches!(resolution, "fork" | "mirror") {
-                continue;
-            }
+            // A successor row reads "repo_id was succeeded by related_repo_id":
+            // the old repository is stored as a predecessor view.
+            let relationship = match resolution {
+                "fork" | "mirror" => resolution,
+                "successor" => "predecessor",
+                _ => continue,
+            };
             let key = (
-                resolution.to_string(),
+                relationship.to_string(),
                 suggestion.repo_id,
                 suggestion.related_repo_id,
             );
             if seen.insert(key) {
                 relationships.push(SharedGitDirRelationship {
-                    relationship: resolution.to_string(),
+                    relationship: relationship.to_string(),
                     dependent_repo_id: suggestion.repo_id,
                     dependent_locator: suggestion.repo_locator,
                     dependent_path: suggestion.repo_path,
@@ -3995,55 +3997,186 @@ impl Store {
         Ok(())
     }
 
-    /// A related set (repositories connected by shared history that has not
-    /// been dismissed as unrelated) has exactly one canonical repository.
-    /// Refuse to make `candidate_id` canonical when another repository of
-    /// the set reached through `other_id` already is.
-    fn ensure_single_canonical(&self, candidate_id: i64, other_id: i64) -> Result<()> {
-        let mut stmt = self.conn.prepare(
-            "
-            SELECT id, repo_id, related_repo_id, resolution FROM related_history
-            WHERE resolution IS NULL OR resolution != 'unrelated'
-            ",
-        )?;
-        let edges = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+    /// The related set containing `seeds`: repositories joined by shared
+    /// history that was not dismissed as unrelated, or by a recorded fork.
+    fn related_set(&self, seeds: &[i64]) -> Result<HashSet<i64>> {
+        let mut edges = {
+            let mut stmt = self.conn.prepare(
+                "
+                SELECT repo_id, related_repo_id FROM related_history
+                WHERE resolution IS NULL OR resolution != 'unrelated'
+                ",
+            )?;
+            stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut stmt = self
+            .conn
+            .prepare("SELECT fork_repo_id, canonical_repo_id FROM forks")?;
+        edges.extend(
+            stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        );
 
-        let mut members = HashSet::from([candidate_id, other_id]);
+        let mut members = seeds.iter().copied().collect::<HashSet<_>>();
         let mut grew = true;
         while grew {
             grew = false;
-            for (_, repo_id, related_repo_id, _) in &edges {
-                if members.contains(repo_id) != members.contains(related_repo_id) {
-                    members.insert(*repo_id);
-                    members.insert(*related_repo_id);
+            for (left, right) in &edges {
+                if members.contains(left) != members.contains(right) {
+                    members.insert(*left);
+                    members.insert(*right);
                     grew = true;
                 }
             }
         }
+        Ok(members)
+    }
 
-        let conflict = edges.iter().find(|(_, repo_id, _, resolution)| {
-            resolution.as_deref() == Some("canonical")
-                && *repo_id != candidate_id
-                && members.contains(repo_id)
-        });
-        if let Some((suggestion_id, canonical_id, _, _)) = conflict {
-            let canonical = self.repo_by_id(*canonical_id)?.map_or_else(
-                || format!("repository {canonical_id}"),
-                |repo| repo.current.key(),
-            );
-            bail!(
-                "{canonical} is already the canonical repository of this related set (suggestion #{suggestion_id}); a related set has exactly one canonical repository"
-            );
+    /// Canonical repositories among `members`: those marked canonical, and
+    /// those that store fork, mirror or predecessor views without being
+    /// stored in another repository themselves.
+    fn canonical_repos_in(&self, members: &HashSet<i64>) -> Result<BTreeSet<i64>> {
+        let mut canonical = BTreeSet::new();
+        let mut stmt = self.conn.prepare("SELECT repo_id FROM canonical_repos")?;
+        for repo_id in stmt.query_map([], |row| row.get::<_, i64>(0))? {
+            let repo_id = repo_id?;
+            if members.contains(&repo_id) {
+                canonical.insert(repo_id);
+            }
         }
+        let relationships = self.shared_git_dir_relationships()?;
+        let dependents = relationships
+            .iter()
+            .map(|relationship| relationship.dependent_repo_id)
+            .collect::<HashSet<_>>();
+        for relationship in &relationships {
+            let root = relationship.controlling_repo_id;
+            if members.contains(&root) && !dependents.contains(&root) {
+                canonical.insert(root);
+            }
+        }
+        Ok(canonical)
+    }
+
+    fn mark_canonical(&self, repo_id: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO canonical_repos (repo_id) VALUES (?1)",
+            params![repo_id],
+        )?;
+        Ok(())
+    }
+
+    fn unmark_canonical(&self, repo_id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM canonical_repos WHERE repo_id = ?1",
+            params![repo_id],
+        )?;
+        Ok(())
+    }
+
+    /// Point every storage reference to `old_storage` at `new_storage`, for
+    /// repositories whose views now live in another bare repository.
+    fn rename_canonical_identity(
+        &self,
+        old_storage: &Locator,
+        new_storage: &Locator,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE repos SET canonical_identity = ?2, updated_at = CURRENT_TIMESTAMP WHERE canonical_identity = ?1",
+            params![old_storage.key(), new_storage.key()],
+        )?;
+        Ok(())
+    }
+
+    /// Fold repository `from` into `into` after `from` moved to `into`'s
+    /// locator: `from`'s locators become historical locators of `into`, its
+    /// path an alias of `into`'s path, and its relationships `into`'s. Rows
+    /// that would relate `into` to itself or duplicate one of its pairs are
+    /// dropped with `from`.
+    fn merge_moved_repo(&self, from: &ManagedRepoRecord, into: &ManagedRepoRecord) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE OR IGNORE locators SET repo_id = ?2, is_current = 0 WHERE repo_id = ?1",
+            params![from.id, into.id],
+        )?;
+        tx.execute(
+            "UPDATE aliases SET repo_id = ?2, target_path = ?3 WHERE repo_id = ?1",
+            params![from.id, into.id, into.path.display().to_string()],
+        )?;
+        tx.execute(
+            "
+            INSERT INTO aliases (repo_id, alias_path, target_path) VALUES (?1, ?2, ?3)
+            ON CONFLICT(alias_path) DO UPDATE SET
+              repo_id = excluded.repo_id,
+              target_path = excluded.target_path
+            ",
+            params![
+                into.id,
+                from.path.display().to_string(),
+                into.path.display().to_string()
+            ],
+        )?;
+        tx.execute(
+            "UPDATE OR IGNORE forks SET canonical_repo_id = ?2 WHERE canonical_repo_id = ?1",
+            params![from.id, into.id],
+        )?;
+        tx.execute(
+            "UPDATE OR IGNORE forks SET fork_repo_id = ?2 WHERE fork_repo_id = ?1",
+            params![from.id, into.id],
+        )?;
+        tx.execute(
+            "DELETE FROM forks WHERE fork_repo_id = canonical_repo_id",
+            [],
+        )?;
+        tx.execute(
+            "
+            DELETE FROM related_history
+            WHERE (repo_id = ?1 AND related_repo_id = ?2) OR (repo_id = ?2 AND related_repo_id = ?1)
+            ",
+            params![from.id, into.id],
+        )?;
+        tx.execute(
+            "
+            UPDATE related_history SET repo_id = ?2
+            WHERE repo_id = ?1 AND NOT EXISTS (
+              SELECT 1 FROM related_history other
+              WHERE (other.repo_id = ?2 AND other.related_repo_id = related_history.related_repo_id)
+                 OR (other.repo_id = related_history.related_repo_id AND other.related_repo_id = ?2)
+            )
+            ",
+            params![from.id, into.id],
+        )?;
+        tx.execute(
+            "
+            UPDATE related_history SET related_repo_id = ?2
+            WHERE related_repo_id = ?1 AND NOT EXISTS (
+              SELECT 1 FROM related_history other
+              WHERE (other.repo_id = ?2 AND other.related_repo_id = related_history.repo_id)
+                 OR (other.repo_id = related_history.repo_id AND other.related_repo_id = ?2)
+            )
+            ",
+            params![from.id, into.id],
+        )?;
+        tx.execute(
+            "UPDATE repos SET canonical_identity = ?2 WHERE canonical_identity = ?1",
+            params![from.current.key(), into.current.key()],
+        )?;
+        tx.execute(
+            "INSERT INTO events (repo_id, kind, payload_json) VALUES (?1, 'related-moved', ?2)",
+            params![
+                into.id,
+                serde_json::json!({
+                    "from": from.current.key(),
+                    "from_path": from.path,
+                    "into": into.current.key(),
+                    "into_path": into.path,
+                })
+                .to_string()
+            ],
+        )?;
+        tx.execute("DELETE FROM repos WHERE id = ?1", params![from.id])?;
+        tx.commit()?;
         Ok(())
     }
 }
@@ -5354,8 +5487,20 @@ fn materialize_namespace_view(
     ssh_command: Option<&str>,
 ) -> Result<RepoViewMetadata> {
     ensure_bare_repository(canonical_path)?;
-    let default_branch =
-        remote_default_branch_from_url(origin_url, ssh_command)?.unwrap_or_else(|| "main".into());
+    // A predecessor's origin may be archived or deleted: its refs already
+    // came from the old checkout, so an unreachable origin is not an error.
+    let origin_optional = relationship == "predecessor";
+    let remote_default = match remote_default_branch_from_url(origin_url, ssh_command) {
+        Ok(branch) => branch,
+        Err(error) if origin_optional => {
+            warn!("could not query {origin_url} for its default branch: {error:#}");
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    let default_branch = remote_default
+        .or_else(|| origin_optional.then(|| local_head_branch(path)).flatten())
+        .unwrap_or_else(|| "main".into());
     let refs_prefix = repo_view_refs_prefix(relationship, locator);
     let view = RepoViewMetadata {
         version: REPO_VIEW_METADATA_VERSION,
@@ -5381,7 +5526,17 @@ fn materialize_namespace_view(
     }
     fs::create_dir_all(path).with_context(|| format!("creating repo view {}", path.display()))?;
     write_repo_view_metadata(&view)?;
-    fetch_repo_view(&view, "origin", ssh_command)?;
+    match fetch_repo_view(&view, "origin", ssh_command) {
+        Ok(()) => {}
+        Err(error) if origin_optional => {
+            warn!(
+                "could not fetch {} for predecessor {}: {error:#}",
+                view.origin_url,
+                locator.key()
+            );
+        }
+        Err(error) => return Err(error),
+    }
     ensure_repo_view_default_branch(&view)?;
     Ok(view)
 }
@@ -5389,12 +5544,30 @@ fn materialize_namespace_view(
 fn repo_view_refs_prefix(relationship: &str, locator: &Locator) -> String {
     let plural = match relationship {
         "mirror" => "mirrors",
+        "predecessor" => "predecessors",
+        "moved" => "moved",
         _ => "forks",
     };
     format!(
         "refs/repo-manager/{plural}/{}",
         sanitize_remote_name(&locator.key())
     )
+}
+
+/// The branch HEAD names in the checkout or bare repository at `path`.
+fn local_head_branch(path: &Path) -> Option<String> {
+    if !path.exists() || read_repo_view_metadata(path).ok().flatten().is_some() {
+        return None;
+    }
+    let output = git_command(path)
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|branch| !branch.is_empty())
 }
 
 fn write_repo_view_metadata(view: &RepoViewMetadata) -> Result<()> {
@@ -6213,7 +6386,9 @@ fn repos_set_type(
             if args.canonical.is_some() {
                 bail!("--canonical is only valid when setting type to fork or mirror");
             }
+            ensure_sole_canonical(db, &[repo.id], repo.id, repo.id)?;
             db.clear_dependent_relationships(repo.id)?;
+            db.mark_canonical(repo.id)?;
             None
         }
         "fork" | "mirror" => {
@@ -6227,7 +6402,15 @@ fn repos_set_type(
             if parent.storage.id == repo.id {
                 bail!("repository cannot depend on one of its own descendants");
             }
+            ensure_sole_canonical(
+                db,
+                &[repo.id, parent.storage.id],
+                parent.storage.id,
+                repo.id,
+            )?;
             db.clear_dependent_relationships(repo.id)?;
+            db.unmark_canonical(repo.id)?;
+            db.mark_canonical(parent.storage.id)?;
             let resolution = materialize_related_view(
                 db,
                 &repo.current,
@@ -6268,6 +6451,31 @@ fn repos_set_type(
         shared_git_dir,
     };
     output_repo_type_change(output, &result)
+}
+
+/// Refuse to make `canonical_id` the canonical repository of the related
+/// set containing `members` while a different repository already is one,
+/// ignoring `subject_id`, whose own role is being changed.
+fn ensure_sole_canonical(
+    db: &Store,
+    members: &[i64],
+    canonical_id: i64,
+    subject_id: i64,
+) -> Result<()> {
+    let set = db.related_set(members)?;
+    if let Some(other) = db
+        .canonical_repos_in(&set)?
+        .into_iter()
+        .find(|repo_id| *repo_id != canonical_id && *repo_id != subject_id)
+    {
+        let other = db
+            .repo_by_id(other)?
+            .map_or_else(|| format!("repository {other}"), |repo| repo.current.key());
+        bail!(
+            "{other} is already the canonical repository of this related set; a related set has exactly one canonical repository"
+        );
+    }
+    Ok(())
 }
 
 fn ensure_type_change_parent(
@@ -6733,7 +6941,17 @@ fn apply_repair_operations(
                 }
             }
             RepairOperationKind::RepairRelationship(relationship) => {
-                match materialize_related_view(
+                // The check reports views against their storage root; only a
+                // direct fork or mirror of that root is recorded again here.
+                let summaries =
+                    relationship_summaries(&db.shared_git_dir_relationships()?).unwrap_or_default();
+                let depth = db
+                    .find_repo(&relationship.dependent_locator.key())?
+                    .and_then(|record| summaries.get(&record.id))
+                    .map_or(1, |summary| summary.depth);
+                let record_relationship =
+                    depth == 1 && matches!(relationship.relationship.as_str(), "fork" | "mirror");
+                match materialize_view_in_storage(
                     db,
                     &relationship.dependent_locator,
                     &relationship.dependent_path,
@@ -6741,6 +6959,7 @@ fn apply_repair_operations(
                     &relationship.controlling_path,
                     &relationship.relationship,
                     &config.identities,
+                    record_relationship,
                 ) {
                     Ok(shared_git_dir) => report.relationships.push(RepairRelationship {
                         relationship: relationship.relationship.clone(),
@@ -6975,7 +7194,22 @@ fn build_repair_report(config: &Config, db: &Store, check: bool) -> Result<Repai
     } else {
         db.shared_git_dir_relationships()?
     };
-    for relationship in relationship_source {
+    // A view is stored in its chain's root repository, not in its direct
+    // parent when that parent is itself a view: check and repair it there.
+    let summaries = relationship_summaries(&relationship_source).unwrap_or_default();
+    for mut relationship in relationship_source {
+        // Only a direct fork or mirror of its storage is recorded by the
+        // repair itself; deeper views and predecessors keep their own rows.
+        let mut record_relationship =
+            matches!(relationship.relationship.as_str(), "fork" | "mirror");
+        if let Some(summary) = summaries.get(&relationship.dependent_repo_id)
+            && summary.canonical_repo_id != relationship.controlling_repo_id
+        {
+            relationship.controlling_repo_id = summary.canonical_repo_id;
+            relationship.controlling_locator = summary.canonical_locator.clone();
+            relationship.controlling_path = summary.canonical_path.clone();
+            record_relationship = false;
+        }
         if stale_repo_ids.contains(&relationship.dependent_repo_id)
             || stale_repo_ids.contains(&relationship.controlling_repo_id)
         {
@@ -7049,7 +7283,7 @@ fn build_repair_report(config: &Config, db: &Store, check: bool) -> Result<Repai
             continue;
         }
 
-        match materialize_related_view(
+        match materialize_view_in_storage(
             db,
             &relationship.dependent_locator,
             &relationship.dependent_path,
@@ -7057,6 +7291,7 @@ fn build_repair_report(config: &Config, db: &Store, check: bool) -> Result<Repai
             &relationship.controlling_path,
             &relationship.relationship,
             &config.identities,
+            record_relationship,
         ) {
             Ok(shared_git_dir) => relationships.push(RepairRelationship {
                 relationship: relationship.relationship,
@@ -7868,33 +8103,12 @@ fn related_resolve(
     let repositories = related_repository_reports(&suggestion);
     let [a, b] = &repositories;
     let (subject, object) = if reverse { (b, a) } else { (a, b) };
+    let statement = kind.statement(&subject.locator.key(), &object.locator.key());
 
-    if kind == RelatedKind::Canonical {
-        db.ensure_single_canonical(subject.repo_id, object.repo_id)?;
-    }
-    let shared_git_dir = kind
-        .changes_checkouts()
-        .then(|| {
-            materialize_related_view(
-                db,
-                &subject.locator,
-                &subject.path,
-                &object.locator,
-                &object.path,
-                kind.as_str(),
-                &config.identities,
-            )
-        })
-        .transpose()?;
-    db.resolve_related(id, kind.as_str(), subject.repo_id, object.repo_id)?;
-    let successor = if kind == RelatedKind::Successor {
-        let old_ref = subject.locator.key();
-        db.record_successor(&old_ref, &object.locator)?;
-        Some(SuccessorRecord {
-            old_ref,
-            new_locator: object.locator.clone(),
-        })
+    let restructure = if kind.is_directional() {
+        Some(restructure_related(config, db, id, kind, subject, object)?)
     } else {
+        db.resolve_related(id, kind.as_str(), subject.repo_id, object.repo_id)?;
         None
     };
 
@@ -7905,19 +8119,559 @@ fn related_resolve(
             id,
             resolution: kind.as_str().to_string(),
             reversed: reverse,
-            statement: kind.statement(&subject.locator.key(), &object.locator.key()),
-            changes_checkouts: kind.changes_checkouts(),
-            successor,
-            shared_git_dir,
+            statement,
+            restructure,
             repositories,
         },
     )
+}
+
+/// Store `subject` with `object` according to `kind`: `object`'s storage
+/// root becomes (or stays) the related set's canonical bare repository,
+/// everything stored in or checked out from `subject` moves into it, and
+/// `subject` becomes a namespace view there or, for `moved`, an alias of
+/// `object`.
+fn restructure_related(
+    config: &Config,
+    db: &Store,
+    id: i64,
+    kind: RelatedKind,
+    subject: &RelatedRepositoryReport,
+    object: &RelatedRepositoryReport,
+) -> Result<RelatedRestructure> {
+    let subject_key = subject.locator.key();
+    let object_key = object.locator.key();
+    let summaries = relationship_summaries(&db.shared_git_dir_relationships()?)?;
+    if let Some(summary) = summaries.get(&subject.repo_id) {
+        bail!(
+            "{subject_key} is already a {} of {}; a repository has one parent",
+            summary.relationship,
+            summary.parent_locator.key()
+        );
+    }
+    if read_repo_view_metadata(&subject.path)?.is_some() {
+        bail!(
+            "{subject_key} is a namespace view without a recorded parent; run `repo check --repair` first"
+        );
+    }
+    let root_id = summaries
+        .get(&object.repo_id)
+        .map_or(object.repo_id, |summary| summary.canonical_repo_id);
+    if root_id == subject.repo_id {
+        bail!("{object_key} is stored in {subject_key}, so {subject_key} cannot be stored with it");
+    }
+    if kind == RelatedKind::Moved
+        && let Some(summary) = summaries.get(&object.repo_id)
+    {
+        bail!(
+            "{object_key} is a {} view stored in {}; a repository can only move to a canonical repository",
+            summary.relationship,
+            summary.canonical_locator.key()
+        );
+    }
+    let storage = db
+        .repo_by_id(root_id)?
+        .ok_or_else(|| anyhow!("repository {root_id} disappeared"))?;
+    let members = db.related_set(&[subject.repo_id, object.repo_id])?;
+    if let Some(other) = db
+        .canonical_repos_in(&members)?
+        .into_iter()
+        .find(|repo_id| *repo_id != root_id && *repo_id != subject.repo_id)
+    {
+        let other = db
+            .repo_by_id(other)?
+            .map_or_else(|| format!("repository {other}"), |repo| repo.current.key());
+        bail!(
+            "{other} is already the canonical repository of this related set, but {} is not stored in it; resolve how {object_key} relates to {other} first",
+            storage.current.key()
+        );
+    }
+    let subject_record = db
+        .repo_by_id(subject.repo_id)?
+        .ok_or_else(|| anyhow!("repository {subject_key} disappeared"))?;
+
+    // Plan every worktree before changing anything.
+    let worktrees = if subject.path.exists() {
+        linked_worktrees(&subject.path)?
+    } else {
+        Vec::new()
+    };
+    for worktree in &worktrees {
+        ensure_clean_checkout(&worktree.path)?;
+    }
+    let subject_worktree_root = locator_path(&config.dev_worktree_root, &subject.locator);
+    let worktree_paths = worktrees
+        .iter()
+        .map(
+            |worktree| match worktree.path.strip_prefix(&subject_worktree_root) {
+                Ok(relative) if kind == RelatedKind::Moved => {
+                    locator_path(&config.dev_worktree_root, &object.locator).join(relative)
+                }
+                _ => worktree.path.clone(),
+            },
+        )
+        .collect::<Vec<_>>();
+    for (worktree, path) in worktrees.iter().zip(&worktree_paths) {
+        if *path != worktree.path && fs::symlink_metadata(path).is_ok() {
+            bail!(
+                "cannot move worktree {} to {}: the destination exists",
+                worktree.path.display(),
+                path.display()
+            );
+        }
+    }
+    // Worktrees of views stored in the subject may sit on a plain branch of
+    // the subject's Git directory; that branch moves to the canonical one.
+    let mut view_branches = Vec::new();
+    if kind != RelatedKind::Moved {
+        for worktree in &worktrees {
+            let Some(refname) = worktree.branch() else {
+                continue;
+            };
+            if worktree.path.starts_with(&subject_worktree_root)
+                || !refname.starts_with("refs/heads/")
+            {
+                continue;
+            }
+            let target = git_output(&subject.path, ["rev-parse", refname], "resolving branch")?;
+            let target = target.trim().to_string();
+            if storage.path.exists() && git_dir_ref_exists(&storage.path, refname)? {
+                let existing =
+                    git_dir_output(&storage.path, ["rev-parse", refname], "resolving branch")?;
+                if existing.trim() != target {
+                    bail!(
+                        "worktree {} is on {refname}, which {} also has at another commit; rename the branch first",
+                        worktree.path.display(),
+                        storage.current.key()
+                    );
+                }
+            }
+            view_branches.push((refname.to_string(), target));
+        }
+    }
+
+    ensure_managed_canonical_is_bare(&storage)?;
+    if !worktrees.is_empty() {
+        // Relinked worktrees get worktree-scoped config below.
+        configure_worktree_config(&storage.path, config.worktree_use_relative_paths)?;
+    }
+    let rehomed_views = if subject.path.exists() {
+        rehome_stored_views(db, &subject_record, &storage)?
+    } else {
+        Vec::new()
+    };
+
+    let mut restructure = RelatedRestructure {
+        canonical_locator: storage.current.clone(),
+        canonical_path: storage.path.clone(),
+        view: None,
+        successor: None,
+        moved: None,
+        rehomed_views,
+        worktrees: Vec::new(),
+    };
+
+    if kind == RelatedKind::Moved {
+        let (imported, namespaced) = if subject.path.exists() {
+            fold_moved_refs(&subject.path, &storage.path, &subject.locator)?
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let moved_prefix = repo_view_refs_prefix("moved", &subject.locator);
+        for (worktree, path) in worktrees.iter().zip(&worktree_paths) {
+            let head = worktree
+                .branch()
+                .map(|refname| match refname.strip_prefix("refs/heads/") {
+                    Some(branch) if namespaced.iter().any(|kept| kept == branch) => {
+                        format!("{moved_prefix}/heads/{branch}")
+                    }
+                    _ => refname.to_string(),
+                });
+            relink_worktree(&storage.path, worktree, path, head.as_deref())?;
+            apply_worktree_identity(&config.identities, &object.locator, path)?;
+            restructure
+                .worktrees
+                .push(RelinkedWorktree::new(path, head));
+        }
+        let backup_path = if fs::symlink_metadata(&subject.path).is_ok() {
+            let backup_path = unique_backup_path(&subject.path)?;
+            fs::rename(&subject.path, &backup_path).with_context(|| {
+                format!(
+                    "moving {} aside to {}",
+                    subject.path.display(),
+                    backup_path.display()
+                )
+            })?;
+            Some(backup_path)
+        } else {
+            None
+        };
+        if let Some(parent) = subject.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        symlink_dir(&storage.path, &subject.path)?;
+        remove_empty_dirs(&subject_worktree_root, &config.dev_worktree_root);
+        db.merge_moved_repo(&subject_record, &storage)?;
+        restructure.moved = Some(MovedFold {
+            alias_path: subject.path.clone(),
+            alias_target: storage.path.clone(),
+            backup_path,
+            imported_branches: imported,
+            namespaced_branches: namespaced,
+        });
+    } else {
+        let relationship = kind
+            .view_relationship()
+            .expect("directional kinds other than moved have a view");
+        let prefix = repo_view_refs_prefix(relationship, &subject.locator);
+        for (refname, target) in &view_branches {
+            git_dir_update_ref(&storage.path, refname, target)?;
+        }
+        let mut own_worktrees = Vec::new();
+        for (worktree, path) in worktrees.iter().zip(&worktree_paths) {
+            let own = worktree.path.starts_with(&subject_worktree_root);
+            let head = worktree
+                .branch()
+                .map(|refname| match refname.strip_prefix("refs/heads/") {
+                    Some(branch) if own => format!("{prefix}/heads/{branch}"),
+                    _ => refname.to_string(),
+                });
+            relink_worktree(&storage.path, worktree, path, head.as_deref())?;
+            if own {
+                own_worktrees.push((path.clone(), head.clone()));
+            }
+            restructure
+                .worktrees
+                .push(RelinkedWorktree::new(path, head));
+        }
+        let view = materialize_view_in_storage(
+            db,
+            &subject.locator,
+            &subject.path,
+            &storage.current,
+            &storage.path,
+            relationship,
+            &config.identities,
+            false,
+        )?;
+        let metadata = read_repo_view_metadata(&subject.path)?
+            .ok_or_else(|| anyhow!("{subject_key} view metadata is missing"))?;
+        for (path, head) in &own_worktrees {
+            if let Some(head) = head {
+                configure_repo_view_worktree_remote(&metadata, path, head)?;
+            }
+            apply_worktree_identity(&config.identities, &subject.locator, path)?;
+        }
+        db.unmark_canonical(subject.repo_id)?;
+        if kind == RelatedKind::Fork {
+            db.record_fork(subject.repo_id, object.repo_id)?;
+        }
+        db.resolve_related(id, kind.as_str(), subject.repo_id, object.repo_id)?;
+        if kind == RelatedKind::Successor {
+            db.record_successor(&subject_key, &object.locator)?;
+            restructure.successor = Some(SuccessorRecord {
+                old_ref: subject_key.clone(),
+                new_locator: object.locator.clone(),
+            });
+        }
+        restructure.view = Some(view);
+    }
+
+    if !worktrees.is_empty() {
+        configure_worktree_config(&storage.path, config.worktree_use_relative_paths)?;
+    }
+    db.mark_canonical(storage.id)?;
+    Ok(restructure)
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct SuccessorRecord {
     old_ref: String,
     new_locator: Locator,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RelatedRestructure {
+    /// The related set's canonical repository, holding the only bare Git
+    /// directory.
+    canonical_locator: Locator,
+    canonical_path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    view: Option<SharedGitDirResolution>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    successor: Option<SuccessorRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    moved: Option<MovedFold>,
+    /// Views that were stored in the subject's Git directory and now live
+    /// in the canonical repository.
+    rehomed_views: Vec<Locator>,
+    worktrees: Vec<RelinkedWorktree>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MovedFold {
+    alias_path: PathBuf,
+    alias_target: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backup_path: Option<PathBuf>,
+    /// Branches of the moved repository created in the canonical one.
+    imported_branches: Vec<String>,
+    /// Branches the canonical repository already had; the moved
+    /// repository's versions stay under its `refs/repo-manager/moved/`
+    /// namespace.
+    namespaced_branches: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RelinkedWorktree {
+    path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    head: Option<String>,
+}
+
+impl RelinkedWorktree {
+    fn new(path: &Path, head: Option<String>) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            head,
+        }
+    }
+}
+
+/// A linked worktree of a repository and the ref its HEAD names, if any.
+#[derive(Debug, Clone)]
+struct LinkedWorktree {
+    path: PathBuf,
+    branch: Option<String>,
+}
+
+impl LinkedWorktree {
+    fn branch(&self) -> Option<&str> {
+        self.branch.as_deref()
+    }
+}
+
+/// Linked worktrees of the repository at `repo_path`, excluding its main
+/// worktree (or bare directory) and worktrees whose directory is gone.
+fn linked_worktrees(repo_path: &Path) -> Result<Vec<LinkedWorktree>> {
+    let output = git_output(
+        repo_path,
+        ["worktree", "list", "--porcelain"],
+        "listing Git worktrees",
+    )?;
+    let mut worktrees = Vec::new();
+    for block in output.split("\n\n").skip(1) {
+        let mut path = None;
+        let mut branch = None;
+        let mut prunable = false;
+        for line in block.lines() {
+            if let Some(value) = line.strip_prefix("worktree ") {
+                path = Some(PathBuf::from(value));
+            } else if let Some(value) = line.strip_prefix("branch ") {
+                branch = Some(value.to_string());
+            } else if line.starts_with("prunable") {
+                prunable = true;
+            }
+        }
+        if let Some(path) = path
+            && !prunable
+        {
+            worktrees.push(LinkedWorktree { path, branch });
+        }
+    }
+    Ok(worktrees)
+}
+
+/// Re-attach `worktree` to the bare repository `git_dir` at `new_path`,
+/// keeping its directory, index and worktree config: the administrative
+/// directory moves into `git_dir/worktrees/`, HEAD is pointed at `head` when
+/// given, and `git worktree repair` rewrites the links.
+fn relink_worktree(
+    git_dir: &Path,
+    worktree: &LinkedWorktree,
+    new_path: &Path,
+    head: Option<&str>,
+) -> Result<()> {
+    // Resolve now: a relative admin path goes through the worktree directory.
+    let old_admin = worktree_git_dir(&worktree.path)?;
+    let old_admin = fs::canonicalize(&old_admin)
+        .with_context(|| format!("resolving worktree admin dir {}", old_admin.display()))?;
+    if new_path != worktree.path {
+        if let Some(parent) = new_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::rename(&worktree.path, new_path).with_context(|| {
+            format!(
+                "moving worktree {} to {}",
+                worktree.path.display(),
+                new_path.display()
+            )
+        })?;
+    }
+    let name = old_admin
+        .file_name()
+        .ok_or_else(|| anyhow!("worktree admin dir has no name: {}", old_admin.display()))?
+        .to_string_lossy()
+        .into_owned();
+    let admin_root = git_dir.join("worktrees");
+    fs::create_dir_all(&admin_root)?;
+    let mut new_admin = admin_root.join(&name);
+    let mut suffix = 1;
+    while fs::symlink_metadata(&new_admin).is_ok() {
+        new_admin = admin_root.join(format!("{name}{suffix}"));
+        suffix += 1;
+    }
+    fs::rename(&old_admin, &new_admin).with_context(|| {
+        format!(
+            "moving worktree admin dir {} to {}",
+            old_admin.display(),
+            new_admin.display()
+        )
+    })?;
+    if let Some(head) = head {
+        fs::write(new_admin.join("HEAD"), format!("ref: {head}\n"))?;
+    }
+    fs::write(
+        new_path.join(".git"),
+        format!("gitdir: {}\n", new_admin.display()),
+    )?;
+    fs::write(
+        new_admin.join("gitdir"),
+        format!("{}\n", new_path.join(".git").display()),
+    )?;
+    // `repair` reports every link it rewrites on stderr; that is expected here.
+    let output = git_dir_command(git_dir)
+        .args(["worktree", "repair"])
+        .arg(new_path)
+        .output()
+        .with_context(|| format!("repairing worktree {}", new_path.display()))?;
+    if !output.status.success() {
+        bail!(
+            "git worktree repair failed with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Move every namespace stored in `from`'s Git directory into `to`, the
+/// bare repository that becomes their storage, and point the views at it.
+/// Returns the locators of the moved views.
+fn rehome_stored_views(
+    db: &Store,
+    from: &ManagedRepoRecord,
+    to: &ManagedRepoRecord,
+) -> Result<Vec<Locator>> {
+    let stored = git_output(
+        &from.path,
+        ["for-each-ref", "--count=1", "refs/repo-manager/"],
+        "listing stored namespaces",
+    )?;
+    if !stored.trim().is_empty() {
+        let status = git_dir_command(&to.path)
+            .args(["fetch", "--no-tags", "--update-head-ok"])
+            .arg(&from.path)
+            .arg("+refs/repo-manager/*:refs/repo-manager/*")
+            .status()
+            .with_context(|| {
+                format!(
+                    "fetching stored namespaces from {} into {}",
+                    from.path.display(),
+                    to.path.display()
+                )
+            })?;
+        if !status.success() {
+            bail!("git fetch of stored namespaces failed with status {status}");
+        }
+    }
+
+    let mut rehomed = Vec::new();
+    for relationship in db.shared_git_dir_relationships()? {
+        let Some(mut view) = read_repo_view_metadata(&relationship.dependent_path)? else {
+            continue;
+        };
+        if comparable_path(&view.canonical_path) != comparable_path(&from.path)
+            || rehomed.contains(&view.locator)
+        {
+            continue;
+        }
+        view.canonical_locator = to.current.clone();
+        view.canonical_path = to.path.clone();
+        write_repo_view_metadata(&view)?;
+        rehomed.push(view.locator);
+    }
+    db.rename_canonical_identity(&from.current, &to.current)?;
+    Ok(rehomed)
+}
+
+/// Bring the branches of `moved_path`, the old checkout of the repository
+/// now at `canonical_path`, into the canonical repository. Every branch and
+/// tag is kept under the `moved` namespace; branches the canonical
+/// repository lacks are also created there. Returns `(imported, kept)`
+/// branch names.
+fn fold_moved_refs(
+    moved_path: &Path,
+    canonical_path: &Path,
+    moved_locator: &Locator,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let prefix = repo_view_refs_prefix("moved", moved_locator);
+    let status = git_dir_command(canonical_path)
+        .args(["fetch", "--no-tags"])
+        .arg(moved_path)
+        .arg(format!("+refs/heads/*:{prefix}/heads/*"))
+        .arg(format!("+refs/tags/*:{prefix}/tags/*"))
+        .status()
+        .with_context(|| {
+            format!(
+                "fetching {} into {}",
+                moved_path.display(),
+                canonical_path.display()
+            )
+        })?;
+    if !status.success() {
+        bail!("git fetch from moved checkout failed with status {status}");
+    }
+    let heads_prefix = format!("{prefix}/heads/");
+    let refs = git_dir_output(
+        canonical_path,
+        [
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            &heads_prefix,
+        ],
+        "listing moved branches",
+    )?;
+    let mut imported = Vec::new();
+    let mut kept = Vec::new();
+    for line in refs.lines() {
+        let Some((refname, target)) = line.split_once(' ') else {
+            continue;
+        };
+        let Some(branch) = refname.strip_prefix(&heads_prefix) else {
+            continue;
+        };
+        let local = format!("refs/heads/{branch}");
+        if git_dir_ref_exists(canonical_path, &local)? {
+            kept.push(branch.to_string());
+        } else {
+            git_dir_update_ref(canonical_path, &local, target)?;
+            imported.push(branch.to_string());
+        }
+    }
+    Ok((imported, kept))
+}
+
+/// Remove `path` and its parents below `root` while they are empty
+/// directories.
+fn remove_empty_dirs(path: &Path, root: &Path) {
+    let mut current = Some(path);
+    while let Some(dir) = current {
+        if !dir.starts_with(root) || dir == root || fs::remove_dir(dir).is_err() {
+            break;
+        }
+        current = dir.parent();
+    }
 }
 
 /// Attach a fork or mirror to its canonical bare repository as a namespace
@@ -7933,6 +8687,32 @@ fn materialize_related_view(
     controlling_path: &Path,
     relationship: &str,
     identities: &IdentityMap,
+) -> Result<SharedGitDirResolution> {
+    materialize_view_in_storage(
+        db,
+        dependent_locator,
+        dependent_path,
+        controlling_locator,
+        controlling_path,
+        relationship,
+        identities,
+        true,
+    )
+}
+
+/// [`materialize_related_view`], recording the dependent's relationship to
+/// the storage repository only when `record_relationship` is set; callers
+/// that relate the dependent to another parent record that themselves.
+#[allow(clippy::too_many_arguments)]
+fn materialize_view_in_storage(
+    db: &Store,
+    dependent_locator: &Locator,
+    dependent_path: &Path,
+    controlling_locator: &Locator,
+    controlling_path: &Path,
+    relationship: &str,
+    identities: &IdentityMap,
+    record_relationship: bool,
 ) -> Result<SharedGitDirResolution> {
     // Check before touching Git: a view written at the canonical path would
     // replace the canonical repository.
@@ -7995,10 +8775,12 @@ fn materialize_related_view(
         dependent_path,
         Some(&controlling_locator.key()),
     )?;
-    if relationship == "fork" {
-        db.record_fork(dependent_id, controlling_id)?;
-    } else {
-        db.record_resolved_related(dependent_id, controlling_id, relationship)?;
+    if record_relationship {
+        if relationship == "fork" {
+            db.record_fork(dependent_id, controlling_id)?;
+        } else {
+            db.record_resolved_related(dependent_id, controlling_id, relationship)?;
+        }
     }
 
     Ok(SharedGitDirResolution {
@@ -8023,8 +8805,9 @@ fn fetch_existing_dependent_into_namespace(
     let heads_refspec = format!("+refs/heads/*:{refs_prefix}/heads/*");
     let remote_heads_refspec = format!("+refs/remotes/origin/*:{refs_prefix}/remotes/origin/*");
     let tags_refspec = format!("+refs/tags/*:{refs_prefix}/tags/*");
+    // A relinked worktree may already have one of these refs as HEAD.
     let status = git_dir_command(controlling_path)
-        .args(["fetch", "--no-tags"])
+        .args(["fetch", "--no-tags", "--update-head-ok"])
         .arg(dependent_path)
         .arg(heads_refspec)
         .arg(remote_heads_refspec)
@@ -10493,7 +11276,6 @@ fn related_list_report(suggestions: &[RelatedSuggestion]) -> RelatedListReport {
             .map(|kind| RelatedKindReport {
                 kind: kind.as_str(),
                 directional: kind.is_directional(),
-                changes_checkouts: kind.changes_checkouts(),
                 description: kind.description(),
             })
             .collect(),
@@ -10569,30 +11351,64 @@ fn output_related_resolution(output: &Output, resolution: &RelatedResolution) ->
         "resolved shared-history suggestion #{}: {}",
         resolution.id, resolution.statement
     );
-    if let Some(successor) = &resolution.successor {
+    let Some(restructure) = &resolution.restructure else {
+        println!("no checkout changed");
+        return Ok(());
+    };
+    println!(
+        "canonical repository: {} ({})",
+        restructure.canonical_locator.key(),
+        restructure.canonical_path.display()
+    );
+    if let Some(view) = &restructure.view {
+        println!(
+            "{} is now a namespace view stored in {}",
+            view.dependent_locator.key(),
+            view.controlling_locator.key()
+        );
+        println!(
+            "view origin: {} -> {}",
+            view.dependent_remote, view.dependent_url
+        );
+        println!(
+            "namespace branch: {} -> {}",
+            view.local_branch, view.remote_branch
+        );
+    }
+    if let Some(successor) = &restructure.successor {
         println!(
             "recorded successor: {} -> {}",
             successor.old_ref,
             successor.new_locator.key()
         );
     }
-    if !resolution.changes_checkouts {
-        println!("no checkout changed");
+    if let Some(moved) = &restructure.moved {
+        println!(
+            "alias: {} -> {}",
+            moved.alias_path.display(),
+            moved.alias_target.display()
+        );
+        if let Some(backup) = &moved.backup_path {
+            println!("old checkout moved aside to {}", backup.display());
+        }
+        if !moved.imported_branches.is_empty() {
+            println!("imported branches: {}", moved.imported_branches.join(", "));
+        }
+        if !moved.namespaced_branches.is_empty() {
+            println!(
+                "branches already present, old versions kept under refs/repo-manager/moved/: {}",
+                moved.namespaced_branches.join(", ")
+            );
+        }
     }
-    if let Some(shared_git_dir) = &resolution.shared_git_dir {
-        println!(
-            "{} now lives in canonical Git directory {}",
-            shared_git_dir.dependent_locator.key(),
-            shared_git_dir.controlling_locator.key()
-        );
-        println!(
-            "view origin: {} -> {}",
-            shared_git_dir.dependent_remote, shared_git_dir.dependent_url
-        );
-        println!(
-            "namespace branch: {} -> {}",
-            shared_git_dir.local_branch, shared_git_dir.remote_branch
-        );
+    for view in &restructure.rehomed_views {
+        println!("moved stored view: {}", view.key());
+    }
+    for worktree in &restructure.worktrees {
+        match &worktree.head {
+            Some(head) => println!("worktree {} -> {head}", worktree.path.display()),
+            None => println!("worktree {} (detached)", worktree.path.display()),
+        }
     }
     Ok(())
 }
@@ -15088,10 +15904,10 @@ mod tests {
         let directional: Vec<_> = report
             .kinds
             .iter()
-            .filter(|kind| kind.changes_checkouts)
+            .filter(|kind| kind.directional)
             .map(|kind| kind.kind)
             .collect();
-        assert_eq!(directional, ["fork", "mirror"]);
+        assert_eq!(directional, ["fork", "mirror", "moved", "successor"]);
     }
 
     #[test]
@@ -15350,115 +16166,283 @@ mod tests {
             .id
     }
 
-    fn resolved_row(store: &Store, id: i64) -> (i64, i64, String) {
-        store
-            .conn
-            .query_row(
-                "SELECT repo_id, related_repo_id, resolution FROM related_history WHERE id = ?1",
-                params![id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap()
+    fn commit_all(path: &Path, message: &str) {
+        run_git_in(path, ["add", "."]).unwrap();
+        run_git_in(
+            path,
+            [
+                "-c",
+                "user.name=repo-manager",
+                "-c",
+                "user.email=repo-manager@example.com",
+                "commit",
+                "-m",
+                message,
+            ],
+        )
+        .unwrap();
+    }
+
+    /// Standalone checkouts under the clone root for `names`, each cloned
+    /// from its own local stand-in origin; all share a root commit and each
+    /// adds one commit on `main`. Shared history is recorded between every
+    /// pair. Returns `(locator, path, repo_id)` in order.
+    fn related_seeded_checkouts(
+        config: &Config,
+        store: &Store,
+        dir: &Path,
+        names: &[&str],
+    ) -> Vec<(Locator, PathBuf, i64)> {
+        let root_seed = dir.join("root-seed");
+        fs::create_dir_all(&root_seed).unwrap();
+        run_git_in(&root_seed, ["init", "-b", "main"]).unwrap();
+        fs::write(root_seed.join("README.md"), "root\n").unwrap();
+        commit_all(&root_seed, "root");
+        let repos = names
+            .iter()
+            .map(|name| {
+                let seed = dir.join(format!("{name}-seed"));
+                clone_local_repo(&root_seed, &seed);
+                fs::write(seed.join(format!("{name}.txt")), format!("{name}\n")).unwrap();
+                commit_all(&seed, name);
+                let url = file_url_for_path(&seed);
+                let locator = Locator::parse(&url).unwrap();
+                let path = locator_path(&config.clone_root, &locator);
+                clone_local_repo(&seed, &path);
+                run_git_in(&path, ["remote", "set-url", "origin", url.as_str()]).unwrap();
+                let id = store.upsert_repo(&locator, &path, None).unwrap();
+                (locator, path, id)
+            })
+            .collect::<Vec<_>>();
+        for (index, (_, _, first)) in repos.iter().enumerate() {
+            for (_, _, second) in &repos[index + 1..] {
+                store
+                    .record_related_history(*first, *second, &["shared root commit abc".into()])
+                    .unwrap();
+            }
+        }
+        repos
+    }
+
+    fn add_branch_worktree(
+        config: &Config,
+        repo: &Path,
+        locator: &Locator,
+        branch: &str,
+    ) -> PathBuf {
+        let path = locator_path(&config.dev_worktree_root, locator).join(branch);
+        run_git_in(
+            repo,
+            ["worktree", "add", "-b", branch, path.to_str().unwrap()],
+        )
+        .unwrap();
+        path
+    }
+
+    fn resolve_pair(
+        config: &Config,
+        store: &Store,
+        subject: i64,
+        object: i64,
+        kind: RelatedKind,
+    ) -> Result<()> {
+        let id = suggestion_between(store, subject, object);
+        let suggestion = store.related_suggestion(id).unwrap();
+        related_resolve(
+            config,
+            store,
+            &Output { json: true },
+            id,
+            kind,
+            suggestion.repo_id != subject,
+        )
+    }
+
+    fn canonical_path_of(path: &Path) -> PathBuf {
+        fs::canonicalize(path).unwrap()
     }
 
     #[test]
-    fn reversed_resolution_is_stored_subject_first_and_not_suggested_again() {
+    fn successor_chain_stores_every_predecessor_in_the_latest_repository() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
         let store = Store::open(&config.state).unwrap();
-        let ids = example_repos(&store, dir.path(), &["a", "b"]);
-        let (a, b) = (ids[0], ids[1]);
-        let id = suggestion_between(&store, a, b);
+        let repos = related_seeded_checkouts(&config, &store, dir.path(), &["a", "b", "c"]);
+        let (a_locator, a_path, a) = repos[0].clone();
+        let (b_locator, b_path, b) = repos[1].clone();
+        let (c_locator, c_path, c) = repos[2].clone();
+        let topic = add_branch_worktree(&config, &a_path, &a_locator, "topic");
 
-        related_resolve(
-            &config,
-            &store,
-            &Output { json: true },
-            id,
-            RelatedKind::Moved,
-            true,
-        )
-        .unwrap();
+        // A was succeeded by B: A is stored in B.
+        resolve_pair(&config, &store, a, b, RelatedKind::Successor).unwrap();
+        assert!(is_bare_repository(&b_path).unwrap());
+        let a_view = read_repo_view_metadata(&a_path).unwrap().unwrap();
+        assert_eq!(a_view.relationship, "predecessor");
+        assert_eq!(a_view.canonical_path, b_path);
 
-        assert_eq!(resolved_row(&store, id), (b, a, "moved".to_string()));
-        // The daemon seeing the pair again, in either order, must not reopen it.
-        suggestion_between(&store, a, b);
-        suggestion_between(&store, b, a);
-        assert_eq!(store.pending_related_count().unwrap(), 0);
-        let rows: i64 = store
-            .conn
-            .query_row("SELECT COUNT(*) FROM related_history", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(rows, 1);
-    }
-
-    #[test]
-    fn successor_resolution_records_old_and_new_repository() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = test_config(dir.path());
-        let store = Store::open(&config.state).unwrap();
-        let ids = example_repos(&store, dir.path(), &["old", "new"]);
-        let id = suggestion_between(&store, ids[0], ids[1]);
-
-        // A is `old`; "A was succeeded by B".
-        related_resolve(
-            &config,
-            &store,
-            &Output { json: true },
-            id,
-            RelatedKind::Successor,
-            false,
-        )
-        .unwrap();
-
-        let (old_ref, new_path): (String, String) = store
-            .conn
-            .query_row(
-                "SELECT old_ref, new_remote_path FROM successors",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(old_ref, "github.com/example/old");
-        assert_eq!(new_path, "example/new");
+        // B was succeeded by C: B and everything stored in it move to C.
+        resolve_pair(&config, &store, b, c, RelatedKind::Successor).unwrap();
+        assert!(is_bare_repository(&c_path).unwrap());
+        let a_view = read_repo_view_metadata(&a_path).unwrap().unwrap();
+        let b_view = read_repo_view_metadata(&b_path).unwrap().unwrap();
+        assert_eq!(a_view.canonical_path, c_path);
         assert_eq!(
-            resolved_row(&store, id),
-            (ids[0], ids[1], "successor".to_string())
+            (b_view.relationship.as_str(), &b_view.canonical_path),
+            ("predecessor", &c_path)
+        );
+        let a_prefix = repo_view_refs_prefix("predecessor", &a_locator);
+        let b_prefix = repo_view_refs_prefix("predecessor", &b_locator);
+        assert!(git_dir_ref_exists(&c_path, &format!("{a_prefix}/heads/main")).unwrap());
+        assert!(git_dir_ref_exists(&c_path, &format!("{a_prefix}/heads/topic")).unwrap());
+        assert!(git_dir_ref_exists(&c_path, &format!("{b_prefix}/heads/main")).unwrap());
+
+        // A's worktree followed its branch into C and is still clean.
+        let head = git_output(&topic, ["symbolic-ref", "HEAD"], "reading HEAD").unwrap();
+        assert_eq!(head.trim(), format!("{a_prefix}/heads/topic"));
+        let common = git_output(&topic, ["rev-parse", "--git-common-dir"], "common dir").unwrap();
+        assert_eq!(
+            canonical_path_of(&topic.join(common.trim())),
+            canonical_path_of(&c_path)
+        );
+        assert!(fs::read_to_string(topic.join("a.txt")).is_ok());
+        let status = git_output(&topic, ["status", "--porcelain"], "status").unwrap();
+        assert!(status.trim().is_empty(), "{status}");
+
+        // C is the related set's only canonical repository; A's parent is B.
+        let members = store.related_set(&[a]).unwrap();
+        assert_eq!(
+            store.canonical_repos_in(&members).unwrap(),
+            BTreeSet::from([c])
+        );
+        let summaries =
+            relationship_summaries(&store.shared_git_dir_relationships().unwrap()).unwrap();
+        assert_eq!(summaries[&a].parent_locator, b_locator);
+        assert_eq!(summaries[&a].canonical_locator, c_locator);
+        let successors: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM successors", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(successors, 2);
+        // The daemon seeing an oriented pair again must not reopen it.
+        suggestion_between(&store, b, a);
+        assert_eq!(
+            store.pending_related_count().unwrap(),
+            1,
+            "only a/c stays open"
         );
     }
 
     #[test]
-    fn related_set_has_exactly_one_canonical_repository() {
+    fn moved_folds_the_old_repository_into_the_new_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let repos = related_seeded_checkouts(&config, &store, dir.path(), &["old", "new"]);
+        let (old_locator, old_path, old) = repos[0].clone();
+        let (new_locator, new_path, new) = repos[1].clone();
+        let old_topic = add_branch_worktree(&config, &old_path, &old_locator, "topic");
+
+        resolve_pair(&config, &store, old, new, RelatedKind::Moved).unwrap();
+
+        assert!(is_bare_repository(&new_path).unwrap());
+        assert_eq!(fs::read_link(&old_path).unwrap(), new_path);
+        // `topic` is new to the canonical repository; its `main` wins and
+        // the old `main` is kept in the moved namespace.
+        let moved_prefix = repo_view_refs_prefix("moved", &old_locator);
+        assert!(git_dir_ref_exists(&new_path, "refs/heads/topic").unwrap());
+        assert!(git_dir_ref_exists(&new_path, &format!("{moved_prefix}/heads/main")).unwrap());
+        let new_main = git_dir_output(&new_path, ["rev-parse", "refs/heads/main"], "main").unwrap();
+        let new_seed_main =
+            git_output(&dir.path().join("new-seed"), ["rev-parse", "HEAD"], "seed").unwrap();
+        assert_eq!(new_main.trim(), new_seed_main.trim());
+
+        let topic = locator_path(&config.dev_worktree_root, &new_locator).join("topic");
+        assert!(!old_topic.exists());
+        let head = git_output(&topic, ["symbolic-ref", "HEAD"], "reading HEAD").unwrap();
+        assert_eq!(head.trim(), "refs/heads/topic");
+        let common = git_output(&topic, ["rev-parse", "--git-common-dir"], "common dir").unwrap();
+        assert_eq!(
+            canonical_path_of(&topic.join(common.trim())),
+            canonical_path_of(&new_path)
+        );
+
+        // The old locator now names the new repository.
+        let record = store.find_repo(&old_locator.key()).unwrap().unwrap();
+        assert_eq!((record.id, &record.current), (new, &new_locator));
+        assert_eq!(store.pending_related_count().unwrap(), 0);
+        assert!(store.repo_by_id(old).unwrap().is_none());
+    }
+
+    #[test]
+    fn fork_of_a_fork_is_stored_in_the_root_and_passes_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let repos = related_seeded_checkouts(&config, &store, dir.path(), &["a", "b", "c"]);
+        let (_, a_path, a) = repos[0].clone();
+        let (b_locator, _, b) = repos[1].clone();
+        let (c_locator, c_path, c) = repos[2].clone();
+
+        resolve_pair(&config, &store, b, c, RelatedKind::Fork).unwrap();
+        resolve_pair(&config, &store, a, b, RelatedKind::Fork).unwrap();
+
+        let a_view = read_repo_view_metadata(&a_path).unwrap().unwrap();
+        assert_eq!(a_view.canonical_path, c_path);
+        let summaries =
+            relationship_summaries(&store.shared_git_dir_relationships().unwrap()).unwrap();
+        assert_eq!(summaries[&a].parent_locator, b_locator);
+        assert_eq!(summaries[&a].canonical_locator, c_locator);
+        assert_eq!(summaries[&a].depth, 2);
+
+        let report = build_repair_report(&config, &store, true).unwrap();
+        assert!(
+            report
+                .relationships
+                .iter()
+                .all(|relationship| relationship.status == RepairStatus::Ok),
+            "{:?}",
+            report.relationships
+        );
+        let members = store.related_set(&[a]).unwrap();
+        assert_eq!(
+            store.canonical_repos_in(&members).unwrap(),
+            BTreeSet::from([c])
+        );
+    }
+
+    #[test]
+    fn resolving_fails_while_a_third_repository_is_canonical() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_config(dir.path());
         let store = Store::open(&config.state).unwrap();
         let ids = example_repos(&store, dir.path(), &["a", "b", "c"]);
         let (a, b, c) = (ids[0], ids[1], ids[2]);
-        let ab = suggestion_between(&store, a, b);
-        let bc = suggestion_between(&store, b, c);
-        let ac = suggestion_between(&store, a, c);
-        let resolve = |id, reverse| {
-            related_resolve(
-                &config,
-                &store,
-                &Output { json: true },
-                id,
-                RelatedKind::Canonical,
-                reverse,
-            )
-        };
+        suggestion_between(&store, a, b);
+        suggestion_between(&store, b, c);
+        store.mark_canonical(c).unwrap();
 
-        resolve(ab, false).unwrap();
-        for reverse in [false, true] {
-            let error = resolve(bc, reverse).unwrap_err().to_string();
+        for kind in [
+            RelatedKind::Fork,
+            RelatedKind::Mirror,
+            RelatedKind::Moved,
+            RelatedKind::Successor,
+        ] {
+            let error = resolve_pair(&config, &store, a, b, kind)
+                .unwrap_err()
+                .to_string();
             assert!(
-                error.contains("github.com/example/a is already the canonical repository"),
+                error.contains("github.com/example/c is already the canonical repository"),
                 "{error}"
             );
         }
-        // The same canonical repository may be named again for another member.
-        resolve(ac, false).unwrap();
-        assert_eq!(resolved_row(&store, ac), (a, c, "canonical".to_string()));
+        assert_eq!(store.pending_related_count().unwrap(), 2);
+        // Marking another canonical in the same set is refused as well.
+        let error = ensure_sole_canonical(&store, &[a], a, a).unwrap_err();
+        assert!(
+            error.to_string().contains("github.com/example/c"),
+            "{error}"
+        );
+        ensure_sole_canonical(&store, &[a], c, a).unwrap();
     }
 
     #[test]
