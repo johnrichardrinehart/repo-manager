@@ -757,12 +757,52 @@ struct AliasesCommand {
 #[derive(Debug, Subcommand)]
 enum RelatedSubcommand {
     #[command(about = "List unresolved shared-history suggestions")]
-    List,
+    List(RelatedListArgs),
     #[command(
         about = "Resolve a shared-history suggestion",
-        long_about = "Resolve a shared-history suggestion with an explicit relationship.\n\n`repo related list` labels the two repositories of each suggestion A (first line) and B (second line). KIND is read as a statement about A and B, such as \"A is a fork of B\" or \"A was succeeded by B\". Pass --reverse to swap the roles: \"B is a fork of A\". A suggestion can be resolved only once.\n\nEvery kind except unrelated restructures the checkouts. The parent (B, or A with --reverse) is stored in the related set's canonical repository, which keeps the only bare Git directory: B itself, or the repository B is already stored in when B is a fork, mirror or predecessor view. That repository is marked canonical. When a third repository of the related set is already canonical, resolving fails until B's own relationship to it is resolved.\n\n  fork, mirror  A becomes a fork or mirror namespace view inside the canonical Git directory.\n  successor     A becomes a predecessor namespace view inside the canonical Git directory and is recorded as `repo successor set A B` would.\n  moved         A is folded into B: B keeps A's branches, A's dev worktrees move under B, and A's old path becomes an alias symlink to B, like `repo move`.\n\nRepositories stored in A's Git directory (its own forks, mirrors and predecessors) move with it, and A's dev worktrees are re-created against the new Git directory, so they must be clean. To mark a repository canonical before any suggestion is resolved, use `repo repos set-type <PATH> canonical`."
+        long_about = "Resolve a shared-history suggestion with an explicit relationship.\n\n`repo related list` labels the two repositories of each suggestion A (first line) and B (second line). KIND is read as a statement about A and B, such as \"A is a fork of B\" or \"A was succeeded by B\". Pass --reverse to swap the roles: \"B is a fork of A\". To change a resolved suggestion, pass --replace (or confirm when asked): its resolution is undone first, as `repo related unresolve` does.\n\nEvery kind except unrelated restructures the checkouts. The parent (B, or A with --reverse) is stored in the related set's canonical repository, which keeps the only bare Git directory: B itself, or the repository B is already stored in when B is a fork, mirror or predecessor view. That repository is marked canonical. When a third repository of the related set is already canonical, resolving fails until B's own relationship to it is resolved.\n\n  fork, mirror  A becomes a fork or mirror namespace view inside the canonical Git directory.\n  successor     A becomes a predecessor namespace view inside the canonical Git directory and is recorded as `repo successor set A B` would.\n  moved         A is folded into B: B keeps A's branches, A's dev worktrees move under B, and A's old path becomes an alias symlink to B, like `repo move`.\n\nRepositories stored in A's Git directory (its own forks, mirrors and predecessors) move with it, and A's dev worktrees are re-created against the new Git directory, so they must be clean. To mark a repository canonical before any suggestion is resolved, use `repo repos set-type <PATH> canonical`."
     )]
     Resolve(RelatedResolveArgs),
+    #[command(
+        about = "Undo a resolution and reopen its suggestion",
+        long_about = "Undo the resolution of a suggestion and reopen it.\n\nA fork, mirror or predecessor view becomes a standalone bare repository at its own path again, rebuilt from its namespace in the canonical repository; views stored through it and the worktrees of both move with it, and the namespace is removed from the canonical repository only after the copy is verified. A moved repository is split back out: it is rebuilt at its old path from refs/repo-manager/moved/<locator>/, its worktrees move back, and it is its own repository again. An unrelated suggestion simply reopens. Worktrees that move must be clean. The canonical repository stays marked canonical.\n\nIDs come from `repo related list --all`."
+    )]
+    Unresolve(RelatedUnresolveArgs),
+    #[command(
+        about = "Relate any two managed repositories",
+        long_about = "Relate two managed repositories as \"A <KIND> B\" without waiting for a shared-history suggestion, e.g. `repo related set github.com/me/tool fork github.com/org/tool`. A and B are locators, URLs or managed paths. The pair is recorded as a suggestion and resolved like `repo related resolve`; when the pair is already resolved, pass --replace (or confirm when asked) to undo that first."
+    )]
+    Set(RelatedSetArgs),
+}
+
+#[derive(Debug, Args)]
+struct RelatedListArgs {
+    #[arg(long, help = "Also list resolved suggestions and how to undo them")]
+    all: bool,
+}
+
+#[derive(Debug, Args)]
+struct RelatedUnresolveArgs {
+    #[arg(
+        value_name = "ID",
+        help = "Resolved suggestion ID from `repo related list --all`"
+    )]
+    id: i64,
+}
+
+#[derive(Debug, Args)]
+struct RelatedSetArgs {
+    #[arg(value_name = "A", help = "Repository the relationship is about")]
+    subject: String,
+
+    #[arg(value_name = "KIND", help = "How A relates to B")]
+    kind: RelatedKind,
+
+    #[arg(value_name = "B", help = "Repository A relates to")]
+    object: String,
+
+    #[arg(long, help = "Undo an existing resolution of the pair first")]
+    replace: bool,
 }
 
 #[derive(Debug, Args)]
@@ -796,6 +836,9 @@ struct RelatedResolveArgs {
         help = "Swap A and B, e.g. `fork --reverse` means B is a fork of A (not valid with unrelated)"
     )]
     reverse: bool,
+
+    #[arg(long, help = "Undo the suggestion's existing resolution first")]
+    replace: bool,
 }
 
 /// How repository A of a shared-history suggestion relates to repository B.
@@ -816,6 +859,10 @@ impl RelatedKind {
         Self::Successor,
         Self::Unrelated,
     ];
+
+    fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == value)
+    }
 
     fn as_str(self) -> &'static str {
         match self {
@@ -1642,6 +1689,17 @@ struct RelatedListReport {
     unresolved_count: usize,
     suggestions: Vec<RelatedSuggestionReport>,
     kinds: Vec<RelatedKindReport>,
+    /// Resolved suggestions, listed with `--all`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    resolved: Vec<RelatedResolvedReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RelatedResolvedReport {
+    id: i64,
+    resolution: String,
+    statement: String,
+    unresolve_command: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1972,10 +2030,28 @@ pub fn run() -> Result<()> {
             OrganizationalAnalysisCommands::Related(command) => {
                 let db = Store::open(&config.state)?;
                 match command.command {
-                    RelatedSubcommand::List => related_list(&db, &output),
-                    RelatedSubcommand::Resolve(args) => {
-                        related_resolve(&config, &db, &output, args.id, args.kind, args.reverse)
+                    RelatedSubcommand::List(args) => related_list(&db, &output, args.all),
+                    RelatedSubcommand::Resolve(args) => related_resolve(
+                        &config,
+                        &db,
+                        &output,
+                        args.id,
+                        args.kind,
+                        args.reverse,
+                        args.replace,
+                    ),
+                    RelatedSubcommand::Unresolve(args) => {
+                        related_unresolve(&config, &db, &output, args.id)
                     }
+                    RelatedSubcommand::Set(args) => related_set(
+                        &config,
+                        &db,
+                        &output,
+                        &args.subject,
+                        args.kind,
+                        &args.object,
+                        args.replace,
+                    ),
                 }
             }
         },
@@ -3147,6 +3223,16 @@ impl Store {
               marked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
+            CREATE TABLE IF NOT EXISTS related_moves (
+              id INTEGER PRIMARY KEY,
+              into_repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+              from_authority TEXT NOT NULL,
+              from_remote_path TEXT NOT NULL,
+              from_path TEXT NOT NULL,
+              details_json TEXT NOT NULL,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
             CREATE TABLE IF NOT EXISTS background_fetch (
               repo_id INTEGER PRIMARY KEY REFERENCES repos(id) ON DELETE CASCADE,
               last_fetch_at INTEGER,
@@ -3159,7 +3245,8 @@ impl Store {
             DROP TABLE IF EXISTS worktrees;
             ",
         )?;
-        self.migrate_repository_paths()
+        self.migrate_repository_paths()?;
+        self.backfill_related_moves()
     }
 
     /// Give every repository a comparable path key and make it unique. A
@@ -3779,10 +3866,15 @@ impl Store {
         };
         self.conn.execute(
             "
-            INSERT INTO related_history (repo_id, related_repo_id, shared_refs_json)
-            VALUES (?1, ?2, ?3)
+            INSERT INTO related_history (id, repo_id, related_repo_id, shared_refs_json)
+            VALUES (?1, ?2, ?3, ?4)
             ",
-            params![repo_id, related_repo_id, shared_refs_json],
+            params![
+                self.next_related_id()?,
+                repo_id,
+                related_repo_id,
+                shared_refs_json
+            ],
         )?;
         Ok(())
     }
@@ -3807,13 +3899,239 @@ impl Store {
         if updated == 0 {
             self.conn.execute(
                 "
-                INSERT INTO related_history (repo_id, related_repo_id, shared_refs_json, resolution, resolved_at)
-                VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP)
+                INSERT INTO related_history (id, repo_id, related_repo_id, shared_refs_json, resolution, resolved_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP)
                 ",
-                params![dependent_repo_id, controlling_repo_id, "[]", resolution],
+                params![
+                    self.next_related_id()?,
+                    dependent_repo_id,
+                    controlling_repo_id,
+                    "[]",
+                    resolution
+                ],
             )?;
         }
         Ok(())
+    }
+
+    /// The next id for a related-history row. Moves keep their suggestion's
+    /// id after its row is gone, so ids are allocated above both tables and
+    /// never reused.
+    fn next_related_id(&self) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "
+            SELECT MAX(
+              COALESCE((SELECT MAX(id) FROM related_history), 0),
+              COALESCE((SELECT MAX(id) FROM related_moves), 0)
+            ) + 1
+            ",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Record moves resolved before related_moves existed, from the events
+    /// they logged. Their original suggestion id is unknown, so each gets a
+    /// fresh id.
+    fn backfill_related_moves(&mut self) -> Result<()> {
+        let events = {
+            let mut stmt = self.conn.prepare(
+                "SELECT repo_id, payload_json FROM events WHERE kind = 'related-moved' AND repo_id IS NOT NULL ORDER BY id",
+            )?;
+            stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (into_repo_id, payload) in events {
+            let Ok(payload) = serde_json::from_str::<serde_json::Value>(&payload) else {
+                continue;
+            };
+            let (Some(from), Some(from_path)) = (
+                payload.get("from").and_then(|value| value.as_str()),
+                payload.get("from_path").and_then(|value| value.as_str()),
+            ) else {
+                continue;
+            };
+            let Ok(from) = Locator::parse(from) else {
+                continue;
+            };
+            let known: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM related_moves WHERE from_authority = ?1 AND from_remote_path = ?2)",
+                params![from.authority, from.remote_path],
+                |row| row.get(0),
+            )?;
+            let into_exists: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM repos WHERE id = ?1)",
+                params![into_repo_id],
+                |row| row.get(0),
+            )?;
+            if known || !into_exists {
+                continue;
+            }
+            let id = self.next_related_id()?;
+            self.conn.execute(
+                "
+                INSERT INTO related_moves (id, into_repo_id, from_authority, from_remote_path, from_path, details_json)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ",
+                params![
+                    id,
+                    into_repo_id,
+                    from.authority,
+                    from.remote_path,
+                    from_path,
+                    serde_json::to_string(&MovedDetails::default())?
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn related_moves(&self) -> Result<Vec<RelatedMoveRecord>> {
+        let mut stmt = self.conn.prepare(
+            "
+            SELECT related_moves.id, related_moves.from_authority, related_moves.from_remote_path,
+                   related_moves.from_path, related_moves.details_json,
+                   repos.id, repos.current_authority, repos.current_remote_path, repos.current_path
+            FROM related_moves JOIN repos ON repos.id = related_moves.into_repo_id
+            ORDER BY related_moves.id
+            ",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                Locator {
+                    authority: row.get(1)?,
+                    remote_path: row.get(2)?,
+                },
+                PathBuf::from(row.get::<_, String>(3)?),
+                row.get::<_, String>(4)?,
+                ManagedRepoRecord {
+                    id: row.get(5)?,
+                    current: Locator {
+                        authority: row.get(6)?,
+                        remote_path: row.get(7)?,
+                    },
+                    path: PathBuf::from(row.get::<_, String>(8)?),
+                },
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, from, from_path, details, into) = row?;
+            Ok(RelatedMoveRecord {
+                id,
+                from,
+                from_path,
+                details: serde_json::from_str(&details).unwrap_or_default(),
+                into,
+            })
+        })
+        .collect()
+    }
+
+    fn related_move(&self, id: i64) -> Result<Option<RelatedMoveRecord>> {
+        Ok(self
+            .related_moves()?
+            .into_iter()
+            .find(|record| record.id == id))
+    }
+
+    /// Clear the resolution of suggestion `id`, reopening it.
+    fn unresolve_related(&self, id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE related_history SET resolution = NULL, resolved_at = NULL WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    fn delete_successor(&self, old_ref: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM successors WHERE old_ref = ?1",
+            params![old_ref],
+        )?;
+        Ok(())
+    }
+
+    fn related_pair_id(&self, first: i64, second: i64) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "
+                SELECT id FROM related_history
+                WHERE (repo_id = ?1 AND related_repo_id = ?2) OR (repo_id = ?2 AND related_repo_id = ?1)
+                ",
+                params![first, second],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    fn delete_forks_of(&self, fork_repo_id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM forks WHERE fork_repo_id = ?1",
+            params![fork_repo_id],
+        )?;
+        Ok(())
+    }
+
+    fn set_canonical_identity(&self, repo_id: i64, storage: Option<&Locator>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE repos SET canonical_identity = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            params![repo_id, storage.map(Locator::key)],
+        )?;
+        Ok(())
+    }
+
+    /// Undo [`Store::merge_moved_repo`] for `record`: `from` becomes its own
+    /// repository at `path` again, no longer a historical locator or alias of
+    /// the repository it moved into, and the suggestion reopens under the
+    /// move's id. Returns the new repository id.
+    fn split_moved_repo(&self, record: &RelatedMoveRecord, path: &Path) -> Result<i64> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM locators WHERE repo_id = ?1 AND authority = ?2 AND remote_path = ?3",
+            params![
+                record.into.id,
+                record.from.authority,
+                record.from.remote_path
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM aliases WHERE repo_id = ?1 AND alias_path = ?2",
+            params![record.into.id, record.from_path.display().to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM related_moves WHERE id = ?1",
+            params![record.id],
+        )?;
+        let repo_id = self.upsert_repo(&record.from, path, None)?;
+        tx.execute(
+            "
+            INSERT INTO related_history (id, repo_id, related_repo_id, shared_refs_json)
+            VALUES (?1, ?2, ?3, ?4)
+            ",
+            params![
+                record.id,
+                repo_id,
+                record.into.id,
+                serde_json::to_string(&record.details.shared_refs)?
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO events (repo_id, kind, payload_json) VALUES (?1, 'related-split', ?2)",
+            params![
+                repo_id,
+                serde_json::json!({
+                    "from": record.from.key(),
+                    "into": record.into.current.key(),
+                })
+                .to_string()
+            ],
+        )?;
+        tx.commit()?;
+        Ok(repo_id)
     }
 
     fn pending_related_count(&self) -> Result<i64> {
@@ -4095,8 +4413,29 @@ impl Store {
     /// path an alias of `into`'s path, and its relationships `into`'s. Rows
     /// that would relate `into` to itself or duplicate one of its pairs are
     /// dropped with `from`.
-    fn merge_moved_repo(&self, from: &ManagedRepoRecord, into: &ManagedRepoRecord) -> Result<()> {
+    fn merge_moved_repo(
+        &self,
+        suggestion_id: i64,
+        from: &ManagedRepoRecord,
+        into: &ManagedRepoRecord,
+        details: &MovedDetails,
+    ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
+        // The move stays listed (and undoable) under the suggestion's id.
+        tx.execute(
+            "
+            INSERT INTO related_moves (id, into_repo_id, from_authority, from_remote_path, from_path, details_json)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ",
+            params![
+                suggestion_id,
+                into.id,
+                from.current.authority,
+                from.current.remote_path,
+                from.path.display().to_string(),
+                serde_json::to_string(details)?
+            ],
+        )?;
         tx.execute(
             "UPDATE OR IGNORE locators SET repo_id = ?2, is_current = 0 WHERE repo_id = ?1",
             params![from.id, into.id],
@@ -8351,8 +8690,88 @@ fn aliases_list(db: &Store, output: &Output, repo_ref: &str) -> Result<()> {
     output_aliases(output, &db.aliases(repo_ref)?)
 }
 
-fn related_list(db: &Store, output: &Output) -> Result<()> {
-    output_related(output, &db.related_suggestions(true)?)
+fn related_list(db: &Store, output: &Output, all: bool) -> Result<()> {
+    let mut report = related_list_report(&db.related_suggestions(true)?);
+    if all {
+        let mut resolved = db
+            .related_suggestions(false)?
+            .into_iter()
+            .filter_map(|suggestion| {
+                let resolution = suggestion.resolution.clone()?;
+                Some(RelatedResolvedReport {
+                    id: suggestion.id,
+                    statement: resolution_statement(&resolution, &suggestion),
+                    unresolve_command: format!("repo related unresolve {}", suggestion.id),
+                    resolution,
+                })
+            })
+            .collect::<Vec<_>>();
+        resolved.extend(
+            db.related_moves()?
+                .into_iter()
+                .map(|record| RelatedResolvedReport {
+                    id: record.id,
+                    resolution: "moved".to_string(),
+                    statement: RelatedKind::Moved
+                        .statement(&record.from.key(), &record.into.current.key()),
+                    unresolve_command: format!("repo related unresolve {}", record.id),
+                }),
+        );
+        resolved.sort_by_key(|resolved| resolved.id);
+        report.resolved = resolved;
+    }
+    output_related(output, &report)
+}
+
+/// Relate two managed repositories as "subject <kind> object", recording
+/// the pair as a suggestion first when it has none.
+fn related_set(
+    config: &Config,
+    db: &Store,
+    output: &Output,
+    subject_ref: &str,
+    kind: RelatedKind,
+    object_ref: &str,
+    replace: bool,
+) -> Result<()> {
+    let subject = managed_repo_by_reference(config, db, subject_ref)?;
+    let object = managed_repo_by_reference(config, db, object_ref)?;
+    if subject.id == object.id {
+        bail!(
+            "{subject_ref} and {object_ref} are the same repository ({}); if one moved into the other, undo that move first",
+            subject.current.key()
+        );
+    }
+    let id = match db.related_pair_id(subject.id, object.id)? {
+        Some(id) => id,
+        None => {
+            let evidence = shared_root_evidence_between(&subject.path, &object.path)
+                .ok()
+                .filter(|evidence| !evidence.is_empty())
+                .unwrap_or_else(|| vec!["recorded with repo related set".to_string()]);
+            db.record_related_history(subject.id, object.id, &evidence)?;
+            db.related_pair_id(subject.id, object.id)?
+                .context("recording the pair failed")?
+        }
+    };
+    let suggestion = db.related_suggestion(id)?;
+    let reverse = kind.is_directional() && suggestion.repo_id != subject.id;
+    related_resolve(config, db, output, id, kind, reverse, replace)
+}
+
+/// A managed repository named by locator, URL, historical locator or path.
+fn managed_repo_by_reference(
+    config: &Config,
+    db: &Store,
+    reference: &str,
+) -> Result<ManagedRepoRecord> {
+    if let Some(record) = db.find_repo(reference)?
+        && let Some(repo) = db.repo_by_id(record.id)?
+    {
+        return Ok(repo);
+    }
+    managed_repo_by_path_id(config, db, Path::new(reference))
+        .map_err(|_| anyhow!("{reference} is not a managed repository"))
 }
 
 fn related_resolve(
@@ -8362,8 +8781,25 @@ fn related_resolve(
     id: i64,
     kind: RelatedKind,
     reverse: bool,
+    replace: bool,
 ) -> Result<()> {
-    let interactive = !output.json && io::stdin().is_terminal();
+    let interactive = can_prompt(output);
+    if let Some(statement) = resolved_statement(db, id)? {
+        let confirmed = replace
+            || (interactive
+                && prompt_yes_no(&format!(
+                    "#{id} is resolved: {statement}. Undo it and resolve it again?"
+                ))?);
+        if !confirmed {
+            bail!(
+                "related-history suggestion #{id} is already resolved: {statement}; pass --replace to undo it and resolve it again, or run `repo related unresolve {id}`"
+            );
+        }
+        let undone = unresolve_related_suggestion(config, db, id)?;
+        if !output.json {
+            eprintln!("undid #{id}: {}", undone.statement);
+        }
+    }
     let mut resolve_conflict = |conflict: &WorktreeConflict,
                                 check_name: &dyn Fn(&str) -> Result<PathBuf>|
      -> Result<WorktreeConflictChoice> {
@@ -8371,13 +8807,19 @@ fn related_resolve(
             prompt_worktree_conflict(conflict, check_name)
         } else {
             bail!(
-                "cannot move worktree {} to {}: the destination exists; run `repo related resolve` in a terminal to rename or drop it",
+                "cannot move worktree {} to {}: the destination exists; run the command in a terminal to rename or drop it",
                 conflict.worktree.path.display(),
                 conflict.destination.display()
             )
         }
     };
     related_resolve_with(config, db, output, id, kind, reverse, &mut resolve_conflict)
+}
+
+/// Whether a person can answer prompts: stdin is a terminal and the output
+/// is not meant for a program. Never in tests.
+fn can_prompt(output: &Output) -> bool {
+    !cfg!(test) && !output.json && io::stdin().is_terminal()
 }
 
 /// [`related_resolve`] with `resolve_conflict` deciding what happens to a
@@ -8676,7 +9118,18 @@ fn restructure_related(
         }
         symlink_dir(&storage.path, &subject.path)?;
         remove_empty_dirs(&subject_worktree_root, &config.dev_worktree_root);
-        db.merge_moved_repo(&subject_record, &storage)?;
+        let details = MovedDetails {
+            shared_refs: db.related_suggestion(id)?.shared_refs,
+            imported_branches: imported.clone(),
+            worktrees: worktrees
+                .iter()
+                .zip(&worktree_paths)
+                .zip(&dropped)
+                .filter(|(_, dropped)| !**dropped)
+                .map(|((worktree, path), _)| (worktree.path.clone(), path.clone()))
+                .collect(),
+        };
+        db.merge_moved_repo(id, &subject_record, &storage, &details)?;
         restructure.moved = Some(MovedFold {
             alias_path: subject.path.clone(),
             alias_target: storage.path.clone(),
@@ -8747,6 +9200,704 @@ fn restructure_related(
     }
     db.mark_canonical(storage.id)?;
     Ok(restructure)
+}
+
+/// What `moved` did, kept so the move can be undone.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct MovedDetails {
+    #[serde(default)]
+    shared_refs: Vec<String>,
+    /// Branches created in the target from the moved repository.
+    #[serde(default)]
+    imported_branches: Vec<String>,
+    /// Worktrees moved from the old repository: `(from, to)` paths.
+    #[serde(default)]
+    worktrees: Vec<(PathBuf, PathBuf)>,
+}
+
+#[derive(Debug, Clone)]
+struct RelatedMoveRecord {
+    id: i64,
+    from: Locator,
+    from_path: PathBuf,
+    details: MovedDetails,
+    into: ManagedRepoRecord,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RelatedUnresolution {
+    action: &'static str,
+    id: i64,
+    /// The resolution that was undone.
+    previous: String,
+    statement: String,
+    /// Where a standalone repository was rebuilt, if one was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restored_path: Option<PathBuf>,
+    /// Views stored through the restored repository that moved with it.
+    carried_views: Vec<Locator>,
+    worktrees: Vec<RelinkedWorktree>,
+    notes: Vec<String>,
+}
+
+impl RelatedUnresolution {
+    fn new(id: i64, previous: &str, statement: String) -> Self {
+        Self {
+            action: "related-unresolve",
+            id,
+            previous: previous.to_string(),
+            statement,
+            restored_path: None,
+            carried_views: Vec::new(),
+            worktrees: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+}
+
+fn related_unresolve(config: &Config, db: &Store, output: &Output, id: i64) -> Result<()> {
+    let report = unresolve_related_suggestion(config, db, id)?;
+    output_related_unresolution(output, &report)
+}
+
+/// The statement for resolved suggestion or move `id`, if it is resolved.
+fn resolved_statement(db: &Store, id: i64) -> Result<Option<String>> {
+    if let Some(record) = db.related_move(id)? {
+        return Ok(Some(
+            RelatedKind::Moved.statement(&record.from.key(), &record.into.current.key()),
+        ));
+    }
+    let suggestion = db.related_suggestion(id)?;
+    Ok(suggestion
+        .resolution
+        .as_deref()
+        .map(|resolution| resolution_statement(resolution, &suggestion)))
+}
+
+/// A resolved row reads "repo_id <resolution> related_repo_id".
+fn resolution_statement(resolution: &str, suggestion: &RelatedSuggestion) -> String {
+    let (subject, object) = (
+        suggestion.repo_locator.key(),
+        suggestion.related_locator.key(),
+    );
+    match RelatedKind::parse(resolution) {
+        Some(kind) => kind.statement(&subject, &object),
+        None => format!("{subject} {resolution} {object}"),
+    }
+}
+
+/// Undo the resolution of `id`, restoring the repositories it restructured,
+/// and reopen the suggestion.
+fn unresolve_related_suggestion(
+    config: &Config,
+    db: &Store,
+    id: i64,
+) -> Result<RelatedUnresolution> {
+    if let Some(record) = db.related_move(id)? {
+        return split_moved_repository(config, db, &record);
+    }
+    let suggestion = db.related_suggestion(id)?;
+    let Some(resolution) = suggestion.resolution.clone() else {
+        bail!("related-history suggestion #{id} is not resolved");
+    };
+    let mut report = RelatedUnresolution::new(
+        id,
+        &resolution,
+        resolution_statement(&resolution, &suggestion),
+    );
+    if matches!(resolution.as_str(), "fork" | "mirror" | "successor") {
+        detach_related_view(config, db, &suggestion, &resolution, &mut report)?;
+    }
+    db.unresolve_related(id)?;
+    Ok(report)
+}
+
+/// Turn the view `suggestion.repo_*` back into a standalone bare repository
+/// at its own path, rebuilt from its namespace in the canonical repository.
+/// Views stored through it, and the worktrees of both, move with it.
+fn detach_related_view(
+    config: &Config,
+    db: &Store,
+    suggestion: &RelatedSuggestion,
+    resolution: &str,
+    report: &mut RelatedUnresolution,
+) -> Result<()> {
+    let subject_id = suggestion.repo_id;
+    let subject_locator = &suggestion.repo_locator;
+    let subject_path = &suggestion.repo_path;
+    let subject_key = subject_locator.key();
+    let forget_relationship = || -> Result<()> {
+        match resolution {
+            "fork" => db.delete_forks_of(subject_id),
+            "successor" => db.delete_successor(&subject_key),
+            _ => Ok(()),
+        }
+    };
+    let Some(view) = read_repo_view_metadata(subject_path)? else {
+        forget_relationship()?;
+        report.notes.push(format!(
+            "{subject_key} is not a namespace view, so only the relationship was removed"
+        ));
+        return Ok(());
+    };
+    let storage = view.canonical_path.clone();
+
+    // Views whose parent chain passes through the subject are stored with it.
+    let relationships = db.shared_git_dir_relationships()?;
+    let parents = relationships
+        .iter()
+        .map(|relationship| {
+            (
+                relationship.dependent_repo_id,
+                relationship.controlling_repo_id,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut carried = Vec::new();
+    for relationship in &relationships {
+        let dependent = relationship.dependent_repo_id;
+        if dependent == subject_id || carried.iter().any(|(id, _)| *id == dependent) {
+            continue;
+        }
+        let mut seen = HashSet::new();
+        let mut cursor = parents.get(&dependent).copied();
+        let mut through_subject = false;
+        while let Some(parent) = cursor {
+            if parent == subject_id {
+                through_subject = true;
+                break;
+            }
+            if !seen.insert(parent) {
+                break;
+            }
+            cursor = parents.get(&parent).copied();
+        }
+        if through_subject
+            && let Some(carried_view) = read_repo_view_metadata(&relationship.dependent_path)?
+        {
+            carried.push((dependent, carried_view));
+        }
+    }
+    let carried_prefixes = carried
+        .iter()
+        .map(|(_, carried_view)| carried_view.refs_prefix.clone())
+        .collect::<Vec<_>>();
+    let carried_roots = carried
+        .iter()
+        .map(|(_, carried_view)| locator_path(&config.dev_worktree_root, &carried_view.locator))
+        .collect::<Vec<_>>();
+    let own_root = locator_path(&config.dev_worktree_root, subject_locator);
+    let own_heads = format!("{}/heads/", view.refs_prefix);
+    let within = |refname: &str, prefix: &str| refname.starts_with(&format!("{prefix}/"));
+
+    // Plan the worktrees before changing anything.
+    let mut moving = Vec::new();
+    let mut plain_branches = Vec::new();
+    for worktree in linked_worktrees(&storage)? {
+        let branch = worktree.branch().map(str::to_string);
+        let own = worktree.path.starts_with(&own_root)
+            || branch
+                .as_deref()
+                .is_some_and(|refname| within(refname, &view.refs_prefix));
+        let carried_worktree = carried_roots
+            .iter()
+            .any(|root| worktree.path.starts_with(root))
+            || branch.as_deref().is_some_and(|refname| {
+                carried_prefixes
+                    .iter()
+                    .any(|prefix| within(refname, prefix))
+            });
+        if !own && !carried_worktree {
+            continue;
+        }
+        ensure_clean_checkout(&worktree.path)?;
+        let head = match branch.as_deref() {
+            Some(refname) if refname.starts_with(&own_heads) => Some(format!(
+                "refs/heads/{}",
+                refname.trim_start_matches(&own_heads)
+            )),
+            Some(refname) if refname.starts_with("refs/heads/") => {
+                // A view worktree made with --branch sits on a plain branch
+                // of the canonical repository; that branch comes along.
+                let namespaced =
+                    format!("{own_heads}{}", refname.trim_start_matches("refs/heads/"));
+                if !git_dir_ref_exists(&storage, &namespaced)? {
+                    if !plain_branches.iter().any(|plain| plain == refname) {
+                        plain_branches.push(refname.to_string());
+                    }
+                } else if git_dir_output(&storage, ["rev-parse", &namespaced], "resolving branch")?
+                    != git_dir_output(&storage, ["rev-parse", refname], "resolving branch")?
+                {
+                    bail!(
+                        "worktree {} is on {refname}, which differs from {subject_key}'s own branch of that name; rename one first",
+                        worktree.path.display()
+                    );
+                }
+                Some(refname.to_string())
+            }
+            other => other.map(str::to_string),
+        };
+        moving.push((worktree, head, own));
+    }
+
+    // Rebuild the repository beside the view and verify it before swapping.
+    let mut refspecs = vec![
+        format!("+{}/heads/*:refs/heads/*", view.refs_prefix),
+        format!(
+            "+{}/remotes/origin/*:refs/remotes/origin/*",
+            view.refs_prefix
+        ),
+        format!("+{}/tags/*:refs/tags/*", view.refs_prefix),
+    ];
+    refspecs.extend(
+        carried_prefixes
+            .iter()
+            .map(|prefix| format!("+{prefix}/*:{prefix}/*")),
+    );
+    refspecs.extend(
+        plain_branches
+            .iter()
+            .map(|refname| format!("+{refname}:{refname}")),
+    );
+    let mut expected = refs_under(&storage, &view.refs_prefix)?
+        .into_iter()
+        .filter_map(|(refname, target)| {
+            let rest = refname.strip_prefix(&format!("{}/", view.refs_prefix))?;
+            let mapped = if let Some(branch) = rest.strip_prefix("heads/") {
+                format!("refs/heads/{branch}")
+            } else if let Some(remote) = rest.strip_prefix("remotes/origin/") {
+                format!("refs/remotes/origin/{remote}")
+            } else if let Some(tag) = rest.strip_prefix("tags/") {
+                format!("refs/tags/{tag}")
+            } else {
+                return None;
+            };
+            Some((mapped, target))
+        })
+        .collect::<Vec<_>>();
+    for prefix in &carried_prefixes {
+        expected.extend(refs_under(&storage, prefix)?);
+    }
+    let restoring = rebuild_repository(
+        subject_path,
+        &storage,
+        &refspecs,
+        &expected,
+        &view.origin_url,
+        &view.default_branch,
+    )?;
+
+    // Swap the rebuilt repository in for the view directory.
+    replace_with(subject_path, &restoring, report)?;
+    if !moving.is_empty() {
+        configure_worktree_config(subject_path, config.worktree_use_relative_paths)?;
+    }
+    for (worktree, head, own) in &moving {
+        relink_worktree(subject_path, worktree, &worktree.path, head.as_deref())?;
+        if *own {
+            let _ = run_git_in(
+                &worktree.path,
+                ["config", "--worktree", "--remove-section", "remote.fork"],
+            );
+            apply_worktree_identity(&config.identities, subject_locator, &worktree.path)?;
+        }
+        report
+            .worktrees
+            .push(RelinkedWorktree::new(&worktree.path, head.clone()));
+    }
+    if !moving.is_empty() {
+        configure_worktree_config(subject_path, config.worktree_use_relative_paths)?;
+    }
+
+    for (repo_id, mut carried_view) in carried {
+        carried_view.canonical_locator = subject_locator.clone();
+        carried_view.canonical_path = subject_path.clone();
+        write_repo_view_metadata(&carried_view)?;
+        db.set_canonical_identity(repo_id, Some(subject_locator))?;
+        report.carried_views.push(carried_view.locator);
+    }
+    db.set_canonical_identity(subject_id, None)?;
+    forget_relationship()?;
+
+    // Only now drop the copied namespaces from the canonical repository.
+    let mut stale = refs_under(&storage, &view.refs_prefix)?;
+    for prefix in &carried_prefixes {
+        stale.extend(refs_under(&storage, prefix)?);
+    }
+    delete_refs(
+        &storage,
+        &stale
+            .into_iter()
+            .map(|(refname, _)| refname)
+            .collect::<Vec<_>>(),
+    )?;
+    report.restored_path = Some(subject_path.clone());
+    Ok(())
+}
+
+/// Undo a `moved` resolution: rebuild the moved repository at its old path
+/// from `refs/repo-manager/moved/<from>/`, move its worktrees back, and make
+/// it its own repository again.
+fn split_moved_repository(
+    config: &Config,
+    db: &Store,
+    record: &RelatedMoveRecord,
+) -> Result<RelatedUnresolution> {
+    let into = &record.into;
+    let from_key = record.from.key();
+    let into_key = into.current.key();
+    let mut report = RelatedUnresolution::new(
+        record.id,
+        "moved",
+        RelatedKind::Moved.statement(&from_key, &into_key),
+    );
+    let prefix = repo_view_refs_prefix("moved", &record.from);
+    let stored = refs_under(&into.path, &prefix)?;
+    if stored.is_empty() {
+        bail!(
+            "{into_key} keeps nothing of {from_key} under {prefix}, so it cannot be split back out"
+        );
+    }
+    match fs::symlink_metadata(&record.from_path) {
+        Ok(metadata) if !metadata.file_type().is_symlink() => bail!(
+            "{} exists and is not the alias of {into_key}; move it away first",
+            record.from_path.display()
+        ),
+        _ => {}
+    }
+
+    // Worktrees that came from the moved repository: recorded by the move,
+    // or (for older moves) still on one of its namespaced branches.
+    let recorded = record
+        .details
+        .worktrees
+        .iter()
+        .map(|(from, to)| (to.clone(), from.clone()))
+        .collect::<HashMap<_, _>>();
+    let from_root = locator_path(&config.dev_worktree_root, &record.from);
+    let into_root = locator_path(&config.dev_worktree_root, &into.current);
+    let moved_heads = format!("{prefix}/heads/");
+    let mut moving = Vec::new();
+    let mut plain_branches = Vec::new();
+    for worktree in linked_worktrees(&into.path)? {
+        let branch = worktree.branch().map(str::to_string);
+        let target = if let Some(original) = recorded.get(&worktree.path) {
+            original.clone()
+        } else if branch
+            .as_deref()
+            .is_some_and(|refname| refname.starts_with(&format!("{prefix}/")))
+        {
+            match worktree.path.strip_prefix(&into_root) {
+                Ok(relative) => from_root.join(relative),
+                Err(_) => worktree.path.clone(),
+            }
+        } else {
+            continue;
+        };
+        ensure_clean_checkout(&worktree.path)?;
+        if target != worktree.path && fs::symlink_metadata(&target).is_ok() {
+            bail!(
+                "cannot move worktree {} back to {}: the destination exists",
+                worktree.path.display(),
+                target.display()
+            );
+        }
+        let head = match branch.as_deref() {
+            Some(refname) if refname.starts_with(&moved_heads) => Some(format!(
+                "refs/heads/{}",
+                refname.trim_start_matches(&moved_heads)
+            )),
+            Some(refname) if refname.starts_with("refs/heads/") => {
+                if !plain_branches.iter().any(|plain| plain == refname) {
+                    plain_branches.push(refname.to_string());
+                }
+                Some(refname.to_string())
+            }
+            other => other.map(str::to_string),
+        };
+        moving.push((worktree, target, head));
+    }
+
+    let mut refspecs = vec![
+        format!("+{prefix}/heads/*:refs/heads/*"),
+        format!("+{prefix}/remotes/origin/*:refs/remotes/origin/*"),
+        format!("+{prefix}/tags/*:refs/tags/*"),
+    ];
+    for refname in &plain_branches {
+        // The returning worktree's current branch wins over the copy kept
+        // in the namespace at move time.
+        refspecs.push(format!(
+            "^{moved_heads}{}",
+            refname.trim_start_matches("refs/heads/")
+        ));
+        refspecs.push(format!("+{refname}:{refname}"));
+    }
+    let expected = stored
+        .iter()
+        .filter_map(|(refname, target)| {
+            let rest = refname.strip_prefix(&format!("{prefix}/"))?;
+            let mapped = if let Some(branch) = rest.strip_prefix("heads/") {
+                // Plain branches checked out by returning worktrees win.
+                if plain_branches.contains(&format!("refs/heads/{branch}")) {
+                    return None;
+                }
+                format!("refs/heads/{branch}")
+            } else if let Some(remote) = rest.strip_prefix("remotes/origin/") {
+                format!("refs/remotes/origin/{remote}")
+            } else if let Some(tag) = rest.strip_prefix("tags/") {
+                format!("refs/tags/{tag}")
+            } else {
+                return None;
+            };
+            Some((mapped, target.clone()))
+        })
+        .collect::<Vec<_>>();
+    let origin_url = remote_url_for_locator(git_origin_url(&into.path)?.as_deref(), &record.from);
+    let default_branch = local_head_branch(&into.path).unwrap_or_else(|| "main".into());
+    let restoring = rebuild_repository(
+        &record.from_path,
+        &into.path,
+        &refspecs,
+        &expected,
+        &origin_url,
+        &default_branch,
+    )?;
+
+    if fs::symlink_metadata(&record.from_path).is_ok() {
+        fs::remove_file(&record.from_path)
+            .with_context(|| format!("removing alias {}", record.from_path.display()))?;
+    }
+    fs::rename(&restoring, &record.from_path).with_context(|| {
+        format!(
+            "moving rebuilt repository into {}",
+            record.from_path.display()
+        )
+    })?;
+    if !moving.is_empty() {
+        configure_worktree_config(&record.from_path, config.worktree_use_relative_paths)?;
+    }
+    for (worktree, target, head) in &moving {
+        relink_worktree(&record.from_path, worktree, target, head.as_deref())?;
+        apply_worktree_identity(&config.identities, &record.from, target)?;
+        report
+            .worktrees
+            .push(RelinkedWorktree::new(target, head.clone()));
+    }
+    if !moving.is_empty() {
+        configure_worktree_config(&record.from_path, config.worktree_use_relative_paths)?;
+        remove_empty_dirs(&into_root, &config.dev_worktree_root);
+    }
+
+    db.split_moved_repo(record, &record.from_path)?;
+    delete_refs(
+        &into.path,
+        &stored
+            .into_iter()
+            .map(|(refname, _)| refname)
+            .collect::<Vec<_>>(),
+    )?;
+    if !record.details.imported_branches.is_empty() {
+        report.notes.push(format!(
+            "branches the move created in {into_key} stay there: {}",
+            record.details.imported_branches.join(", ")
+        ));
+    }
+    if record.details.worktrees.is_empty() && moving.is_empty() {
+        report.notes.push(format!(
+            "no worktree of {into_key} came from {from_key}; any that did and now sits on a plain branch stays"
+        ));
+    }
+    report.restored_path = Some(record.from_path.clone());
+    Ok(report)
+}
+
+/// Refs under `prefix/` in `git_dir` as `(refname, object)`.
+fn refs_under(git_dir: &Path, prefix: &str) -> Result<Vec<(String, String)>> {
+    let output = git_output(
+        git_dir,
+        [
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            &format!("{prefix}/"),
+        ],
+        "listing refs",
+    )?;
+    Ok(output
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .map(|(refname, object)| (refname.to_string(), object.to_string()))
+        .collect())
+}
+
+fn delete_refs(git_dir: &Path, refnames: &[String]) -> Result<()> {
+    if refnames.is_empty() {
+        return Ok(());
+    }
+    let mut child = git_command(git_dir)
+        .args(["update-ref", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("deleting refs in {}", git_dir.display()))?;
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .context("opening git update-ref stdin")?;
+        for refname in refnames {
+            writeln!(stdin, "delete {refname}")?;
+        }
+    }
+    let status = child.wait()?;
+    if !status.success() {
+        bail!("git update-ref --stdin failed with status {status}");
+    }
+    Ok(())
+}
+
+/// Build a bare repository next to `path` from `refspecs` fetched out of
+/// `source`, check that every `(refname, object)` in `expected` arrived,
+/// and point it at `origin_url`. Returns the new repository's path; on any
+/// failure it is removed and nothing else has changed.
+fn rebuild_repository(
+    path: &Path,
+    source: &Path,
+    refspecs: &[String],
+    expected: &[(String, String)],
+    origin_url: &str,
+    default_branch: &str,
+) -> Result<PathBuf> {
+    let parent = path.parent().context("repository path has no parent")?;
+    let leaf = path
+        .file_name()
+        .context("repository path has no name")?
+        .to_string_lossy();
+    let restoring = parent.join(format!(
+        ".repo-manager-restoring-{leaf}-{}",
+        std::process::id()
+    ));
+    if fs::symlink_metadata(&restoring).is_ok() {
+        fs::remove_dir_all(&restoring)?;
+    }
+    fs::create_dir_all(parent)?;
+    let result = (|| -> Result<()> {
+        let restoring_arg = restoring.display().to_string();
+        run_git_in(
+            parent,
+            ["init", "--bare", "--quiet", restoring_arg.as_str()],
+        )?;
+        let status = git_dir_command(&restoring)
+            .args(["fetch", "--quiet", "--no-tags"])
+            .arg(source)
+            .args(refspecs)
+            .status()
+            .with_context(|| format!("copying refs from {}", source.display()))?;
+        if !status.success() {
+            bail!(
+                "git fetch from {} failed with status {status}",
+                source.display()
+            );
+        }
+        for (refname, object) in expected {
+            let copied = git_dir_output(
+                &restoring,
+                ["rev-parse", "-q", "--verify", refname],
+                "verifying copy",
+            )
+            .unwrap_or_default();
+            if copied.trim() != object {
+                bail!("{refname} did not arrive intact from {}", source.display());
+            }
+        }
+        run_git_in(&restoring, ["config", "remote.origin.url", origin_url])?;
+        run_git_in(
+            &restoring,
+            [
+                "config",
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ],
+        )?;
+        let head = format!("refs/heads/{default_branch}");
+        let head = if git_dir_ref_exists(&restoring, &head)? {
+            Some(head)
+        } else {
+            refs_under(&restoring, "refs/heads")?
+                .into_iter()
+                .next()
+                .map(|(refname, _)| refname)
+        };
+        if let Some(head) = head {
+            run_git_in(&restoring, ["symbolic-ref", "HEAD", head.as_str()])?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_dir_all(&restoring);
+        return Err(error);
+    }
+    Ok(restoring)
+}
+
+/// Put the rebuilt repository `restoring` at `path`, where a view
+/// directory is. A view holding anything besides its metadata is kept as a
+/// replaced-checkout backup.
+fn replace_with(path: &Path, restoring: &Path, report: &mut RelatedUnresolution) -> Result<()> {
+    if fs::symlink_metadata(path).is_ok() {
+        let only_metadata = fs::read_dir(path)?
+            .filter_map(|entry| entry.ok())
+            .all(|entry| entry.file_name() == REPO_VIEW_METADATA_FILE);
+        if only_metadata {
+            fs::remove_dir_all(path)?;
+        } else {
+            let backup = unique_backup_path(path)?;
+            fs::rename(path, &backup)?;
+            report.notes.push(format!(
+                "the view directory held more than its metadata; kept at {}",
+                backup.display()
+            ));
+        }
+    }
+    fs::rename(restoring, path)
+        .with_context(|| format!("moving rebuilt repository into {}", path.display()))
+}
+
+fn prompt_yes_no(question: &str) -> Result<bool> {
+    loop {
+        eprint!("{question} [y/N]: ");
+        io::stderr().flush().context("flushing prompt")?;
+        match read_prompt_line()?.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => return Ok(true),
+            "" | "n" | "no" => return Ok(false),
+            _ => eprintln!("enter y or n"),
+        }
+    }
+}
+
+fn output_related_unresolution(output: &Output, report: &RelatedUnresolution) -> Result<()> {
+    if output.json {
+        return print_json(report);
+    }
+    println!(
+        "unresolved #{}: {} (was {})",
+        report.id, report.statement, report.previous
+    );
+    if let Some(path) = &report.restored_path {
+        println!("restored standalone repository: {}", path.display());
+    }
+    for view in &report.carried_views {
+        println!("moved stored view with it: {}", view.key());
+    }
+    for worktree in &report.worktrees {
+        match &worktree.head {
+            Some(head) => println!("worktree {} -> {head}", worktree.path.display()),
+            None => println!("worktree {} (detached)", worktree.path.display()),
+        }
+    }
+    for note in &report.notes {
+        println!("note: {note}");
+    }
+    println!("the suggestion is open again; see `repo related list`");
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -11737,10 +12888,18 @@ fn summarized_relationship_reasons(relationship: &RepairRelationship) -> Vec<Str
     summarized
 }
 
-fn output_related(output: &Output, suggestions: &[RelatedSuggestion]) -> Result<()> {
-    let report = related_list_report(suggestions);
+fn output_related(output: &Output, report: &RelatedListReport) -> Result<()> {
     if output.json {
-        return print_json(&report);
+        return print_json(report);
+    }
+    if !report.resolved.is_empty() {
+        println!("resolved: {}", report.resolved.len());
+        for resolved in &report.resolved {
+            println!();
+            println!("#{}  {}", resolved.id, resolved.statement);
+            println!("    undo:     {}", resolved.unresolve_command);
+        }
+        println!();
     }
     if report.suggestions.is_empty() {
         println!("no unresolved shared-history suggestions");
@@ -11780,6 +12939,7 @@ fn related_list_report(suggestions: &[RelatedSuggestion]) -> RelatedListReport {
                 resolve_command: format!("repo related resolve {} <kind>", suggestion.id),
             })
             .collect(),
+        resolved: Vec::new(),
         kinds: RelatedKind::ALL
             .iter()
             .map(|kind| RelatedKindReport {
@@ -12076,7 +13236,7 @@ mod tests {
                         assert_eq!(args.kind, RelatedKind::Fork);
                         assert!(args.reverse);
                     }
-                    RelatedSubcommand::List => panic!("unexpected list command"),
+                    other => panic!("unexpected related command: {other:?}"),
                 }
             }
             command => panic!("unexpected command: {command:?}"),
@@ -16772,6 +17932,7 @@ mod tests {
             id,
             kind,
             suggestion.repo_id != subject,
+            false,
         )
     }
 
@@ -16939,6 +18100,305 @@ mod tests {
         let error = remove_replaced_backup(&preserved).unwrap_err().to_string();
         assert!(error.contains("refusing to remove"), "{error}");
         assert!(backup.join("late.txt").exists());
+    }
+
+    fn refs_of(path: &Path) -> BTreeMap<String, String> {
+        git_output(
+            path,
+            ["for-each-ref", "--format=%(refname) %(objectname)"],
+            "refs",
+        )
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .map(|(refname, object)| (refname.to_string(), object.to_string()))
+        .collect()
+    }
+
+    fn head_of(worktree: &Path) -> String {
+        git_output(worktree, ["symbolic-ref", "HEAD"], "HEAD")
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    fn common_dir_of(worktree: &Path) -> PathBuf {
+        let common = git_output(worktree, ["rev-parse", "--git-common-dir"], "common").unwrap();
+        canonical_path_of(&worktree.join(common.trim()))
+    }
+
+    #[test]
+    fn unresolving_a_fork_restores_the_standalone_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let repos = related_seeded_checkouts(&config, &store, dir.path(), &["fork", "upstream"]);
+        let (fork_locator, fork_path, fork) = repos[0].clone();
+        let (_, upstream_path, upstream) = repos[1].clone();
+        let topic = add_branch_worktree(&config, &fork_path, &fork_locator, "topic");
+        let before = refs_of(&fork_path)
+            .into_iter()
+            .filter(|(refname, _)| refname.starts_with("refs/heads/"))
+            .collect::<BTreeMap<_, _>>();
+
+        resolve_pair(&config, &store, fork, upstream, RelatedKind::Fork).unwrap();
+        let id = suggestion_between(&store, fork, upstream);
+        let report = unresolve_related_suggestion(&config, &store, id).unwrap();
+        assert_eq!(report.previous, "fork");
+
+        assert!(read_repo_view_metadata(&fork_path).unwrap().is_none());
+        assert!(is_bare_repository(&fork_path).unwrap());
+        let after = refs_of(&fork_path);
+        for (refname, object) in &before {
+            assert_eq!(after.get(refname), Some(object), "{refname}");
+        }
+        assert_eq!(head_of(&topic), "refs/heads/topic");
+        assert_eq!(common_dir_of(&topic), canonical_path_of(&fork_path));
+        let status = git_output(&topic, ["status", "--porcelain"], "status").unwrap();
+        assert!(status.trim().is_empty(), "{status}");
+        let prefix = repo_view_refs_prefix("fork", &fork_locator);
+        assert!(refs_under(&upstream_path, &prefix).unwrap().is_empty());
+        assert_eq!(store.pending_related_count().unwrap(), 1);
+        assert!(
+            relationship_summaries(&store.shared_git_dir_relationships().unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            build_repair_report(&config, &store, true)
+                .unwrap()
+                .relationships
+                .is_empty()
+        );
+
+        // It can be resolved again, the other way around this time.
+        resolve_pair(&config, &store, upstream, fork, RelatedKind::Mirror).unwrap();
+        let upstream_view = read_repo_view_metadata(&upstream_path).unwrap().unwrap();
+        assert_eq!(upstream_view.canonical_path, fork_path);
+    }
+
+    #[test]
+    fn unresolving_inside_a_successor_chain_carries_the_older_predecessor() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let repos = related_seeded_checkouts(&config, &store, dir.path(), &["a", "b", "c"]);
+        let (a_locator, a_path, a) = repos[0].clone();
+        let (b_locator, b_path, b) = repos[1].clone();
+        let (_, c_path, c) = repos[2].clone();
+        let topic = add_branch_worktree(&config, &a_path, &a_locator, "topic");
+        resolve_pair(&config, &store, a, b, RelatedKind::Successor).unwrap();
+        resolve_pair(&config, &store, b, c, RelatedKind::Successor).unwrap();
+
+        let bc = suggestion_between(&store, b, c);
+        let report = unresolve_related_suggestion(&config, &store, bc).unwrap();
+        assert_eq!(report.carried_views, vec![a_locator.clone()]);
+
+        // B is a repository again, and A (its predecessor) is stored in it.
+        assert!(is_bare_repository(&b_path).unwrap());
+        let a_view = read_repo_view_metadata(&a_path).unwrap().unwrap();
+        assert_eq!(a_view.canonical_path, b_path);
+        let a_prefix = repo_view_refs_prefix("predecessor", &a_locator);
+        assert!(!refs_under(&b_path, &a_prefix).unwrap().is_empty());
+        assert_eq!(common_dir_of(&topic), canonical_path_of(&b_path));
+        assert_eq!(head_of(&topic), format!("{a_prefix}/heads/topic"));
+        // C keeps nothing of A or B.
+        assert!(refs_under(&c_path, &a_prefix).unwrap().is_empty());
+        let b_prefix = repo_view_refs_prefix("predecessor", &b_locator);
+        assert!(refs_under(&c_path, &b_prefix).unwrap().is_empty());
+        let summaries =
+            relationship_summaries(&store.shared_git_dir_relationships().unwrap()).unwrap();
+        assert_eq!(summaries[&a].canonical_locator, b_locator);
+        assert!(!summaries.contains_key(&b));
+        let successors: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM successors", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(successors, 1);
+    }
+
+    #[test]
+    fn unresolving_a_move_splits_the_repository_back_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let repos = related_seeded_checkouts(&config, &store, dir.path(), &["old", "new"]);
+        let (old_locator, old_path, old) = repos[0].clone();
+        let (new_locator, new_path, new) = repos[1].clone();
+        let old_topic = add_branch_worktree(&config, &old_path, &old_locator, "topic");
+        let old_main = refs_of(&old_path)["refs/heads/main"].clone();
+        let id = suggestion_between(&store, old, new);
+        resolve_pair(&config, &store, old, new, RelatedKind::Moved).unwrap();
+        assert_eq!(
+            store
+                .related_move(id)
+                .unwrap()
+                .unwrap()
+                .details
+                .worktrees
+                .len(),
+            1
+        );
+
+        assert_eq!(store.pending_related_count().unwrap(), 0);
+        related_list(&store, &Output { json: true }, true).unwrap();
+
+        let undone = unresolve_related_suggestion(&config, &store, id).unwrap();
+        assert_eq!(undone.previous, "moved");
+        assert!(fs::symlink_metadata(&old_path).unwrap().is_dir());
+        assert!(is_bare_repository(&old_path).unwrap());
+        assert_eq!(refs_of(&old_path)["refs/heads/main"], old_main);
+        assert_eq!(head_of(&old_topic), "refs/heads/topic");
+        assert_eq!(common_dir_of(&old_topic), canonical_path_of(&old_path));
+        assert!(
+            !locator_path(&config.dev_worktree_root, &new_locator)
+                .join("topic")
+                .exists()
+        );
+
+        let record = store.find_repo(&old_locator.key()).unwrap().unwrap();
+        assert_ne!(record.id, new);
+        assert_eq!(record.current, old_locator);
+        assert!(store.related_move(id).unwrap().is_none());
+        let reopened = store.related_suggestion(id).unwrap();
+        assert!(reopened.resolution.is_none());
+        assert_eq!(reopened.repo_locator, old_locator);
+        let moved_prefix = repo_view_refs_prefix("moved", &old_locator);
+        assert!(refs_under(&new_path, &moved_prefix).unwrap().is_empty());
+        assert!(
+            build_repair_report(&config, &store, true)
+                .unwrap()
+                .stale_paths
+                .is_empty()
+        );
+
+        // And it can be moved again.
+        resolve_pair(&config, &store, record.id, new, RelatedKind::Moved).unwrap();
+        assert_eq!(fs::read_link(&old_path).unwrap(), new_path);
+    }
+
+    #[test]
+    fn replace_and_set_rewrite_the_relationship() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let repos = related_seeded_checkouts(&config, &store, dir.path(), &["mine", "theirs"]);
+        let (mine_locator, mine_path, mine) = repos[0].clone();
+        let (theirs_locator, _, theirs) = repos[1].clone();
+        let id = suggestion_between(&store, mine, theirs);
+        let output = Output { json: true };
+
+        related_resolve(
+            &config,
+            &store,
+            &output,
+            id,
+            RelatedKind::Fork,
+            false,
+            false,
+        )
+        .unwrap();
+        let error = related_resolve(
+            &config,
+            &store,
+            &output,
+            id,
+            RelatedKind::Mirror,
+            false,
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("pass --replace"), "{error}");
+        related_resolve(
+            &config,
+            &store,
+            &output,
+            id,
+            RelatedKind::Mirror,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            read_repo_view_metadata(&mine_path)
+                .unwrap()
+                .unwrap()
+                .relationship,
+            "mirror"
+        );
+
+        // `set` addresses the pair by its repositories, in either order.
+        related_set(
+            &config,
+            &store,
+            &output,
+            &theirs_locator.key(),
+            RelatedKind::Fork,
+            &mine_locator.key(),
+            true,
+        )
+        .unwrap();
+        let suggestion = store.related_suggestion(id).unwrap();
+        assert_eq!(suggestion.resolution.as_deref(), Some("fork"));
+        assert_eq!(suggestion.repo_locator, theirs_locator);
+
+        // A pair without a suggestion is recorded first.
+        store
+            .conn
+            .execute("DELETE FROM related_history", [])
+            .unwrap();
+        related_set(
+            &config,
+            &store,
+            &output,
+            &mine_locator.key(),
+            RelatedKind::Unrelated,
+            &theirs_locator.key(),
+            false,
+        )
+        .unwrap();
+        let id = store.related_pair_id(mine, theirs).unwrap().unwrap();
+        assert_eq!(
+            store.related_suggestion(id).unwrap().resolution.as_deref(),
+            Some("unrelated")
+        );
+    }
+
+    #[test]
+    fn moves_logged_before_related_moves_are_backfilled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repos.sqlite");
+        let into = {
+            let store = Store::open(&path).unwrap();
+            let into = example_repos(&store, dir.path(), &["new"])[0];
+            store
+                .conn
+                .execute(
+                    "INSERT INTO events (repo_id, kind, payload_json) VALUES (?1, 'related-moved', ?2)",
+                    params![
+                        into,
+                        serde_json::json!({
+                            "from": "github.com/example/old",
+                            "from_path": "/clones/github.com/example/old",
+                        })
+                        .to_string()
+                    ],
+                )
+                .unwrap();
+            store.conn.execute("DELETE FROM related_moves", []).unwrap();
+            into
+        };
+        let store = Store::open(&path).unwrap();
+        let moves = store.related_moves().unwrap();
+        assert_eq!(moves.len(), 1);
+        assert_eq!(moves[0].into.id, into);
+        assert_eq!(moves[0].from.key(), "github.com/example/old");
+        // Reopening does not duplicate it, and new ids do not collide.
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.related_moves().unwrap().len(), 1);
+        assert!(store.next_related_id().unwrap() > moves[0].id);
     }
 
     #[test]
@@ -17206,7 +18666,15 @@ mod tests {
         let ids = example_repos(&store, dir.path(), &["a", "b"]);
         let id = suggestion_between(&store, ids[0], ids[1]);
         let resolve = |kind, reverse| {
-            related_resolve(&config, &store, &Output { json: true }, id, kind, reverse)
+            related_resolve(
+                &config,
+                &store,
+                &Output { json: true },
+                id,
+                kind,
+                reverse,
+                false,
+            )
         };
 
         let error = resolve(RelatedKind::Unrelated, true).unwrap_err();
@@ -17214,7 +18682,7 @@ mod tests {
         resolve(RelatedKind::Unrelated, false).unwrap();
         let error = resolve(RelatedKind::Moved, false).unwrap_err();
         assert!(
-            error.to_string().contains("already resolved as unrelated"),
+            error.to_string().contains("is already resolved: github.com/example/a and github.com/example/b are unrelated; pass --replace"),
             "{error}"
         );
     }
@@ -17293,6 +18761,7 @@ mod tests {
             suggestion_id,
             RelatedKind::Fork,
             false,
+            false,
         )
         .unwrap();
 
@@ -17353,6 +18822,7 @@ mod tests {
             suggestion_id,
             RelatedKind::Fork,
             true,
+            false,
         )
         .unwrap();
 
@@ -18141,6 +19611,7 @@ mod tests {
             &Output { json: true },
             suggestion_id,
             RelatedKind::Mirror,
+            false,
             false,
         )
         .unwrap();
