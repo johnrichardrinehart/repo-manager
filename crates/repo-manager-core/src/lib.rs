@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
@@ -8093,6 +8093,34 @@ fn related_resolve(
     kind: RelatedKind,
     reverse: bool,
 ) -> Result<()> {
+    let interactive = !output.json && io::stdin().is_terminal();
+    let mut resolve_conflict = |conflict: &WorktreeConflict,
+                                check_name: &dyn Fn(&str) -> Result<PathBuf>|
+     -> Result<WorktreeConflictChoice> {
+        if interactive {
+            prompt_worktree_conflict(conflict, check_name)
+        } else {
+            bail!(
+                "cannot move worktree {} to {}: the destination exists; run `repo related resolve` in a terminal to rename or drop it",
+                conflict.worktree.path.display(),
+                conflict.destination.display()
+            )
+        }
+    };
+    related_resolve_with(config, db, output, id, kind, reverse, &mut resolve_conflict)
+}
+
+/// [`related_resolve`] with `resolve_conflict` deciding what happens to a
+/// worktree whose new location is taken.
+fn related_resolve_with(
+    config: &Config,
+    db: &Store,
+    output: &Output,
+    id: i64,
+    kind: RelatedKind,
+    reverse: bool,
+    resolve_conflict: &mut WorktreeConflictResolver<'_>,
+) -> Result<()> {
     if reverse && !kind.is_directional() {
         bail!("{} has no direction; drop --reverse", kind.as_str());
     }
@@ -8106,7 +8134,15 @@ fn related_resolve(
     let statement = kind.statement(&subject.locator.key(), &object.locator.key());
 
     let restructure = if kind.is_directional() {
-        Some(restructure_related(config, db, id, kind, subject, object)?)
+        Some(restructure_related(
+            config,
+            db,
+            id,
+            kind,
+            subject,
+            object,
+            resolve_conflict,
+        )?)
     } else {
         db.resolve_related(id, kind.as_str(), subject.repo_id, object.repo_id)?;
         None
@@ -8138,6 +8174,7 @@ fn restructure_related(
     kind: RelatedKind,
     subject: &RelatedRepositoryReport,
     object: &RelatedRepositoryReport,
+    resolve_conflict: &mut WorktreeConflictResolver<'_>,
 ) -> Result<RelatedRestructure> {
     let subject_key = subject.locator.key();
     let object_key = object.locator.key();
@@ -8211,13 +8248,62 @@ fn restructure_related(
             },
         )
         .collect::<Vec<_>>();
-    for (worktree, path) in worktrees.iter().zip(&worktree_paths) {
-        if *path != worktree.path && fs::symlink_metadata(path).is_ok() {
-            bail!(
-                "cannot move worktree {} to {}: the destination exists",
-                worktree.path.display(),
-                path.display()
-            );
+    // A moved worktree keeps its name under the new locator; when that name
+    // is taken, ask whether to rename or drop it before changing anything.
+    let mut worktree_paths = worktree_paths;
+    let mut dropped = vec![false; worktrees.len()];
+    for index in 0..worktrees.len() {
+        let worktree = &worktrees[index];
+        let path = worktree_paths[index].clone();
+        let taken = |candidate: &Path, paths: &[PathBuf]| {
+            fs::symlink_metadata(candidate).is_ok()
+                || paths
+                    .iter()
+                    .enumerate()
+                    .any(|(other, taken)| other != index && taken == candidate)
+        };
+        if path == worktree.path || !taken(&path, &worktree_paths) {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let owner = subject
+            .locator
+            .remote_path
+            .split('/')
+            .next()
+            .unwrap_or("moved");
+        let conflict = WorktreeConflict {
+            worktree: worktree.clone(),
+            destination: path.clone(),
+            default_name: format!("{name}-{owner}"),
+            branch_note: worktree.branch().and_then(|refname| refname.strip_prefix("refs/heads/")).map(|branch| {
+                format!(
+                    "branch {branch} stays in {object_key}, or under {}/heads/{branch} if {object_key} already has one",
+                    repo_view_refs_prefix("moved", &subject.locator)
+                )
+            }),
+        };
+        let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let check_name = |candidate: &str| -> Result<PathBuf> {
+            validate_worktree_name(candidate)?;
+            let candidate = parent.join(candidate);
+            if taken(&candidate, &worktree_paths) {
+                bail!("{} already exists", candidate.display());
+            }
+            Ok(candidate)
+        };
+        match resolve_conflict(&conflict, &check_name)? {
+            WorktreeConflictChoice::Rename(name) => {
+                let renamed = check_name(&name)?;
+                worktree_paths[index] = renamed;
+            }
+            WorktreeConflictChoice::Drop => dropped[index] = true,
+            WorktreeConflictChoice::Abort => {
+                bail!("aborted; nothing was changed");
+            }
         }
     }
     // Worktrees of views stored in the subject may sit on a plain branch of
@@ -8278,7 +8364,16 @@ fn restructure_related(
             (Vec::new(), Vec::new())
         };
         let moved_prefix = repo_view_refs_prefix("moved", &subject.locator);
-        for (worktree, path) in worktrees.iter().zip(&worktree_paths) {
+        for ((worktree, path), dropped) in worktrees.iter().zip(&worktree_paths).zip(&dropped) {
+            if *dropped {
+                // Its branch already came along with the moved refs.
+                let target = worktree.path.display().to_string();
+                run_git_in(&subject.path, ["worktree", "remove", target.as_str()])?;
+                restructure
+                    .worktrees
+                    .push(RelinkedWorktree::dropped(&worktree.path));
+                continue;
+            }
             let head = worktree
                 .branch()
                 .map(|refname| match refname.strip_prefix("refs/heads/") {
@@ -8427,6 +8522,9 @@ struct RelinkedWorktree {
     path: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
     head: Option<String>,
+    /// The worktree was removed instead of moved; its branch was kept.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    dropped: bool,
 }
 
 impl RelinkedWorktree {
@@ -8434,7 +8532,94 @@ impl RelinkedWorktree {
         Self {
             path: path.to_path_buf(),
             head,
+            dropped: false,
         }
+    }
+
+    fn dropped(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            head: None,
+            dropped: true,
+        }
+    }
+}
+
+/// A moved worktree whose destination is already taken.
+#[derive(Debug, Clone)]
+struct WorktreeConflict {
+    worktree: LinkedWorktree,
+    destination: PathBuf,
+    /// Suggested new name: the old name plus the old owner.
+    default_name: String,
+    /// Where the worktree's branch ends up if the worktree is dropped.
+    branch_note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorktreeConflictChoice {
+    /// Move the worktree to this sibling name instead.
+    Rename(String),
+    /// Remove the (clean) worktree; its branch is kept.
+    Drop,
+    Abort,
+}
+
+/// Decides a [`WorktreeConflict`]; the second argument validates a rename
+/// and returns the resulting path.
+type WorktreeConflictResolver<'a> = dyn FnMut(&WorktreeConflict, &dyn Fn(&str) -> Result<PathBuf>) -> Result<WorktreeConflictChoice>
+    + 'a;
+
+fn prompt_worktree_conflict(
+    conflict: &WorktreeConflict,
+    check_name: &dyn Fn(&str) -> Result<PathBuf>,
+) -> Result<WorktreeConflictChoice> {
+    let source = &conflict.worktree.path;
+    let branch = conflict
+        .worktree
+        .branch()
+        .map_or_else(|| "detached".to_string(), |refname| refname.to_string());
+    eprintln!();
+    eprintln!("worktree {} ({branch}) would move to", source.display());
+    eprintln!(
+        "  {}, which already exists.",
+        conflict.destination.display()
+    );
+    eprintln!("  1. rename: move it next to that worktree under another name");
+    match &conflict.branch_note {
+        Some(note) => eprintln!("  2. drop: remove this worktree; {note}"),
+        None => eprintln!("  2. drop: remove this worktree"),
+    }
+    eprintln!("  3. abort: change nothing");
+    loop {
+        eprint!("choice [1-3, rename, drop, abort]: ");
+        io::stderr().flush().context("flushing prompt")?;
+        match parse_worktree_conflict_answer(&read_prompt_line()?) {
+            Some(WorktreeConflictChoice::Rename(_)) => loop {
+                eprint!("new name [{}]: ", conflict.default_name);
+                io::stderr().flush().context("flushing prompt")?;
+                let answer = read_prompt_line()?;
+                let name = match answer.trim() {
+                    "" => conflict.default_name.clone(),
+                    name => name.to_string(),
+                };
+                match check_name(&name) {
+                    Ok(_) => return Ok(WorktreeConflictChoice::Rename(name)),
+                    Err(error) => eprintln!("{error:#}"),
+                }
+            },
+            Some(choice) => return Ok(choice),
+            None => eprintln!("enter rename, drop, or abort"),
+        }
+    }
+}
+
+fn parse_worktree_conflict_answer(answer: &str) -> Option<WorktreeConflictChoice> {
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "1" | "r" | "rename" => Some(WorktreeConflictChoice::Rename(String::new())),
+        "2" | "d" | "drop" => Some(WorktreeConflictChoice::Drop),
+        "3" | "a" | "abort" => Some(WorktreeConflictChoice::Abort),
+        _ => None,
     }
 }
 
@@ -11405,6 +11590,13 @@ fn output_related_resolution(output: &Output, resolution: &RelatedResolution) ->
         println!("moved stored view: {}", view.key());
     }
     for worktree in &restructure.worktrees {
+        if worktree.dropped {
+            println!(
+                "worktree {} removed; its branch was kept",
+                worktree.path.display()
+            );
+            continue;
+        }
         match &worktree.head {
             Some(head) => println!("worktree {} -> {head}", worktree.path.display()),
             None => println!("worktree {} (detached)", worktree.path.display()),
@@ -16371,6 +16563,135 @@ mod tests {
         assert_eq!((record.id, &record.current), (new, &new_locator));
         assert_eq!(store.pending_related_count().unwrap(), 0);
         assert!(store.repo_by_id(old).unwrap().is_none());
+    }
+
+    /// Resolve "old moved to new" where both have a `topic` worktree, with
+    /// `choice` deciding the conflict. Returns the repos and the conflicts
+    /// that were offered.
+    #[allow(clippy::type_complexity)]
+    fn resolve_moved_with_conflict(
+        dir: &Path,
+        choice: WorktreeConflictChoice,
+    ) -> (
+        Config,
+        Store,
+        (Locator, PathBuf, i64),
+        (Locator, PathBuf, i64),
+        Result<()>,
+        Vec<WorktreeConflict>,
+    ) {
+        let config = test_config(dir);
+        let store = Store::open(&config.state).unwrap();
+        let repos = related_seeded_checkouts(&config, &store, dir, &["old", "new"]);
+        let (old_locator, old_path, old) = repos[0].clone();
+        let (new_locator, new_path, new) = repos[1].clone();
+        add_branch_worktree(&config, &old_path, &old_locator, "topic");
+        add_branch_worktree(&config, &new_path, &new_locator, "topic");
+        let id = suggestion_between(&store, old, new);
+        let mut offered = Vec::new();
+        let mut resolver = |conflict: &WorktreeConflict,
+                            check_name: &dyn Fn(&str) -> Result<PathBuf>|
+         -> Result<WorktreeConflictChoice> {
+            offered.push(conflict.clone());
+            assert!(check_name("topic").is_err(), "a taken name is rejected");
+            Ok(choice.clone())
+        };
+        let result = related_resolve_with(
+            &config,
+            &store,
+            &Output { json: true },
+            id,
+            RelatedKind::Moved,
+            false,
+            &mut resolver,
+        );
+        (
+            config,
+            store,
+            repos[0].clone(),
+            repos[1].clone(),
+            result,
+            offered,
+        )
+    }
+
+    #[test]
+    fn moved_worktree_conflict_can_be_renamed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, _store, (old_locator, _, _), (new_locator, new_path, _), result, offered) =
+            resolve_moved_with_conflict(
+                dir.path(),
+                WorktreeConflictChoice::Rename("topic-old".into()),
+            );
+        result.unwrap();
+        assert_eq!(offered.len(), 1);
+        let new_root = locator_path(&config.dev_worktree_root, &new_locator);
+        assert_eq!(offered[0].destination, new_root.join("topic"));
+
+        // The new repository's `topic` is untouched; the old one sits beside
+        // it on the old branch, kept in the moved namespace.
+        let kept = new_root.join("topic");
+        let head = git_output(&kept, ["symbolic-ref", "HEAD"], "HEAD").unwrap();
+        assert_eq!(head.trim(), "refs/heads/topic");
+        let renamed = new_root.join("topic-old");
+        let head = git_output(&renamed, ["symbolic-ref", "HEAD"], "HEAD").unwrap();
+        let moved_prefix = repo_view_refs_prefix("moved", &old_locator);
+        assert_eq!(head.trim(), format!("{moved_prefix}/heads/topic"));
+        let common = git_output(&renamed, ["rev-parse", "--git-common-dir"], "common").unwrap();
+        assert_eq!(
+            canonical_path_of(&renamed.join(common.trim())),
+            canonical_path_of(&new_path)
+        );
+        assert!(renamed.join("old.txt").exists());
+    }
+
+    #[test]
+    fn moved_worktree_conflict_can_be_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, _store, (old_locator, _, _), (_, new_path, _), result, _) =
+            resolve_moved_with_conflict(dir.path(), WorktreeConflictChoice::Drop);
+        result.unwrap();
+        let old_topic = locator_path(&config.dev_worktree_root, &old_locator).join("topic");
+        assert!(!old_topic.exists());
+        let moved_prefix = repo_view_refs_prefix("moved", &old_locator);
+        assert!(git_dir_ref_exists(&new_path, &format!("{moved_prefix}/heads/topic")).unwrap());
+        let worktrees = linked_worktrees(&new_path).unwrap();
+        assert_eq!(worktrees.len(), 1, "{worktrees:?}");
+    }
+
+    #[test]
+    fn moved_worktree_conflict_abort_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, store, (old_locator, old_path, _), (_, new_path, _), result, _) =
+            resolve_moved_with_conflict(dir.path(), WorktreeConflictChoice::Abort);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("nothing was changed")
+        );
+        assert!(!is_bare_repository(&new_path).unwrap());
+        assert!(fs::symlink_metadata(&old_path).unwrap().is_dir());
+        let old_topic = locator_path(&config.dev_worktree_root, &old_locator).join("topic");
+        assert!(old_topic.join(".git").exists());
+        assert_eq!(store.pending_related_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn worktree_conflict_answers_parse() {
+        assert_eq!(
+            parse_worktree_conflict_answer("1"),
+            Some(WorktreeConflictChoice::Rename(String::new()))
+        );
+        assert_eq!(
+            parse_worktree_conflict_answer(" Drop\n"),
+            Some(WorktreeConflictChoice::Drop)
+        );
+        assert_eq!(
+            parse_worktree_conflict_answer("a"),
+            Some(WorktreeConflictChoice::Abort)
+        );
+        assert_eq!(parse_worktree_conflict_answer("keep"), None);
     }
 
     #[test]
