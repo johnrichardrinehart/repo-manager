@@ -219,18 +219,6 @@ fetch tracked repositories. The daemon records fetch activity in SQLite, backs
 off quiet repositories, and resets active repositories to the configured
 minimum interval when a fetch observes ref changes.
 
-Fetches, from `repo fetch` or the daemon, keep no history that the remote
-removed. A local branch that only mirrors its same-named upstream (it points
-at or behind it, like every branch `git clone --bare` copies) is deleted once
-the upstream branch is deleted, and reset when the upstream is rewritten. A
-branch with commits upstream never had, or one checked out, rebased or bisected
-in a worktree, is left alone; a released mirror is handled on the next fetch.
-Commits that no ref or reflog reaches any more are then deleted from the object
-store once they have been there an hour (a later fetch deletes younger ones). The
-state behind this lives in `repo-manager-upstream-state` in the Git dir, so
-removals seen first by a plain `git fetch --prune` are handled too, but a
-branch is only known to be a mirror once a fetch has seen it as one.
-
 RPC clients and daemons include an envelope protocol version. The current
 protocol is v1; breaking protobuf changes require a v2 protocol and are
 rejected by mismatched peers.
