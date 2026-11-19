@@ -4574,6 +4574,7 @@ fn clone_repo_inner(config: &Config, db: &Store, url: &str) -> Result<CloneResul
         return Err(error);
     }
     ensure_remote(&path, "origin", url)?;
+    keep_only_default_branch(&path)?;
     ensure_origin_tracking_refs(&path)?;
     apply_repo_identity(&config.identities, &locator, &path)?;
     db.upsert_repo(&locator, &path, None)?;
@@ -5813,8 +5814,73 @@ fn ensure_canonical_bare_repo(
     } else {
         let ssh_command = identity_ssh_command(identities, locator)?;
         run_git_clone(url, path, true, ssh_command.as_deref())?;
+        keep_only_default_branch(path)?;
     }
     apply_repo_identity(identities, locator, path)
+}
+
+/// Turn the local branches of a fresh `git clone --bare` into remote-tracking
+/// refs, keeping only the default branch that HEAD names.
+///
+/// A bare clone copies every upstream branch to `refs/heads/*` and records no
+/// fetch refspec. Those copies have no upstream configured, so once a branch
+/// is deleted upstream nothing marks its copy as gone and the copy keeps the
+/// deleted history alive. Moving them to `refs/remotes/origin/*`, under the
+/// standard refspec, lets `git fetch --prune` drop them like in any clone.
+fn keep_only_default_branch(path: &Path) -> Result<()> {
+    ensure_tracking_refspec(path, "origin")?;
+    let head = git_output_optional(path, ["symbolic-ref", "--quiet", "HEAD"], "reading HEAD")?
+        .map(|head| head.trim().to_string());
+    let branches = git_output(
+        path,
+        [
+            "for-each-ref",
+            "--format=%(objectname) %(refname)",
+            "refs/heads/",
+        ],
+        "listing branches",
+    )?;
+    let mut updates = String::new();
+    for (oid, refname) in branches.lines().filter_map(|line| line.split_once(' ')) {
+        let Some(name) = refname.strip_prefix("refs/heads/") else {
+            continue;
+        };
+        writeln!(updates, "create refs/remotes/origin/{name} {oid}")?;
+        if head.as_deref() != Some(refname) {
+            writeln!(updates, "delete {refname} {oid}")?;
+        }
+    }
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let mut child = git_command(path)
+        .args(["update-ref", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("moving cloned branches in {}", path.display()))?;
+    child
+        .stdin
+        .take()
+        .context("git update-ref has no stdin")?
+        .write_all(updates.as_bytes())?;
+    let status = child.wait()?;
+    if !status.success() {
+        bail!("git update-ref failed with status {status}");
+    }
+    if let Some(default) = head
+        .as_deref()
+        .and_then(|head| head.strip_prefix("refs/heads/"))
+    {
+        run_git_in(
+            path,
+            [
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                &format!("refs/remotes/origin/{default}"),
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 fn materialize_namespace_view(
@@ -17390,6 +17456,42 @@ mod tests {
                 branch: "local".to_string()
             }
         );
+    }
+
+    #[test]
+    fn clone_keeps_only_default_branch_and_tracks_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let store = Store::open(&config.state).unwrap();
+        let seed = dir.path().join("seed");
+        fs::create_dir_all(&seed).unwrap();
+        run_git_in(&seed, ["init", "-q", "-b", "main"]).unwrap();
+        seed_commit(&seed, "README.md", "one\n", "one");
+        run_git_in(&seed, ["checkout", "-q", "-b", "topic"]).unwrap();
+        seed_commit(&seed, "topic.txt", "one\n", "topic");
+        run_git_in(&seed, ["checkout", "-q", "main"]).unwrap();
+        let url = file_url_for_path(&seed);
+        let locator = Locator::parse(&url).unwrap();
+        clone_repo(&config, &store, &Output { json: true }, &url).unwrap();
+        let clone_path = locator_path(&config.clone_root, &locator);
+
+        let heads = git_output(
+            &clone_path,
+            ["for-each-ref", "--format=%(refname)", "refs/heads/"],
+            "branches",
+        )
+        .unwrap();
+        assert_eq!(heads.trim(), "refs/heads/main");
+        assert!(git_ref_exists(&clone_path, "refs/remotes/origin/main").unwrap());
+        assert!(git_ref_exists(&clone_path, "refs/remotes/origin/topic").unwrap());
+
+        // Deleted upstream, the branch leaves no ref behind.
+        run_git_in(&seed, ["branch", "-q", "-D", "topic"]).unwrap();
+        run_git_in(&clone_path, ["fetch", "-q", "--prune", "origin"]).unwrap();
+        assert!(!git_ref_exists(&clone_path, "refs/remotes/origin/topic").unwrap());
+        let refs =
+            git_output(&clone_path, ["for-each-ref", "--format=%(refname)"], "refs").unwrap();
+        assert!(!refs.contains("topic"), "{refs}");
     }
 
     #[test]

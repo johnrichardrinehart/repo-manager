@@ -26,6 +26,12 @@ the clone root has a working tree. Development worktrees live under
 `~/code/dev-worktrees`. Historical locator paths become symlinks to the latest
 real path when a move is applied.
 
+A bare clone keeps only its default branch as a local branch; every other
+upstream branch is a remote-tracking ref under `refs/remotes/origin/`, so
+`git fetch --prune` drops it, and its history, once it is deleted upstream.
+Local branches are yours: one whose upstream was deleted shows as `gone` in
+`git branch -vv` and stays until you delete it.
+
 Existing checkouts can be registered without recloning:
 
 ```sh
